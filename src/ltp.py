@@ -54,12 +54,21 @@ from typing import Any, Optional
 # ===========================================================================
 
 def H(data: bytes) -> str:
-    """Content-addressing hash function. Returns hex digest (256-bit)."""
-    return hashlib.blake2b(data, digest_size=32).hexdigest()
+    """Content-addressing hash function. Returns 'blake2b:<hex>' (256-bit).
+
+    Canonical format per whitepaper §1.2: algorithm-prefixed hex string.
+    Production default is BLAKE3-256; this PoC uses BLAKE2b-256 (identical
+    output length and security parameters). Prefix makes the algorithm explicit
+    and allows future negotiation of alternatives (e.g., 'blake3:<hex>').
+    """
+    return "blake2b:" + hashlib.blake2b(data, digest_size=32).hexdigest()
 
 
 def H_bytes(data: bytes) -> bytes:
-    """Content-addressing hash function. Returns raw 32 bytes."""
+    """Content-addressing hash function. Returns raw 32 bytes (no prefix).
+
+    Used internally where binary output is required (keystream, nonces, tags).
+    """
     return hashlib.blake2b(data, digest_size=32).digest()
 
 
@@ -79,8 +88,8 @@ class AEAD:
       - Integrity: 32-byte authentication tag (forgery → ValueError)
       - Nonce binding: each (key, nonce) pair produces a unique keystream
 
-    Each shard is encrypted with a unique nonce = shard_index, preventing
-    nonce reuse across shards under the same CEK.
+    Each shard is encrypted with a nonce derived as H(CEK || entity_id || shard_index)[:16],
+    binding nonce uniqueness to both key and entity identity.
     """
 
     TAG_SIZE = 32  # BLAKE2b-256 authentication tag
@@ -555,20 +564,20 @@ class ShardEncryptor:
       - Deterministic: same (CEK, shard, index) → same ciphertext
       - AEAD tag detects any modification by commitment nodes
 
-    SECURITY INVARIANT — CEK Uniqueness (Nonce Safety):
-      The nonce-as-index scheme is safe IF AND ONLY IF each CEK is unique per
-      entity. Since nonce = shard_index, two entities sharing the same CEK would
-      produce identical (key, nonce) pairs for corresponding shards, enabling
-      XOR-based plaintext recovery (catastrophic AEAD nonce reuse).
+    SECURITY INVARIANT — Nonce Derivation:
+      Each shard nonce is derived as:
+        nonce_i = H(CEK || entity_id || shard_index)[:16]
 
-      The CEK MUST be generated from a CSPRNG (os.urandom) for every commit.
-      CEK reuse across entities is a CATASTROPHIC failure mode — it leaks
-      plaintext via crib-dragging attacks on the keystream.
+      This binds the nonce to both the CEK and the entity_id, providing
+      defense-in-depth against:
+        - CSPRNG failures (same CEK reused across entities)
+        - VM snapshot/restore (seed-state clone producing duplicate CEKs)
+        - Implementation bugs that cache CEKs across retry paths
 
-      If the protocol ever supports entity updates (re-committing content under
-      the same entity_id), a FRESH CEK MUST be generated each time. The entity_id
-      will differ (due to timestamp/content change), but even if it didn't, the
-      CEK must be independently random.
+      Even if two entities share the same CEK (e.g., due to CSPRNG failure),
+      their nonces differ because entity_id differs, preventing keystream reuse.
+      CEK uniqueness (via CSPRNG) remains the primary barrier; nonce derivation
+      is an additional layer of defense.
     """
 
     # Track issued CEKs within this process to detect accidental reuse.
@@ -609,24 +618,31 @@ class ShardEncryptor:
             raise ValueError("CEK is all-one — degenerate key rejected")
 
     @staticmethod
-    def _nonce(shard_index: int) -> bytes:
-        """Deterministic 16-byte nonce from shard index."""
-        return struct.pack('>I', shard_index) + b'\x00' * 12
+    def _nonce(cek: bytes, entity_id: str, shard_index: int) -> bytes:
+        """Deterministic 16-byte nonce: H(CEK || entity_id || shard_index)[:16].
+
+        Binds nonce to both CEK and entity_id, ensuring that even if a CEK is
+        accidentally reused across entities, the nonces diverge because entity_id
+        differs. Matches whitepaper §2.1.1 nonce derivation spec.
+        """
+        index_bytes = struct.pack('>I', shard_index)
+        digest = H_bytes(cek + entity_id.encode() + index_bytes)
+        return digest[:16]
 
     @classmethod
-    def encrypt_shard(cls, cek: bytes, plaintext_shard: bytes, shard_index: int) -> bytes:
+    def encrypt_shard(cls, cek: bytes, entity_id: str, plaintext_shard: bytes, shard_index: int) -> bytes:
         """Encrypt a shard with CEK. Returns ciphertext || 32-byte auth tag.
 
-        Validates CEK before use. The nonce is deterministically derived from
-        shard_index, so CEK uniqueness is the SOLE barrier against nonce reuse.
+        Nonce is derived as H(CEK || entity_id || shard_index)[:16], binding
+        nonce uniqueness to both key and entity identity.
         """
         cls.validate_cek(cek)
-        return AEAD.encrypt(cek, plaintext_shard, cls._nonce(shard_index))
+        return AEAD.encrypt(cek, plaintext_shard, cls._nonce(cek, entity_id, shard_index))
 
     @classmethod
-    def decrypt_shard(cls, cek: bytes, encrypted_shard: bytes, shard_index: int) -> bytes:
+    def decrypt_shard(cls, cek: bytes, entity_id: str, encrypted_shard: bytes, shard_index: int) -> bytes:
         """Decrypt a shard with CEK. Raises ValueError if tampered."""
-        return AEAD.decrypt(cek, encrypted_shard, cls._nonce(shard_index))
+        return AEAD.decrypt(cek, encrypted_shard, cls._nonce(cek, entity_id, shard_index))
 
 
 # ===========================================================================
@@ -921,24 +937,32 @@ class CommitmentRecord:
     entity_id: str
     sender_id: str
     shard_map_root: str       # H(H(enc_shard_0) || H(enc_shard_1) || ... || H(enc_shard_n))
-    content_hash: str         # H(content) — receiver-side integrity verification
-    encoding_params: dict     # {"n": int, "k": int, "algorithm": str}
-    shape_hash: str
+    content_hash: str         # H(content) — secondary integrity check
+    encoding_params: dict     # {"n": int, "k": int, "algorithm": str, "gf_poly": str, "eval": str}
+    shape: str                # canonicalized media type (e.g. "text/plain;charset=utf-8")
+    shape_hash: str           # H(shape) — retained for legacy lookup compatibility
     timestamp: float
     predecessor: Optional[str] = None
     signature: bytes = b""    # ML-DSA-65 signature (3309 bytes)
 
     def signable_payload(self) -> bytes:
-        """The canonical bytes that get signed/verified."""
+        """The canonical bytes that get signed/verified.
+
+        NOTE: `predecessor` is intentionally excluded. It is a log-level chaining
+        property set by CommitmentLog.append() after the sender signs, so including
+        it would invalidate the signature. The sender authenticates the commitment
+        content (entity_id, shards, shape, timestamp); the log's hash-chain
+        separately authenticates the predecessor linkage.
+        """
         d = {
             "entity_id": self.entity_id,
             "sender_id": self.sender_id,
             "shard_map_root": self.shard_map_root,
             "content_hash": self.content_hash,
             "encoding_params": self.encoding_params,
+            "shape": self.shape,
             "shape_hash": self.shape_hash,
             "timestamp": self.timestamp,
-            "predecessor": self.predecessor,
         }
         return json.dumps(d, sort_keys=True).encode()
 
@@ -959,6 +983,7 @@ class CommitmentRecord:
             "shard_map_root": self.shard_map_root,
             "content_hash": self.content_hash,
             "encoding_params": self.encoding_params,
+            "shape": self.shape,
             "shape_hash": self.shape_hash,
             "timestamp": self.timestamp,
             "predecessor": self.predecessor,
@@ -1120,7 +1145,7 @@ class CommitmentNetwork:
             raise ValueError("No commitment nodes available")
 
         placement_key = f"{entity_id}:{shard_index}"
-        h = int(H(placement_key.encode()), 16)
+        h = int.from_bytes(H_bytes(placement_key.encode()), "big")
 
         selected = []
         for r in range(replicas):
@@ -1539,13 +1564,18 @@ class Entity:
         """Canonicalize shape on construction."""
         self.shape = canonicalize_shape(self.shape)
 
-    def compute_id(self, sender_id: str, timestamp: float) -> str:
-        """Compute deterministic EntityID = H(content || shape || time || sender)."""
+    def compute_id(self, sender_vk: bytes, timestamp: float) -> str:
+        """Compute deterministic EntityID = H(content || shape || timestamp || sender_vk).
+
+        sender_vk is the sender's ML-DSA-65 verification key (1952 bytes), binding
+        the entity's identity to the sender's cryptographic public identity rather
+        than a mutable label string. Matches whitepaper §1.2 specification.
+        """
         identity_input = (
             self.content
             + self.shape.encode()
             + struct.pack('>d', timestamp)
-            + sender_id.encode()
+            + sender_vk
         )
         return H(identity_input)
 
@@ -1658,7 +1688,7 @@ class LTPProtocol:
         self._sender_keypairs[sender_id] = sender_keypair
 
         timestamp = time.time()
-        entity_id = entity.compute_id(sender_id, timestamp)
+        entity_id = entity.compute_id(sender_keypair.vk, timestamp)
         shape_hash = H(entity.shape.encode())
         self._entity_sizes[entity_id] = len(entity.content)
 
@@ -1681,7 +1711,7 @@ class LTPProtocol:
         # Step 3: Encrypt each shard with CEK
         encrypted_shards = []
         for i, shard in enumerate(plaintext_shards):
-            encrypted_shards.append(ShardEncryptor.encrypt_shard(cek, shard, i))
+            encrypted_shards.append(ShardEncryptor.encrypt_shard(cek, entity_id, shard, i))
 
         overhead = len(encrypted_shards[0]) - len(plaintext_shards[0])
         print(f"  [COMMIT] Shards encrypted (AEAD): {len(encrypted_shards[0]):,} bytes "
@@ -1701,7 +1731,14 @@ class LTPProtocol:
             sender_id=sender_id,
             shard_map_root=shard_map_root,
             content_hash=content_hash,
-            encoding_params={"n": n, "k": k, "algorithm": "vandermonde-gf256"},
+            encoding_params={
+                "n": n,
+                "k": k,
+                "algorithm": "reed-solomon-gf256",
+                "gf_poly": "0x11d",
+                "eval": "vandermonde-powers-of-0x02",
+            },
+            shape=entity.shape,
             shape_hash=shape_hash,
             timestamp=timestamp,
         )
@@ -1815,19 +1852,31 @@ class LTPProtocol:
             return None
         print(f"  [MATERIALIZE] ✓ Commitment record found in log")
 
-        # Step 3: Verify commitment integrity
+        # Step 3: Verify commitment integrity (hash match against sealed reference)
         record_ref = H(json.dumps(record.to_dict(), sort_keys=True).encode())
         if record_ref != key.commitment_ref:
             print(f"  [MATERIALIZE] ✗ Commitment reference MISMATCH (tampered?)")
             return None
         print(f"  [MATERIALIZE] ✓ Commitment reference verified")
 
-        # Step 4: Read encoding params from RECORD (not from key — key doesn't have them)
+        # Step 4: Verify ML-DSA-65 signature on the commitment record
+        # The sender's vk is looked up from the local keypair registry (PoC).
+        # In production, vk would be published to a PKI or included in the sealed key.
+        sender_kp = self._sender_keypairs.get(record.sender_id)
+        if sender_kp is None:
+            print(f"  [MATERIALIZE] ✗ Sender '{record.sender_id}' not found in registry")
+            return None
+        if not record.verify_signature(sender_kp.vk):
+            print(f"  [MATERIALIZE] ✗ ML-DSA signature INVALID — commitment record rejected")
+            return None
+        print(f"  [MATERIALIZE] ✓ ML-DSA-65 signature verified (sender '{record.sender_id}')")
+
+        # Step 6: Read encoding params from RECORD (not from key — key doesn't have them)
         n = record.encoding_params["n"]
         k = record.encoding_params["k"]
         print(f"  [MATERIALIZE] Encoding: n={n}, k={k} (from commitment record)")
 
-        # Step 5: Derive locations & fetch encrypted shards
+        # Step 7: Derive locations & fetch encrypted shards
         # Fetch ALL n shards (not just k) so that if some are tampered or missing,
         # we can still reconstruct from any k valid shards (erasure coding resilience).
         print(f"  [MATERIALIZE] Deriving shard locations from entity_id + index...")
@@ -1858,7 +1907,7 @@ class LTPProtocol:
         plaintext_shards: dict[int, bytes] = {}
         for i, enc_shard in verified_encrypted.items():
             try:
-                plaintext_shards[i] = ShardEncryptor.decrypt_shard(key.cek, enc_shard, i)
+                plaintext_shards[i] = ShardEncryptor.decrypt_shard(key.cek, key.entity_id, enc_shard, i)
             except ValueError as e:
                 print(f"  [MATERIALIZE] ⚠ Shard {i}: AEAD authentication FAILED — {e} (skipping)")
                 continue
@@ -1879,20 +1928,31 @@ class LTPProtocol:
         entity_content = ErasureCoder.decode(plaintext_shards, n, k)
         print(f"  [MATERIALIZE] ✓ Entity reconstructed ({len(entity_content):,} bytes)")
 
-        # Step 8: Verify EntityID (content-addressing integrity check)
-        # This is the CRITICAL final gate: recompute H(content) and compare to the
-        # content_hash in the signed commitment record. This ensures end-to-end
-        # integrity even if all other checks were somehow bypassed (defense in depth).
-        # The content_hash is covered by the ML-DSA signature, so forging it requires
-        # breaking EUF-CMA.
-        reconstructed_hash = H(entity_content)
-        if reconstructed_hash != record.content_hash:
-            print(f"  [MATERIALIZE] ✗ Content hash MISMATCH — reconstructed content differs!")
-            print(f"  [MATERIALIZE]   Expected: {record.content_hash[:16]}...")
-            print(f"  [MATERIALIZE]   Got:      {reconstructed_hash[:16]}...")
+        # Step 10: Verify full EntityID (end-to-end content integrity)
+        # Re-derive EntityID from reconstructed content + metadata from the commitment
+        # record. This is the whitepaper §2.3.1 step 10 check:
+        #   H(entity_content || shape || timestamp || sender_vk) == entity_id
+        #
+        # This is DISTINCT from the commitment_ref check (step 3), which confirmed the
+        # record's hash matches the sealed reference. Step 10 defends against a subtler
+        # attack: an adversary who substitutes a valid-but-different commitment record
+        # (internally consistent, correctly signed) pointing to different content.
+        # Such a record would pass step 3 (different commitment_ref wouldn't be in the
+        # sealed key) but would fail here because the reconstructed content hashes to
+        # a different EntityID than the one in the sealed key.
+        expected_entity_id = H(
+            entity_content
+            + record.shape.encode()
+            + struct.pack('>d', record.timestamp)
+            + sender_kp.vk
+        )
+        if expected_entity_id != key.entity_id:
+            print(f"  [MATERIALIZE] ✗ EntityID MISMATCH — reconstructed content differs!")
+            print(f"  [MATERIALIZE]   Expected: {key.entity_id[:16]}...")
+            print(f"  [MATERIALIZE]   Got:      {expected_entity_id[:16]}...")
             print(f"  [MATERIALIZE]   Entity is REJECTED (immutability violation attempt)")
             return None
-        print(f"  [MATERIALIZE] ✓ Content hash verified: H(content) = {reconstructed_hash[:16]}...")
+        print(f"  [MATERIALIZE] ✓ EntityID verified: H(content‖shape‖ts‖vk) = {expected_entity_id[:16]}...")
         print(f"  [MATERIALIZE] ✓ MATERIALIZATION COMPLETE")
 
         return entity_content
@@ -2409,17 +2469,18 @@ def demo():
     # plaintext shards themselves reveal nothing (information-theoretic).
     print("┌─ TSEC VALIDATION 4: CEK compromise + k-1 nodes → zero information")
     tsec_cek = ShardEncryptor.generate_cek()
+    tsec_entity_id = H(tsec_cek + b"tsec-validation-4")  # stable test entity_id
     # Encrypt shards for m_0 and m_1
-    enc_shards_0 = [ShardEncryptor.encrypt_shard(tsec_cek, s, i) for i, s in enumerate(shards_0)]
-    enc_shards_1 = [ShardEncryptor.encrypt_shard(tsec_cek, s, i) for i, s in enumerate(shards_1)]
+    enc_shards_0 = [ShardEncryptor.encrypt_shard(tsec_cek, tsec_entity_id, s, i) for i, s in enumerate(shards_0)]
+    enc_shards_1 = [ShardEncryptor.encrypt_shard(tsec_cek, tsec_entity_id, s, i) for i, s in enumerate(shards_1)]
 
     # Adversary compromises k-1 nodes AND obtains the CEK
     compromised = [0, 1, 2]  # k-1 = 3 node indices
     print(f"  Adversary compromises nodes storing shards {compromised} AND obtains CEK")
 
     # Decrypt the compromised shards (adversary has CEK)
-    dec_0 = [ShardEncryptor.decrypt_shard(tsec_cek, enc_shards_0[i], i) for i in compromised]
-    dec_1 = [ShardEncryptor.decrypt_shard(tsec_cek, enc_shards_1[i], i) for i in compromised]
+    dec_0 = [ShardEncryptor.decrypt_shard(tsec_cek, tsec_entity_id, enc_shards_0[i], i) for i in compromised]
+    dec_1 = [ShardEncryptor.decrypt_shard(tsec_cek, tsec_entity_id, enc_shards_1[i], i) for i in compromised]
 
     # Verify the decrypted shards match the original plaintext shards
     dec_match_0 = all(dec_0[j] == shards_0[compromised[j]] for j in range(len(compromised)))
@@ -2498,15 +2559,15 @@ def demo():
 
     # --- IMM Validation 1: Deterministic EntityID ---
     print("┌─ IMM VALIDATION 1: Deterministic EntityID (consistency)")
-    eid_1 = imm_entity.compute_id(imm_sender.label, imm_timestamp)
-    eid_2 = imm_entity.compute_id(imm_sender.label, imm_timestamp)
-    eid_3 = imm_entity.compute_id(imm_sender.label, imm_timestamp)
+    eid_1 = imm_entity.compute_id(imm_sender.vk, imm_timestamp)
+    eid_2 = imm_entity.compute_id(imm_sender.vk, imm_timestamp)
+    eid_3 = imm_entity.compute_id(imm_sender.vk, imm_timestamp)
     print(f"  Compute #1: {eid_1}")
     print(f"  Compute #2: {eid_2}")
     print(f"  Compute #3: {eid_3}")
     all_equal = (eid_1 == eid_2 == eid_3)
     print(f"  All identical: {'✓ YES' if all_equal else '✗ NO'}")
-    print(f"  → EntityID = H(content ‖ shape ‖ timestamp ‖ sender) is deterministic")
+    print(f"  → EntityID = H(content ‖ shape ‖ timestamp ‖ sender_vk) is deterministic")
     print("└─ Done\n")
 
     # --- IMM Validation 2: Avalanche — single-field changes ---
@@ -2517,28 +2578,28 @@ def demo():
         diff = sum(1 for x, y in zip(a, b) if x != y)
         return diff, len(a)
 
-    eid_original = imm_entity.compute_id(imm_sender.label, imm_timestamp)
+    eid_original = imm_entity.compute_id(imm_sender.vk, imm_timestamp)
     print(f"  Original EntityID: {eid_original[:32]}...")
 
     # Variant 1: flip 1 bit in content
     content_flipped = bytearray(imm_content)
     content_flipped[0] ^= 0x01  # flip least significant bit of first byte
     entity_v1 = Entity(content=bytes(content_flipped), shape=imm_shape)
-    eid_v1 = entity_v1.compute_id(imm_sender.label, imm_timestamp)
+    eid_v1 = entity_v1.compute_id(imm_sender.vk, imm_timestamp)
     diff_v1, total_v1 = hex_diff_count(eid_original, eid_v1)
 
     # Variant 2: change shape
     entity_v2 = Entity(content=imm_content, shape="text/html")
-    eid_v2 = entity_v2.compute_id(imm_sender.label, imm_timestamp)
+    eid_v2 = entity_v2.compute_id(imm_sender.vk, imm_timestamp)
     diff_v2, total_v2 = hex_diff_count(eid_original, eid_v2)
 
     # Variant 3: change timestamp by smallest float increment
     import sys as _sys
-    eid_v3 = imm_entity.compute_id(imm_sender.label, imm_timestamp + _sys.float_info.epsilon * imm_timestamp)
+    eid_v3 = imm_entity.compute_id(imm_sender.vk, imm_timestamp + _sys.float_info.epsilon * imm_timestamp)
     diff_v3, total_v3 = hex_diff_count(eid_original, eid_v3)
 
-    # Variant 4: different sender
-    eid_v4 = imm_entity.compute_id(bob.label, imm_timestamp)
+    # Variant 4: different sender (bob has different vk → different EntityID)
+    eid_v4 = imm_entity.compute_id(bob.vk, imm_timestamp)
     diff_v4, total_v4 = hex_diff_count(eid_original, eid_v4)
 
     print(f"  ┌──────────────────────┬──────────────────────────┬────────────────────┐")
@@ -2565,12 +2626,12 @@ def demo():
     # encode(e) = content || shape.encode() || struct.pack('>d', timestamp) || sender.encode()
     # This is injective because the concatenation of distinct inputs always differs.
 
-    def encode_entity_raw(entity: Entity, sender_id: str, ts: float) -> bytes:
+    def encode_entity_raw(entity: Entity, sender_vk: bytes, ts: float) -> bytes:
         return (entity.content + entity.shape.encode()
-                + struct.pack('>d', ts) + sender_id.encode())
+                + struct.pack('>d', ts) + sender_vk)
 
-    enc_original = encode_entity_raw(imm_entity, imm_sender.label, imm_timestamp)
-    enc_v1 = encode_entity_raw(entity_v1, imm_sender.label, imm_timestamp)
+    enc_original = encode_entity_raw(imm_entity, imm_sender.vk, imm_timestamp)
+    enc_v1 = encode_entity_raw(entity_v1, imm_sender.vk, imm_timestamp)
     print(f"  encode(e_original): {len(enc_original)} bytes, BLAKE2b → {eid_original[:16]}...")
     print(f"  encode(e_flipped):  {len(enc_v1)} bytes, BLAKE2b → {eid_v1[:16]}...")
     print(f"  Raw encodings differ: {'✓ YES' if enc_original != enc_v1 else '✗ NO (BUG!)'}")
@@ -2585,10 +2646,11 @@ def demo():
     n_entities = 10_000
     collision_set: set[str] = set()
     collision_found = False
+    collision_tester_vk = imm_sender.vk  # stable vk for reproducibility
     for i in range(n_entities):
         random_content = os.urandom(64) + struct.pack('>I', i)
         random_entity = Entity(content=random_content, shape="x-ltp/collision-test")
-        eid = random_entity.compute_id("collision-tester", float(i))
+        eid = random_entity.compute_id(collision_tester_vk, float(i))
         if eid in collision_set:
             collision_found = True
             print(f"  ✗ COLLISION FOUND at entity #{i}! (should NEVER happen)")
@@ -2726,7 +2788,9 @@ def demo():
     original_record = network.log._records[first_eid]
     original_content_hash = original_record.content_hash
     # Tamper: flip a bit in the content_hash
-    tampered_hash = hex(int(original_content_hash, 16) ^ 1)[2:].zfill(64)
+    # Strip "blake2b:" prefix before integer manipulation, restore afterward
+    _prefix, _hex = original_content_hash.split(":", 1)
+    tampered_hash = _prefix + ":" + hex(int(_hex, 16) ^ 1)[2:].zfill(64)
     original_record.content_hash = tampered_hash
     print(f"  [TAMPER] Flipped 1 bit in record 0 content_hash")
     print(f"  [TAMPER] Original: {original_content_hash[:24]}...")
