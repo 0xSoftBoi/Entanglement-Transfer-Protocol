@@ -985,47 +985,90 @@ supermajority ($\geq 2/3$) of existing operators to approve via signed votes.
 #### 5.1.4 Commitment Log Trust Model
 
 The append-only commitment log is foundational to LTP's immutability and non-repudiation
-guarantees (Theorems 1, 6, 8). The security proofs assume an idealized log that cannot be
-tampered with. In practice, this assumption requires an explicit trust model.
+guarantees (Theorems 3, 6, 8 in §3.3). The security proofs assume an idealized log that
+cannot be tampered with. In practice, this assumption requires an explicit implementation
+choice.
 
-**Formal trust assumptions.** LTP's commitment log requires:
+---
+
+> **RECOMMENDED IMPLEMENTATION: CT-style multi-operator Merkle log**
+>
+> Implementers who need a default SHOULD use the CT-style Merkle log specified
+> in §5.1.4.2 below. It satisfies all three formal log assumptions with the weakest
+> trust requirement (at least 1 honest operator), uses only LTP's existing primitives
+> (BLAKE2b-256 + ML-DSA-65), and requires no consensus protocol.
+>
+> **Reference implementation:** `src/merkle_log/` in the LTP repository.
+> **Reference tests:** `tests/test_merkle_log.py` (42 tests demonstrating
+> tamper-evidence, O(log N) inclusion proofs, and equivocation detection).
+>
+> Other tiers are available for deployments with stronger adversarial requirements:
+> BFT for environments where operators may be Byzantine, public blockchain for
+> fully decentralized deployments. These escalate complexity and trust cost without
+> improving the append-only guarantee for the CT use case.
+
+---
+
+**Formal trust assumptions.** LTP's commitment log requires all three:
 
 | Assumption | Formal Statement | Consequence if Violated |
 |-----------|-----------------|------------------------|
-| **Append-only integrity** | Once a record $R$ is accepted at position $i$, no operation can modify $R$ or insert a different record at position $i$. | Immutability guarantee (Theorem 1) fails — adversary can retroactively alter committed content. |
+| **Append-only integrity** | Once a record $R$ is accepted at position $i$, no operation can modify $R$ or insert a different record at position $i$. | Corollary (§4.3) and Theorem 3 fail — adversary can retroactively alter committed content. |
 | **Consistency** | All honest participants observe the same log state (up to bounded propagation delay $\delta$). | Non-repudiation (Theorem 6) fails — sender could present different log states to different verifiers. |
 | **Liveness** | A valid commitment record submitted by an honest sender is accepted within bounded time $\Delta$. | Availability degrades — entities cannot be committed. Does NOT affect already-committed entities. |
 
-**Trust tiers.** The strength of these assumptions depends on the log implementation:
+**Trust tiers.** All four satisfy the formal assumptions; they differ in the strength of
+the trust requirement:
 
-| Implementation | Append-Only | Consistency | Trust Requirement |
-|---------------|-------------|-------------|-------------------|
-| Single trusted operator | Operator honesty | Trivial (single source) | Full trust in operator |
-| CT-style multi-operator Merkle log [7] | At least 1 honest operator publishes the tree head | Gossip protocol detects forks (split-view attack) | At least 1 honest mirror + gossip |
-| BFT replicated log (PBFT/Raft) | $f < n/3$ Byzantine operators | BFT consensus | $> 2/3$ honest operators |
-| Public blockchain | Computational hardness (PoW) or economic security (PoS) | Longest-chain / finality gadget | Honest majority of stake/work |
+| Implementation | Append-Only | Consistency | Trust Requirement | Use when |
+|---------------|-------------|-------------|-------------------|----------|
+| Single trusted operator | Operator honesty | Trivial (single source) | Full trust in operator | Internal/private deployments only |
+| **CT-style multi-operator Merkle log [7]** | **≥ 1 honest operator publishes the tree head** | **Gossip detects forks** | **≥ 1 honest mirror** | **Default — most deployments** |
+| BFT replicated log (PBFT/Raft) | $f < n/3$ Byzantine operators | BFT consensus | $> 2/3$ honest operators | Adversarial multi-party environments |
+| Public blockchain | Computational hardness (PoW) or economic security (PoS) | Longest-chain / finality gadget | Honest majority of stake/work | Fully decentralized / permissionless |
 
-**Fork detection and resolution.** A *log fork* occurs when an operator presents different
-log states to different participants (equivocation). LTP mitigates this via:
+#### 5.1.4.1 Minimum Conformance Requirements (CT-Style Merkle Log)
 
-1. **Signed tree heads (STH).** Each log operator periodically signs and publishes a
-   tree head: $\text{STH}_i = \text{Sign}(sk_{\text{operator}}, H(\text{root}_i \| i \| t))$.
-   Receivers SHOULD fetch STHs from multiple operators and verify consistency.
+An implementation claiming to satisfy the CT-style Merkle log requirement MUST:
 
-2. **Gossip protocol.** Participants exchange STHs; any inconsistency (two valid STHs at
-   the same sequence number with different roots) is cryptographic proof of operator
-   equivocation. This follows the Certificate Transparency gossip model [7].
+| Requirement | Specification |
+|-------------|---------------|
+| **Tree hash** | Append-only binary Merkle tree; leaf nodes: `H(0x00 \|\| record)`, internal nodes: `H(0x01 \|\| left \|\| right)` — RFC 6962 §2.1 domain separation |
+| **Hash primitive** | BLAKE2b-256 — consistent with LTP's content-addressing primitive (§1.2) |
+| **Signed Tree Heads** | Each STH MUST be ML-DSA-65 signed over `sequence \|\| tree_size \|\| timestamp \|\| root_hash`; sequence MUST be monotonically increasing per operator |
+| **Inclusion proofs** | MUST produce O(log N) sibling-path proofs for any record; any verifier MUST be able to reconstruct the root from (record, proof, tree_size) without holding other records |
+| **Equivocation detection** | MUST treat two valid STHs from the same operator at the same sequence number with different root hashes as a self-contained equivocation proof requiring no further data |
+| **Operator count** | SHOULD operate with ≥ 2 independent operators exchanging STHs via gossip; 1 operator is permitted for private deployments |
 
-3. **Inclusion proofs.** When a receiver materializes an entity, the log provides a
-   Merkle inclusion proof that the commitment record exists in the tree committed by the
-   STH. This is $O(\log N)$ in proof size where $N$ is the number of log entries.
+An implementation MUST NOT:
+- Modify or delete any record after appending.
+- Issue an STH with a lower tree_size than the operator's previous STH.
+- Omit the ML-DSA-65 signature from any published STH.
+
+#### 5.1.4.2 Fork Detection and Consistency Verification
+
+**Fork detection.** A *log fork* occurs when an operator presents different log states to
+different participants (equivocation). LTP detects this via:
+
+1. **Signed tree heads (STH).** Each log operator periodically signs and publishes:
+   $\text{STH}_i = \text{Sign}(sk_{\text{op}}, \text{seq} \| \text{size} \| t \| \text{root})$.
+   Receivers SHOULD fetch STHs from multiple operators and check consistency.
+
+2. **Gossip protocol.** Participants exchange STHs. Any pair of valid STHs at the same
+   sequence number with different roots is cryptographic proof of equivocation — the
+   pair is a self-contained evidence bundle any third party can verify. This follows the
+   Certificate Transparency gossip model [7].
+
+3. **Inclusion proofs.** The log provides an O(log N) Merkle audit path proving a
+   commitment record exists in the tree committed by a given STH. Receivers verify this
+   proof independently before accepting materialization.
 
 **What happens if the log is compromised?**
 
 | Attack | Impact | Detection | Recovery |
 |--------|--------|-----------|----------|
 | Operator withholds records | New commits blocked; existing entities unaffected | Liveness timeout; failover to alternate operator | Switch to healthy operator; re-submit pending commits |
-| Operator equivocates (fork) | Different receivers see different logs | Gossip detects inconsistent STHs | Equivocation proof published; operator evicted; logs merged |
+| Operator equivocates (fork) | Different receivers see different logs | Gossip detects inconsistent STHs; equivocation proven by two conflicting STHs alone | Equivocation proof published; operator evicted; logs merged |
 | Operator deletes a record | Non-repudiation violated for that record | Any participant with a cached STH + inclusion proof detects deletion | Cached proofs serve as evidence; operator evicted |
 | All operators compromised | Full log integrity lost | No automated detection | Catastrophic — requires manual recovery and network re-bootstrap |
 
@@ -1035,12 +1078,6 @@ at the time the commitment was made. The commitment record's ML-DSA signature is
 self-authenticating — it can be verified against the sender's public key without trusting
 the log. The log's role is to prevent the sender from denying the *existence* of the
 commitment, not its *authenticity*.
-
-**Recommended deployment posture:** For production deployments, LTP SHOULD use a
-multi-operator CT-style Merkle log with gossip-based fork detection. This provides
-append-only integrity under the assumption that at least one operator is honest —
-a strictly weaker trust requirement than BFT consensus ($> 2/3$ honest) and achievable
-with as few as 2 independent operators.
 
 ### 5.2 Sybil Resistance
 
