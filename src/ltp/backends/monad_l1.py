@@ -43,6 +43,12 @@ from .base import (
     CommitmentBackend,
     FinalityModel,
 )
+from ..economics import (
+    EconomicsConfig,
+    EconomicsEngine,
+    NodeEconomics,
+    SlashingTier,
+)
 from ..primitives import H, H_bytes
 
 
@@ -138,9 +144,21 @@ class MonadL1Backend(CommitmentBackend):
         # Node registry (on-chain state)
         self._node_registry: dict[str, MonadNodeEntry] = {}
 
-        # Economics
+        # Basic economics
         self._total_staked: int = 0
         self._slash_pool: int = 0     # accumulated slash penalties
+
+        # Full economics engine (opt-in)
+        self._economics_engine: EconomicsEngine | None = None
+        self._node_economics: dict[str, NodeEconomics] = {}
+        self._current_epoch: int = 0
+        self._epoch_commitment_count: int = 0
+        self._epoch_snapshots: list[dict] = []
+        if config.enable_economics_engine:
+            econ_config = EconomicsConfig(
+                epoch_seconds=config.economics_epoch_seconds,
+            )
+            self._economics_engine = EconomicsEngine(econ_config)
 
         # Parallel execution state
         self._parallel_threads = config.monad_parallel_threads
@@ -291,6 +309,7 @@ class MonadL1Backend(CommitmentBackend):
         }
 
         self._commitments[entity_id] = entry
+        self._epoch_commitment_count += 1
 
         # Add to pending transactions
         self._pending_tx.append({
@@ -362,7 +381,11 @@ class MonadL1Backend(CommitmentBackend):
     def register_node(
         self, node_id: str, region: str, stake_wei: int = 0
     ) -> bool:
-        min_stake = self.config.min_stake_wei
+        # Use economics engine min-stake if enabled
+        if self._economics_engine is not None:
+            min_stake = self._economics_engine.min_stake_for_epoch(self._current_epoch)
+        else:
+            min_stake = self.config.min_stake_wei
         if stake_wei < min_stake:
             return False
 
@@ -375,6 +398,13 @@ class MonadL1Backend(CommitmentBackend):
         )
         self._node_registry[node_id] = entry
         self._total_staked += stake_wei
+
+        # Track in economics engine
+        if self._economics_engine is not None:
+            self._node_economics[node_id] = NodeEconomics(
+                node_id=node_id,
+                stake=stake_wei,
+            )
 
         self._pending_tx.append({
             "type": "REGISTER_NODE",
@@ -436,7 +466,28 @@ class MonadL1Backend(CommitmentBackend):
         if entry is None:
             return 0
 
-        slash_amount = self._compute_slash(entry)
+        # Use progressive slashing from economics engine if enabled
+        node_econ = self._node_economics.get(node_id)
+        if self._economics_engine is not None and node_econ is not None:
+            node_econ.offense_count += 1
+            node_econ.audit_score = max(0, node_econ.audit_score - 25)
+            slash_amount, tier = self._economics_engine.compute_slash(node_econ)
+            node_econ.total_slashed += slash_amount
+            node_econ.stake -= slash_amount
+
+            # Apply cooldown
+            node_econ.cooldown_until_epoch = (
+                self._current_epoch
+                + self._economics_engine.config.cooldown_epochs_per_offense
+            )
+
+            # Auto-evict on critical tier
+            if self._economics_engine.should_evict(node_econ):
+                node_econ.evicted = True
+                entry.active = False
+        else:
+            slash_amount = self._compute_slash(entry)
+
         entry.stake_wei -= slash_amount
         entry.slashed_total += slash_amount
         entry.audit_score = max(0, entry.audit_score - 25)
@@ -452,18 +503,104 @@ class MonadL1Backend(CommitmentBackend):
         return slash_amount
 
     def get_pricing(self) -> dict:
-        return {
+        pricing = {
             "cost_per_shard_per_epoch": 100,     # 100 wei per shard per epoch
             "epoch_seconds": 3600,                # 1 hour epochs
             "currency": "LTP",                    # native L1 token
             "gas_per_commit": 21_000,             # native opcode gas cost
             "block_time_ms": self._block_time_ms,
         }
+        if self._economics_engine is not None:
+            utilization = self._epoch_commitment_count / max(1, 10_000)
+            dynamic_fee = self._economics_engine.compute_commit_fee(utilization)
+            phase = self._economics_engine.network_phase(self._current_epoch)
+            min_stake = self._economics_engine.min_stake_for_epoch(self._current_epoch)
+            pricing.update({
+                "dynamic_commit_fee": dynamic_fee,
+                "network_phase": phase.value,
+                "min_stake_required": min_stake,
+                "bootstrap_multiplier": self._economics_engine.bootstrap_multiplier(
+                    self._current_epoch
+                ),
+                "current_epoch": self._current_epoch,
+            })
+        return pricing
 
     def _compute_slash(self, entry: MonadNodeEntry) -> int:
         """Compute slash amount based on config and current stake."""
         fraction = self.config.slash_fraction_bps / 10_000
         return int(entry.stake_wei * fraction)
+
+    # --- Epoch processing ---
+
+    def process_epoch(self, epoch: int, commitments_this_epoch: int = 0) -> dict | None:
+        """
+        Run end-of-epoch economic processing.
+
+        Distributes rewards, burns fees, updates node economics state.
+        Returns epoch snapshot dict.
+        """
+        if self._economics_engine is None:
+            return None
+
+        self._current_epoch = epoch
+
+        # Sync shard counts from registry
+        for node_id, node_econ in self._node_economics.items():
+            reg = self._node_registry.get(node_id)
+            if reg and reg.active:
+                node_econ.epochs_active += 1
+
+        active_nodes = [
+            n for n in self._node_economics.values() if not n.evicted
+        ]
+        snapshot = self._economics_engine.process_epoch(
+            epoch=epoch,
+            nodes=active_nodes,
+            total_commitments_this_epoch=(
+                commitments_this_epoch or self._epoch_commitment_count
+            ),
+            network_capacity=10_000 * max(1, len(active_nodes)),
+        )
+
+        # Apply rewards to node stakes
+        for reward in snapshot.rewards:
+            node_econ = self._node_economics.get(reward.node_id)
+            reg = self._node_registry.get(reward.node_id)
+            if node_econ and reg and reward.total > 0:
+                node_econ.total_rewards_earned += reward.total
+                node_econ.total_fees_earned += reward.fee_share
+                node_econ.last_reward_epoch = epoch
+                # Rewards added to stake (auto-compound)
+                node_econ.stake += reward.total
+                reg.stake_wei += reward.total
+                self._total_staked += reward.total
+
+        # Reset epoch counter
+        self._epoch_commitment_count = 0
+
+        result = {
+            "epoch": snapshot.epoch,
+            "phase": snapshot.phase.value,
+            "active_nodes": snapshot.active_nodes,
+            "total_shards": snapshot.total_shards,
+            "total_staked": snapshot.total_staked,
+            "total_rewards_distributed": snapshot.total_rewards_distributed,
+            "total_fees_collected": snapshot.total_fees_collected,
+            "total_fees_burned": snapshot.total_fees_burned,
+            "total_fees_to_insurance": snapshot.total_fees_to_insurance,
+            "fee_multiplier": snapshot.fee_multiplier,
+            "utilization": snapshot.utilization,
+            "min_stake_required": snapshot.min_stake_required,
+        }
+        self._epoch_snapshots.append(result)
+        return result
+
+    def update_node_shards(self, node_id: str, shard_count: int) -> None:
+        """Update shard count for a node (called after shard distribution)."""
+        node_econ = self._node_economics.get(node_id)
+        if node_econ is not None:
+            node_econ.shards_stored = shard_count
 
     # --- Batch operations (amortized gas via parallel execution) ---
 
@@ -530,3 +667,15 @@ class MonadL1Backend(CommitmentBackend):
     @property
     def slash_pool(self) -> int:
         return self._slash_pool
+
+    @property
+    def economics_engine(self) -> EconomicsEngine | None:
+        return self._economics_engine
+
+    @property
+    def node_economics(self) -> dict[str, NodeEconomics]:
+        return self._node_economics
+
+    @property
+    def epoch_snapshots(self) -> list[dict]:
+        return self._epoch_snapshots

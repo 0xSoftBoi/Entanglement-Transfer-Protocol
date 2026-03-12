@@ -82,6 +82,8 @@ class BackendConfig:
     # --- Economics ---
     min_stake_wei: int = 0                # minimum stake for node admission
     slash_fraction_bps: int = 1000        # basis points slashed on audit failure (10%)
+    enable_economics_engine: bool = False  # enable full economic incentive model
+    economics_epoch_seconds: int = 3600   # epoch duration for reward cycles
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +216,19 @@ class CommitmentBackend(abc.ABC):
 
         Returns: {"cost_per_shard_per_epoch", "epoch_seconds", "currency"}
         """
+
+    def get_inclusion_proof(self, entity_id: str) -> Optional[dict]:
+        """Generate an inclusion proof for entity_id. Backend-specific format."""
+        return None
+
+    def process_epoch(self, epoch: int, commitments_this_epoch: int = 0) -> Optional[dict]:
+        """
+        Run end-of-epoch economic processing (rewards, fee distribution).
+
+        Returns epoch snapshot dict, or None if economics engine is disabled.
+        Override in backends with full economics support.
+        """
+        return None
 
     # --- Batch operations ---
 
