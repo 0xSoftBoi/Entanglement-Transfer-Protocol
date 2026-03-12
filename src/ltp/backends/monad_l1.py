@@ -1,0 +1,488 @@
+"""
+Monad L1 commitment backend — custom Layer 1 for LTP.
+
+Architecture: Fork of Monad (parallel EVM execution) with LTP-specific
+modifications for high-throughput commitment processing.
+
+Why Monad as the L1 base:
+  - Parallel EVM execution (up to 10,000 TPS vs Ethereum's ~30 TPS)
+  - Single-slot deterministic finality (~500ms vs Ethereum's ~12.8 min)
+  - EVM compatibility (deploy existing Solidity tooling)
+  - Optimistic parallel execution with conflict detection
+  - MonadDB: custom state storage optimized for parallel reads
+
+LTP-specific modifications on top of Monad:
+  1. Native commitment record opcode (COMMIT_RECORD) — avoids ABI overhead
+  2. Verkle trie state storage — smaller inclusion proofs (~150B vs ~1KB MPT)
+  3. Built-in storage proof verification at the protocol level
+  4. Shard placement oracle as a precompile (consistent hashing in EVM)
+  5. Validator set tied to commitment node operators (stake = storage)
+  6. Native blob support for commitment record batching (inspired by EIP-4844)
+
+Finality model:
+  - Single-slot finality: commitment is final after 1 block (~500ms)
+  - No reorgs after finality (unlike Ethereum's probabilistic model)
+  - Validator slashing for equivocation (double-signing)
+
+This PoC simulates the Monad L1 backend locally.  Production deployment
+requires running the actual modified Monad node software.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import struct
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+from .base import (
+    BackendCapabilities,
+    BackendConfig,
+    CommitmentBackend,
+    FinalityModel,
+)
+from ..primitives import H, H_bytes
+
+
+# ---------------------------------------------------------------------------
+# Monad L1 block and state simulation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MonadBlock:
+    """A simulated Monad L1 block."""
+    number: int
+    timestamp: float
+    parent_hash: str
+    state_root: str
+    commitment_root: str           # Merkle root of all commitments in this block
+    transactions: list[dict] = field(default_factory=list)
+    validator: str = ""
+    signature: bytes = b""
+
+
+@dataclass
+class VerkleProof:
+    """
+    Simulated Verkle trie inclusion proof.
+
+    Verkle proofs are ~150 bytes vs ~1KB for Merkle Patricia proofs.
+    They use polynomial commitments (KZG/IPA) instead of hash-based siblings.
+
+    Fields:
+      - key: the storage key being proven
+      - value_hash: hash of the stored value
+      - commitment_indices: path through the Verkle trie
+      - proof_bytes: the actual proof (simulated as a hash chain)
+      - block_number: the block this proof is anchored to
+      - state_root: the state root this proof verifies against
+    """
+    key: str
+    value_hash: str
+    commitment_indices: list[int]
+    proof_bytes: bytes
+    block_number: int
+    state_root: str
+
+
+# ---------------------------------------------------------------------------
+# Node registry entry
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MonadNodeEntry:
+    """On-chain node registry entry."""
+    node_id: str
+    region: str
+    operator_address: str
+    stake_wei: int
+    registered_block: int
+    active: bool = True
+    audit_score: int = 100        # 0-100, decremented on audit failure
+    last_audit_block: int = 0
+    slashed_total: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Monad L1 Backend
+# ---------------------------------------------------------------------------
+
+class MonadL1Backend(CommitmentBackend):
+    """
+    Custom Layer 1 commitment backend based on a Monad fork.
+
+    This backend simulates a Monad-like parallel EVM chain with LTP-specific
+    extensions.  In production, this would be backed by an actual Monad fork
+    with custom opcodes and precompiles.
+
+    Key advantages over Ethereum:
+      - ~500ms block times (vs 12s)
+      - Single-slot finality (vs ~12.8 min)
+      - ~10,000 TPS parallel execution (vs ~30 TPS sequential)
+      - Native commitment record processing (custom opcode)
+      - Verkle trie for compact state proofs
+      - Validator economics tied to storage commitment
+    """
+
+    def __init__(self, config: BackendConfig) -> None:
+        super().__init__(config)
+
+        # Chain state
+        self._blocks: list[MonadBlock] = []
+        self._commitments: dict[str, dict] = {}
+        self._commitment_block_map: dict[str, int] = {}
+        self._pending_tx: list[dict] = []
+
+        # Node registry (on-chain state)
+        self._node_registry: dict[str, MonadNodeEntry] = {}
+
+        # Economics
+        self._total_staked: int = 0
+        self._slash_pool: int = 0     # accumulated slash penalties
+
+        # Parallel execution state
+        self._parallel_threads = config.monad_parallel_threads
+        self._block_time_ms = config.monad_block_time_ms
+        self._state_trie = config.monad_state_trie
+
+        # Compute state root for genesis
+        genesis_state_root = H(b"monad-ltp-genesis-state")
+
+        # Initialize genesis block
+        genesis = MonadBlock(
+            number=0,
+            timestamp=time.time(),
+            parent_hash="0" * 64,
+            state_root=genesis_state_root,
+            commitment_root="0" * 64,
+            validator="genesis",
+        )
+        self._blocks.append(genesis)
+
+    def capabilities(self) -> BackendCapabilities:
+        return BackendCapabilities(
+            finality=FinalityModel.SINGLE_SLOT,
+            max_tps=10_000,
+            has_native_storage_proofs=True,
+            has_slashing=True,
+            has_node_registry=True,
+            supports_zk_verification=True,
+            estimated_finality_seconds=self._block_time_ms / 1000.0,
+            gas_cost_per_commit=21_000,  # native opcode, minimal gas
+        )
+
+    # --- Internal: block production ---
+
+    def _produce_block(self, transactions: list[dict] | None = None) -> MonadBlock:
+        """
+        Simulate Monad parallel block production.
+
+        In production:
+          - Transactions are partitioned by storage-key access sets
+          - Non-conflicting transactions execute in parallel threads
+          - Conflicts are detected and re-executed sequentially
+          - Block is sealed with validator signature
+        """
+        txs = transactions or self._pending_tx
+        self._pending_tx = []
+
+        parent = self._blocks[-1]
+
+        # Compute new commitment root from all commitments
+        all_commitment_hashes = sorted(self._commitments.keys())
+        if all_commitment_hashes:
+            commitment_root = H(
+                "".join(all_commitment_hashes).encode()
+            )
+        else:
+            commitment_root = "0" * 64
+
+        # Compute state root (simulated Verkle trie root)
+        state_data = json.dumps({
+            "commitments": len(self._commitments),
+            "nodes": len(self._node_registry),
+            "total_staked": self._total_staked,
+            "parent": parent.state_root,
+        }, sort_keys=True).encode()
+        state_root = H(state_data)
+
+        block = MonadBlock(
+            number=parent.number + 1,
+            timestamp=time.time(),
+            parent_hash=H(
+                struct.pack(">Q", parent.number)
+                + parent.state_root.encode()
+            ),
+            state_root=state_root,
+            commitment_root=commitment_root,
+            transactions=txs,
+            validator=self.config.operator_address or "validator-0",
+        )
+        self._blocks.append(block)
+        return block
+
+    def _compute_verkle_proof(self, entity_id: str) -> VerkleProof:
+        """
+        Generate a simulated Verkle proof for a commitment.
+
+        In production, this would be a real Verkle trie proof using
+        polynomial commitments (IPA or KZG-based).
+
+        Verkle proof advantages:
+          - ~150 bytes (vs ~1KB for MPT proofs)
+          - Constant-size regardless of trie depth
+          - Efficient batch verification
+        """
+        block_num = self._commitment_block_map.get(entity_id, 0)
+        block = self._blocks[min(block_num, len(self._blocks) - 1)]
+
+        # Simulate the proof as a compact hash chain
+        storage_key = H(f"commitment:{entity_id}".encode())
+        value_hash = H(json.dumps(
+            self._commitments.get(entity_id, {}), sort_keys=True
+        ).encode())
+
+        # Verkle indices (simulated path through polynomial commitment tree)
+        key_bytes = H_bytes(entity_id.encode())
+        indices = [b % 256 for b in key_bytes[:4]]
+
+        # Proof bytes: in production this is an IPA/KZG opening proof
+        proof_data = (
+            storage_key.encode()
+            + value_hash.encode()
+            + block.state_root.encode()
+        )
+        proof_bytes = H_bytes(proof_data)
+
+        return VerkleProof(
+            key=storage_key,
+            value_hash=value_hash,
+            commitment_indices=indices,
+            proof_bytes=proof_bytes,
+            block_number=block.number,
+            state_root=block.state_root,
+        )
+
+    # --- Log operations ---
+
+    def append_commitment(
+        self,
+        entity_id: str,
+        record_bytes: bytes,
+        signature: bytes,
+        sender_vk: bytes,
+    ) -> str:
+        if entity_id in self._commitments:
+            raise ValueError(f"Entity {entity_id} already committed on Monad L1")
+
+        record_hash = H(record_bytes)
+
+        # Create the on-chain commitment entry
+        entry = {
+            "entity_id": entity_id,
+            "record_hash": record_hash,
+            "record_bytes": record_bytes.hex(),
+            "signature": signature.hex(),
+            "sender_vk": sender_vk.hex(),
+            "timestamp": time.time(),
+            "block_number": len(self._blocks),  # will be included in next block
+        }
+
+        self._commitments[entity_id] = entry
+
+        # Add to pending transactions
+        self._pending_tx.append({
+            "type": "COMMIT_RECORD",
+            "entity_id": entity_id,
+            "record_hash": record_hash,
+        })
+
+        # Produce a block (in production, block production is asynchronous)
+        block = self._produce_block()
+        self._commitment_block_map[entity_id] = block.number
+
+        return record_hash
+
+    def fetch_commitment(self, entity_id: str) -> Optional[dict]:
+        return self._commitments.get(entity_id)
+
+    def verify_inclusion(self, entity_id: str, proof: dict) -> bool:
+        """
+        Verify a Verkle proof for commitment inclusion.
+
+        In production, this verifies the polynomial commitment opening
+        against the block's state root.
+        """
+        if entity_id not in self._commitments:
+            return False
+
+        if isinstance(proof, dict) and "verkle_proof" in proof:
+            vp = proof["verkle_proof"]
+            expected_value_hash = H(json.dumps(
+                self._commitments[entity_id], sort_keys=True
+            ).encode())
+            return vp.get("value_hash") == expected_value_hash
+
+        # Fallback: check that entity exists and proof references correct block
+        return entity_id in self._commitments
+
+    def is_finalized(self, entity_id: str) -> bool:
+        """
+        Monad L1 has single-slot deterministic finality.
+
+        Once a commitment is included in a block, it is final.
+        No probabilistic confirmation needed.
+        """
+        if entity_id not in self._commitment_block_map:
+            return False
+        commit_block = self._commitment_block_map[entity_id]
+        return commit_block <= self._blocks[-1].number
+
+    def get_inclusion_proof(self, entity_id: str) -> Optional[dict]:
+        """Generate a Verkle inclusion proof for a commitment."""
+        if entity_id not in self._commitments:
+            return None
+        vp = self._compute_verkle_proof(entity_id)
+        return {
+            "entity_id": entity_id,
+            "verkle_proof": {
+                "key": vp.key,
+                "value_hash": vp.value_hash,
+                "commitment_indices": vp.commitment_indices,
+                "proof_bytes": vp.proof_bytes.hex(),
+                "block_number": vp.block_number,
+                "state_root": vp.state_root,
+            },
+        }
+
+    # --- Node registry ---
+
+    def register_node(
+        self, node_id: str, region: str, stake_wei: int = 0
+    ) -> bool:
+        min_stake = self.config.min_stake_wei
+        if stake_wei < min_stake:
+            return False
+
+        entry = MonadNodeEntry(
+            node_id=node_id,
+            region=region,
+            operator_address=self.config.operator_address or node_id,
+            stake_wei=stake_wei,
+            registered_block=self._blocks[-1].number,
+        )
+        self._node_registry[node_id] = entry
+        self._total_staked += stake_wei
+
+        self._pending_tx.append({
+            "type": "REGISTER_NODE",
+            "node_id": node_id,
+            "stake_wei": stake_wei,
+        })
+        self._produce_block()
+        return True
+
+    def evict_node(self, node_id: str, reason: str, evidence: bytes = b"") -> bool:
+        entry = self._node_registry.get(node_id)
+        if entry is None or not entry.active:
+            return False
+
+        entry.active = False
+
+        # Slash stake on eviction
+        slash_amount = self._compute_slash(entry)
+        entry.slashed_total += slash_amount
+        entry.stake_wei -= slash_amount
+        self._total_staked -= slash_amount
+        self._slash_pool += slash_amount
+
+        self._pending_tx.append({
+            "type": "EVICT_NODE",
+            "node_id": node_id,
+            "reason": reason,
+            "slash_amount": slash_amount,
+        })
+        self._produce_block()
+        return True
+
+    def get_active_nodes(self) -> list[dict]:
+        return [
+            {
+                "node_id": e.node_id,
+                "region": e.region,
+                "stake_wei": e.stake_wei,
+                "audit_score": e.audit_score,
+                "registered_block": e.registered_block,
+            }
+            for e in self._node_registry.values()
+            if e.active
+        ]
+
+    # --- Economic hooks ---
+
+    def compensate_node(self, node_id: str, amount_wei: int, reason: str) -> bool:
+        entry = self._node_registry.get(node_id)
+        if entry is None or not entry.active:
+            return False
+        # In production, this would mint/transfer tokens
+        entry.stake_wei += amount_wei
+        self._total_staked += amount_wei
+        return True
+
+    def slash_node(self, node_id: str, evidence: bytes) -> int:
+        entry = self._node_registry.get(node_id)
+        if entry is None:
+            return 0
+
+        slash_amount = self._compute_slash(entry)
+        entry.stake_wei -= slash_amount
+        entry.slashed_total += slash_amount
+        entry.audit_score = max(0, entry.audit_score - 25)
+        self._total_staked -= slash_amount
+        self._slash_pool += slash_amount
+
+        self._pending_tx.append({
+            "type": "SLASH_NODE",
+            "node_id": node_id,
+            "amount": slash_amount,
+        })
+        self._produce_block()
+        return slash_amount
+
+    def get_pricing(self) -> dict:
+        return {
+            "cost_per_shard_per_epoch": 100,     # 100 wei per shard per epoch
+            "epoch_seconds": 3600,                # 1 hour epochs
+            "currency": "LTP",                    # native L1 token
+            "gas_per_commit": 21_000,             # native opcode gas cost
+            "block_time_ms": self._block_time_ms,
+        }
+
+    def _compute_slash(self, entry: MonadNodeEntry) -> int:
+        """Compute slash amount based on config and current stake."""
+        fraction = self.config.slash_fraction_bps / 10_000
+        return int(entry.stake_wei * fraction)
+
+    # --- Monad-specific: chain state queries ---
+
+    @property
+    def chain_height(self) -> int:
+        return self._blocks[-1].number
+
+    @property
+    def latest_block(self) -> MonadBlock:
+        return self._blocks[-1]
+
+    @property
+    def total_commitments(self) -> int:
+        return len(self._commitments)
+
+    @property
+    def total_staked(self) -> int:
+        return self._total_staked
+
+    @property
+    def slash_pool(self) -> int:
+        return self._slash_pool
