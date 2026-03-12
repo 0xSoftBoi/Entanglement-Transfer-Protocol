@@ -523,6 +523,58 @@ class EthereumBackend(CommitmentBackend):
         fraction = self.config.slash_fraction_bps / 10_000
         return int(entry["stake_wei"] * fraction)
 
+    # --- Batch operations (amortized gas via calldata batching) ---
+
+    def append_commitments_batch(
+        self,
+        commitments: list[tuple[str, bytes, bytes, bytes]],
+    ) -> list[str]:
+        """
+        Append multiple commitments in a single transaction.
+
+        On Ethereum, batching amortizes the 21K base gas cost across
+        all commits. Each additional commitment adds ~60K marginal gas
+        (vs ~80K individually including base cost).
+
+        On L2, this is even more effective since the batch is posted
+        as a single blob to L1.
+        """
+        refs = []
+        batch_data = []
+
+        for entity_id, record_bytes, signature, sender_vk in commitments:
+            if entity_id in self._commitments:
+                raise ValueError(f"Entity {entity_id} already committed on Ethereum")
+
+            record_hash = H(record_bytes)
+            entry = {
+                "entity_id": entity_id,
+                "record_hash": record_hash,
+                "record_bytes": record_bytes.hex(),
+                "signature": signature.hex(),
+                "sender_vk": sender_vk.hex(),
+                "timestamp": time.time(),
+            }
+            self._commitments[entity_id] = entry
+            batch_data.append({"entity_id": entity_id, "record_hash": record_hash})
+            refs.append(record_hash)
+
+        # Single transaction for all commits
+        # Gas: 21K base + 60K per commit (vs 80K each individually)
+        batch_gas = 21_000 + 60_000 * len(commitments)
+        receipt = self._submit_tx(
+            "BatchCommitRecords",
+            {"count": len(commitments), "commits": batch_data},
+            gas=batch_gas,
+        )
+
+        for entity_id, _, _, _ in commitments:
+            self._commitment_block_map[entity_id] = receipt.block_number
+            self._commitments[entity_id]["block_number"] = receipt.block_number
+            self._commitments[entity_id]["tx_hash"] = receipt.tx_hash
+
+        return refs
+
     # --- Ethereum-specific queries ---
 
     @property

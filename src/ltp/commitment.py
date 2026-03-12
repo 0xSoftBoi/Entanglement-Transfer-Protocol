@@ -298,23 +298,49 @@ class CommitmentNetwork:
       - Storage proof auditing with burst challenges
       - Node eviction and shard repair
       - Correlated failure analysis (regional failure model)
+
+    Performance:
+      - Placement results are cached (invalidated on node list change)
+      - Audit uses reverse index: node_id → [(entity_id, shard_index)]
+        for O(S) audit where S = shards on node, instead of O(N·n).
     """
 
     def __init__(self) -> None:
         self.nodes: list[CommitmentNode] = []
         self.log = CommitmentLog()
+        # Cache: (entity_id, shard_index, replicas) → [CommitmentNode]
+        self._placement_cache: dict[tuple[str, int, int], list[CommitmentNode]] = {}
+        self._node_count_at_cache: int = 0
+        # Reverse index: node_id → set of (entity_id, shard_index)
+        self._node_shard_index: dict[str, set[tuple[str, int]]] = {}
+
+    def _invalidate_placement_cache(self) -> None:
+        """Clear placement cache when node list changes."""
+        self._placement_cache.clear()
+        self._node_count_at_cache = len(self.nodes)
 
     def add_node(self, node_id: str, region: str) -> CommitmentNode:
         node = CommitmentNode(node_id, region)
         self.nodes.append(node)
+        self._node_shard_index[node_id] = set()
+        self._invalidate_placement_cache()
         return node
 
     def _placement(
         self, entity_id: str, shard_index: int, replicas: int = 2
     ) -> list[CommitmentNode]:
-        """Deterministic shard placement via consistent hashing."""
+        """Deterministic shard placement via consistent hashing (cached)."""
         if not self.nodes:
             raise ValueError("No commitment nodes available")
+
+        # Invalidate cache if node count changed
+        if len(self.nodes) != self._node_count_at_cache:
+            self._invalidate_placement_cache()
+
+        cache_key = (entity_id, shard_index, replicas)
+        cached = self._placement_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         placement_key = f"{entity_id}:{shard_index}"
         h = int.from_bytes(H_bytes(placement_key.encode()), "big")
@@ -325,6 +351,7 @@ class CommitmentNetwork:
             if self.nodes[idx] not in selected:
                 selected.append(self.nodes[idx])
 
+        self._placement_cache[cache_key] = selected
         return selected
 
     def distribute_encrypted_shards(
@@ -344,8 +371,12 @@ class CommitmentNetwork:
             target_nodes = self._placement(entity_id, i, replicas)
             for node in target_nodes:
                 node.store_shard(entity_id, i, enc_shard)
+                # Update reverse index for O(S) audit
+                self._node_shard_index.setdefault(node.node_id, set()).add(
+                    (entity_id, i)
+                )
 
-        return H(''.join(shard_hashes).encode())
+        return H(b''.join(h.encode() for h in shard_hashes))
 
     def fetch_encrypted_shards(
         self, entity_id: str, n: int, k: int
@@ -374,6 +405,9 @@ class CommitmentNetwork:
         """
         Audit a single node via storage proof challenges.
 
+        Uses reverse index (node_id → shards) for O(S) lookup where
+        S = shards on this node, instead of scanning all N entities.
+
         Anti-outsourcing: burst challenges issue `burst` simultaneous nonces
         per shard, multiplying relay latency and making outsourcing detectable.
 
@@ -386,47 +420,55 @@ class CommitmentNetwork:
         suspicious_latency = 0
         response_times: list[float] = []
 
-        for entity_id in self.log._chain:
-            record = self.log.fetch(entity_id)
-            if record is None:
-                continue
-            n = record.encoding_params.get("n", 8)
-            for shard_index in range(n):
-                target_nodes = self._placement(entity_id, shard_index)
-                if node not in target_nodes:
+        # Use reverse index if available; fall back to full scan
+        node_shards = self._node_shard_index.get(node.node_id)
+        if node_shards is not None and len(node_shards) > 0:
+            shard_list = list(node_shards)
+        else:
+            # Fall back to full scan for backward compatibility
+            shard_list = []
+            for entity_id in self.log._chain:
+                record = self.log.fetch(entity_id)
+                if record is None:
                     continue
+                n = record.encoding_params.get("n", 8)
+                for shard_index in range(n):
+                    target_nodes = self._placement(entity_id, shard_index)
+                    if node in target_nodes:
+                        shard_list.append((entity_id, shard_index))
 
-                nonces = [os.urandom(16) for _ in range(burst)]
-                burst_pass = True
+        for entity_id, shard_index in shard_list:
+            nonces = [os.urandom(16) for _ in range(burst)]
+            burst_pass = True
 
-                for nonce in nonces:
-                    t0 = time.monotonic()
-                    response = node.respond_to_audit(entity_id, shard_index, nonce)
-                    elapsed = time.monotonic() - t0
-                    response_times.append(elapsed)
-                    challenged += 1
+            for nonce in nonces:
+                t0 = time.monotonic()
+                response = node.respond_to_audit(entity_id, shard_index, nonce)
+                elapsed = time.monotonic() - t0
+                response_times.append(elapsed)
+                challenged += 1
 
-                    if response is None:
-                        missing += 1
+                if response is None:
+                    missing += 1
+                    failed += 1
+                    burst_pass = False
+                else:
+                    known_good = self._get_known_good_hash(
+                        entity_id, shard_index, nonce, exclude_node=node
+                    )
+                    if known_good is not None and response == known_good:
+                        passed += 1
+                    elif known_good is None:
+                        passed += 1
+                    else:
                         failed += 1
                         burst_pass = False
-                    else:
-                        known_good = self._get_known_good_hash(
-                            entity_id, shard_index, nonce, exclude_node=node
-                        )
-                        if known_good is not None and response == known_good:
-                            passed += 1
-                        elif known_good is None:
-                            passed += 1
-                        else:
-                            failed += 1
-                            burst_pass = False
 
-                if burst > 1 and burst_pass and response_times:
-                    burst_latencies = response_times[-burst:]
-                    max_burst_latency = max(burst_latencies)
-                    if max_burst_latency > 0.001:
-                        suspicious_latency += 1
+            if burst > 1 and burst_pass and response_times:
+                burst_latencies = response_times[-burst:]
+                max_burst_latency = max(burst_latencies)
+                if max_burst_latency > 0.001:
+                    suspicious_latency += 1
 
         if challenged == 0:
             result = "PASS"

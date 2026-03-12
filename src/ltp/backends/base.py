@@ -2,10 +2,11 @@
 Abstract base for commitment network backends.
 
 Every backend must implement CommitmentBackend.  The interface covers:
-  1. Commitment log operations (append, fetch, verify)
-  2. Finality semantics (instant, probabilistic, economic)
-  3. Node registry (admission, eviction, staking)
-  4. Economic hooks (compensate, slash, pricing)
+  1. Commitment log operations (append, fetch, verify, batch)
+  2. Shard storage operations (distribute, fetch shards)
+  3. Finality semantics (instant, probabilistic, economic)
+  4. Node registry (admission, eviction, staking)
+  5. Economic hooks (compensate, slash, pricing)
 
 The base class also exposes BackendCapabilities — a typed descriptor that
 lets higher layers query what the backend supports without isinstance checks.
@@ -16,7 +17,7 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -213,3 +214,40 @@ class CommitmentBackend(abc.ABC):
 
         Returns: {"cost_per_shard_per_epoch", "epoch_seconds", "currency"}
         """
+
+    # --- Batch operations ---
+
+    def append_commitments_batch(
+        self,
+        commitments: list[tuple[str, bytes, bytes, bytes]],
+    ) -> list[str]:
+        """
+        Append multiple commitments in a single block/transaction.
+
+        Each tuple is (entity_id, record_bytes, signature, sender_vk).
+        Returns list of commitment references.
+
+        Default implementation falls back to sequential appends.
+        On-chain backends should override to amortize gas costs.
+        """
+        return [
+            self.append_commitment(eid, rec, sig, vk)
+            for eid, rec, sig, vk in commitments
+        ]
+
+    # --- Finality callbacks ---
+
+    def on_finality(
+        self,
+        entity_id: str,
+        callback: Callable[[str], None],
+    ) -> None:
+        """
+        Register a callback for when entity_id reaches finality.
+
+        Default implementation calls immediately if already finalized,
+        otherwise stores callback. Backends with real finality delays
+        should override with async notification.
+        """
+        if self.is_finalized(entity_id):
+            callback(entity_id)

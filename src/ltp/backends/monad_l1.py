@@ -465,6 +465,50 @@ class MonadL1Backend(CommitmentBackend):
         fraction = self.config.slash_fraction_bps / 10_000
         return int(entry.stake_wei * fraction)
 
+    # --- Batch operations (amortized gas via parallel execution) ---
+
+    def append_commitments_batch(
+        self,
+        commitments: list[tuple[str, bytes, bytes, bytes]],
+    ) -> list[str]:
+        """
+        Append multiple commitments in a single block.
+
+        Monad's parallel execution handles non-conflicting commits
+        simultaneously, amortizing block production overhead.
+        Gas cost: ~21K per commit (same as single), but block overhead
+        is paid once instead of N times.
+        """
+        refs = []
+        for entity_id, record_bytes, signature, sender_vk in commitments:
+            if entity_id in self._commitments:
+                raise ValueError(f"Entity {entity_id} already committed on Monad L1")
+
+            record_hash = H(record_bytes)
+            entry = {
+                "entity_id": entity_id,
+                "record_hash": record_hash,
+                "record_bytes": record_bytes.hex(),
+                "signature": signature.hex(),
+                "sender_vk": sender_vk.hex(),
+                "timestamp": time.time(),
+                "block_number": len(self._blocks),
+            }
+            self._commitments[entity_id] = entry
+            self._pending_tx.append({
+                "type": "COMMIT_RECORD",
+                "entity_id": entity_id,
+                "record_hash": record_hash,
+            })
+            refs.append(record_hash)
+
+        # Single block for all commits (parallel execution)
+        block = self._produce_block()
+        for entity_id, _, _, _ in commitments:
+            self._commitment_block_map[entity_id] = block.number
+
+        return refs
+
     # --- Monad-specific: chain state queries ---
 
     @property
