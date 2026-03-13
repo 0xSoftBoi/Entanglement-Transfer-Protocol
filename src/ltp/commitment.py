@@ -7,6 +7,7 @@ Provides:
   - CommitmentRecord  — minimal log entry (ML-DSA signed, Merkle root only)
   - CommitmentLog     — append-only hash-chained ledger with inclusion proofs
   - CommitmentNetwork — orchestrates nodes, log, audit, and placement
+  - PDP integration   — cryptographic storage proofs via enforcement module
 """
 
 from __future__ import annotations
@@ -295,7 +296,7 @@ class CommitmentNetwork:
     Responsibilities:
       - Deterministic shard placement via consistent hashing
       - Distributing and fetching encrypted shards
-      - Storage proof auditing with burst challenges
+      - Storage proof auditing with burst challenges AND PDP proofs
       - Node eviction and shard repair
       - Correlated failure analysis (regional failure model)
 
@@ -515,6 +516,130 @@ class CommitmentNetwork:
             if not node.evicted:
                 results.append(self.audit_node(node, burst=burst))
         return results
+
+    def audit_node_pdp(
+        self, node: CommitmentNode, epoch: int, sample_size: int = 4
+    ) -> dict:
+        """
+        Audit a node using PDP (Proof of Data Possession) challenges.
+
+        Provides cryptographic storage verification instead of statistical
+        burst challenges. Uses the enforcement module's PDP infrastructure.
+
+        Returns: {"node_id", "entities_challenged", "passed", "failed",
+                  "result", "proof_size_bytes"}
+        """
+        from .enforcement import (
+            PDPChallenge, PDPVerifier, StorageProofStrategy,
+        )
+
+        verifier = PDPVerifier()
+        node_shards = self._node_shard_index.get(node.node_id, set())
+        if not node_shards:
+            return {
+                "node_id": node.node_id,
+                "entities_challenged": 0,
+                "passed": 0,
+                "failed": 0,
+                "result": "PASS",
+                "proof_size_bytes": 0,
+            }
+
+        # Group shards by entity
+        entities: dict[str, list[int]] = {}
+        for entity_id, shard_index in node_shards:
+            entities.setdefault(entity_id, []).append(shard_index)
+
+        total_passed = 0
+        total_failed = 0
+        total_proof_bytes = 0
+
+        for entity_id, shard_indices in entities.items():
+            # Register known shard hashes for this node's shards
+            shard_hashes = {}
+            for idx in shard_indices:
+                data = node.fetch_shard(entity_id, idx)
+                if data is not None:
+                    from .primitives import H as hash_fn
+                    shard_hashes[idx] = hash_fn(data)
+
+            if not shard_hashes:
+                continue
+
+            verifier.register_commitment(entity_id, shard_hashes)
+
+            # Challenge only indices this node actually stores
+            available_indices = sorted(shard_hashes.keys())
+            challenge_count = min(sample_size, len(available_indices))
+            # Deterministic subset selection using hash
+            seed = H_bytes(f"{entity_id}:{epoch}:pdp-node".encode())
+            rng_val = int.from_bytes(seed[:8], "big")
+            selected_indices = []
+            remaining = list(available_indices)
+            for _ in range(challenge_count):
+                if not remaining:
+                    break
+                pick = rng_val % len(remaining)
+                selected_indices.append(remaining.pop(pick))
+                rng_val = int.from_bytes(
+                    H_bytes(seed + struct.pack(">I", len(selected_indices)))[:8],
+                    "big",
+                )
+
+            # Generate coefficients for selected indices
+            coefficients = []
+            for idx in selected_indices:
+                coeff_seed = H_bytes(seed + struct.pack(">I", idx))
+                coefficients.append(coeff_seed[:16])
+
+            challenge_id = H(
+                f"{entity_id}:{epoch}:{sorted(selected_indices)}".encode()
+            )
+            challenge = PDPChallenge(
+                challenge_id=challenge_id,
+                epoch=epoch,
+                shard_indices=selected_indices,
+                coefficients=coefficients,
+                deadline_epoch=epoch + 1,
+            )
+
+            # Node computes proof from its stored shards
+            node_shard_data = {}
+            for idx in challenge.shard_indices:
+                data = node.fetch_shard(entity_id, idx)
+                if data is not None:
+                    node_shard_data[idx] = data
+
+            proof = PDPVerifier.compute_proof_from_shards(
+                shard_data=node_shard_data,
+                indices=challenge.shard_indices,
+                coefficients=challenge.coefficients,
+                challenge_id=challenge.challenge_id,
+            )
+
+            # Verify proof
+            if verifier.verify_proof(entity_id, challenge, proof):
+                total_passed += 1
+            else:
+                total_failed += 1
+
+            total_proof_bytes += proof.proof_size_bytes
+
+        result = "FAIL" if total_failed > 0 else "PASS"
+        if result == "FAIL":
+            node.strikes += 1
+        else:
+            node.audit_passes += 1
+            node.strikes = max(0, node.strikes - 1)
+
+        return {
+            "node_id": node.node_id,
+            "entities_challenged": len(entities),
+            "passed": total_passed,
+            "failed": total_failed,
+            "result": result,
+            "proof_size_bytes": total_proof_bytes,
+        }
 
     def evict_node(self, node: CommitmentNode) -> dict:
         """

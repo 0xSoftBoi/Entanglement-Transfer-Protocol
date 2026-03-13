@@ -226,6 +226,9 @@ class EconomicsConfig:
     # --- Slashing grace period ---
     slash_grace_epochs: int = 168          # 7 days before slash is finalized
 
+    # --- Programmable slashing (stake allocation change delay) ---
+    allocation_change_delay_epochs: int = 336  # 14 days before allocation changes apply
+
     # --- Capacity scaling ---
     target_shards_per_node: int = 10_000   # ideal shard density
     overload_threshold: float = 1.5        # 1.5x target → discourage more shards
@@ -659,6 +662,64 @@ class EconomicsEngine:
             return False
         slash.reversed = True
         return True
+
+    def compute_slash_for_condition(
+        self,
+        node: NodeEconomics,
+        condition_allocation_bps: int,
+        severity: str,
+        concurrent_slashed_stake: int = 0,
+        total_network_stake: int = 0,
+    ) -> tuple[int, SlashingTier]:
+        """
+        Compute slash amount for a programmable slashing condition.
+
+        Uses the condition's stake allocation to determine the at-risk
+        portion, then applies the severity-based rate and correlation
+        penalty. Integrates with the enforcement module's
+        SlashingConditionRegistry.
+
+        Args:
+            node: The node being slashed.
+            condition_allocation_bps: Basis points of stake allocated
+                to this condition (from SlashingCondition).
+            severity: Severity level from SlashResult ("warning",
+                "minor", "major", "critical").
+            concurrent_slashed_stake: Total stake being slashed this epoch.
+            total_network_stake: Total network stake for correlation calc.
+
+        Returns: (slash_amount_wei, tier)
+        """
+        # Map severity string to SlashingTier
+        severity_map = {
+            "warning": SlashingTier.WARNING,
+            "minor": SlashingTier.MINOR,
+            "major": SlashingTier.MAJOR,
+            "critical": SlashingTier.CRITICAL,
+        }
+        tier = severity_map.get(severity, SlashingTier.WARNING)
+
+        # Compute at-risk stake (only the allocated portion)
+        at_risk_stake = node.stake * condition_allocation_bps // 10_000
+
+        rate_bps = SLASHING_RATES[tier]
+        base_slash = at_risk_stake * rate_bps // 10_000
+
+        # Apply correlation penalty
+        if total_network_stake > 0 and concurrent_slashed_stake > 0:
+            cfg = self.config
+            correlation_ratio = concurrent_slashed_stake / total_network_stake
+            correlation_multiplier = min(
+                cfg.max_correlation_multiplier,
+                1.0 + cfg.correlation_scaling * correlation_ratio,
+            )
+            slash_amount = int(base_slash * correlation_multiplier)
+        else:
+            slash_amount = base_slash
+
+        # Never slash more than the node's at-risk stake
+        slash_amount = min(slash_amount, at_risk_stake)
+        return slash_amount, tier
 
     def should_evict(self, node: NodeEconomics) -> bool:
         """Whether a node should be forcibly evicted based on offense count."""
