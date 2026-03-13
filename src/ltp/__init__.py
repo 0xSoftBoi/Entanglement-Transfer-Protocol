@@ -32,17 +32,29 @@ Run demo:
   python -m ltp
 """
 
-from .primitives import H, H_bytes, AEAD, MLKEM, MLDSA
+from .primitives import (
+    H, H_bytes, AEAD, MLKEM, MLDSA,
+    SecurityProfile, HashFunction,
+    get_security_profile, set_security_profile,
+    set_crypto_provider, get_crypto_provider,
+)
 from .keypair import KeyPair, KeyRegistry, SealedBox
 from .erasure import ErasureCoder
 from .shards import ShardEncryptor
 from .entity import Entity, canonicalize_shape
 from .commitment import (
     AuditResult,
+    StakeEscrow,
+    StorageEndowment,
     CommitmentNode,
     CommitmentRecord,
     CommitmentLog,
     CommitmentNetwork,
+    MIN_STAKE_LTP,
+    STAKE_LOCKUP_SECONDS,
+    EVICTION_COOLDOWN_SECONDS,
+    CORRELATION_PENALTY_MAX,
+    WITHHOLDING_SCHEDULE,
 )
 from .lattice import LatticeKey
 from .protocol import LTPProtocol
@@ -95,11 +107,11 @@ from .compliance import (
     SIEMExporter,
     HSMConfig,
     HSMInterface,
-    SoftwareHSM,
+    SoftwareHSM as ComplianceSoftwareHSM,
     ComplianceConfig,
     ComplianceFramework,
 )
-from .primitives import set_crypto_provider, get_crypto_provider
+from .hsm import HSMBackend, SoftwareHSM
 
 
 def reset_poc_state() -> None:
@@ -116,12 +128,20 @@ def reset_poc_state() -> None:
 
 
 __all__ = [
+    # Security profiles
+    "SecurityProfile",
+    "HashFunction",
+    "get_security_profile",
+    "set_security_profile",
     # Primitives
     "H",
     "H_bytes",
     "AEAD",
     "MLKEM",
     "MLDSA",
+    # HSM
+    "HSMBackend",
+    "SoftwareHSM",
     # Keypair
     "KeyPair",
     "KeyRegistry",
@@ -135,10 +155,17 @@ __all__ = [
     "canonicalize_shape",
     # Commitment layer
     "AuditResult",
+    "StakeEscrow",
     "CommitmentNode",
     "CommitmentRecord",
     "CommitmentLog",
     "CommitmentNetwork",
+    "StorageEndowment",
+    "MIN_STAKE_LTP",
+    "STAKE_LOCKUP_SECONDS",
+    "EVICTION_COOLDOWN_SECONDS",
+    "CORRELATION_PENALTY_MAX",
+    "WITHHOLDING_SCHEDULE",
     # Lattice key
     "LatticeKey",
     # Protocol
@@ -194,7 +221,7 @@ __all__ = [
     "SIEMExporter",
     "HSMConfig",
     "HSMInterface",
-    "SoftwareHSM",
+    "ComplianceSoftwareHSM",
     "ComplianceConfig",
     "ComplianceFramework",
     "set_crypto_provider",
