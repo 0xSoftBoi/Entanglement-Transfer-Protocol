@@ -1,6 +1,8 @@
 # Code Improvement Recommendations
 
-Analysis of the Entanglement Transfer Protocol codebase — all 160 tests passing.
+> **Status: COMPLETED** — All 12 recommendations addressed. Retained for historical reference.
+
+Analysis of the Entanglement Transfer Protocol codebase — all 821 tests passing.
 
 ---
 
@@ -221,4 +223,4 @@ The comment at line 253 says "fetch all n shards so AEAD can reject bad ones" bu
 | 11 | Missing type annotations | Low | Low | **DONE** — `Optional[int]`, `Optional[dict]` in protocol.py |
 | 12 | Confusing fetch API | Low | Low | **DONE** — renamed `k` → `max_shards` with docstring |
 
-The codebase is well-structured with excellent test coverage (173 tests, all passing), thorough security property validation, and clear documentation. All 12 recommendations have been addressed.
+The codebase is well-structured with excellent test coverage (821 tests, all passing), thorough security property validation, and clear documentation. All 12 recommendations have been addressed.
