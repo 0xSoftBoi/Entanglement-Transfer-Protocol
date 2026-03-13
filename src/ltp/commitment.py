@@ -380,6 +380,9 @@ class CommitmentNetwork:
         self._node_shard_index: dict[str, set[tuple[str, int]]] = {}
         # Optional enforcement pipeline (set via set_enforcement_pipeline)
         self._enforcement_pipeline = None
+        # Compliance: geo-fence policy and audit logger (optional)
+        self._geo_fence_policy = None   # GeoFencePolicy | None
+        self._audit_logger = None       # ComplianceAuditLogger | None
 
     def _invalidate_placement_cache(self) -> None:
         """Clear placement cache when node list changes."""
@@ -390,17 +393,42 @@ class CommitmentNetwork:
         """Attach an EnforcementPipeline for integrated enforcement."""
         self._enforcement_pipeline = pipeline
 
+    def set_geo_fence_policy(self, policy) -> None:
+        """Attach a GeoFencePolicy for jurisdiction-constrained shard placement."""
+        self._geo_fence_policy = policy
+        self._invalidate_placement_cache()
+
+    def set_audit_logger(self, logger) -> None:
+        """Attach a ComplianceAuditLogger for immutable audit trail."""
+        self._audit_logger = logger
+
     def add_node(self, node_id: str, region: str) -> CommitmentNode:
         node = CommitmentNode(node_id, region)
         self.nodes.append(node)
         self._node_shard_index[node_id] = set()
         self._invalidate_placement_cache()
+
+        # Compliance: log node registration
+        if self._audit_logger is not None:
+            from .compliance import AuditEvent, AuditEventType
+            self._audit_logger.log(AuditEvent(
+                event_type=AuditEventType.NODE_REGISTERED,
+                actor_id=node_id,
+                action="node_registered",
+                details={"region": region},
+            ))
+
         return node
 
     def _placement(
         self, entity_id: str, shard_index: int, replicas: int = 2
     ) -> list[CommitmentNode]:
-        """Deterministic shard placement via consistent hashing (cached)."""
+        """
+        Deterministic shard placement via consistent hashing (cached).
+
+        When a geo-fence policy is set, only nodes in allowed jurisdictions
+        are considered for placement, enforcing data sovereignty requirements.
+        """
         if not self.nodes:
             raise ValueError("No commitment nodes available")
 
@@ -413,14 +441,23 @@ class CommitmentNetwork:
         if cached is not None:
             return cached
 
+        # Apply geo-fence filter if policy is set
+        eligible_nodes = self.nodes
+        if self._geo_fence_policy is not None:
+            eligible_nodes = self._geo_fence_policy.filter_nodes(self.nodes)
+            if not eligible_nodes:
+                raise ValueError(
+                    "No commitment nodes available in allowed jurisdictions"
+                )
+
         placement_key = f"{entity_id}:{shard_index}"
         h = int.from_bytes(H_bytes(placement_key.encode()), "big")
 
         selected = []
         for r in range(replicas):
-            idx = (h + r * 7) % len(self.nodes)
-            if self.nodes[idx] not in selected:
-                selected.append(self.nodes[idx])
+            idx = (h + r * 7) % len(eligible_nodes)
+            if eligible_nodes[idx] not in selected:
+                selected.append(eligible_nodes[idx])
 
         self._placement_cache[cache_key] = selected
         return selected
@@ -447,7 +484,24 @@ class CommitmentNetwork:
                     (entity_id, i)
                 )
 
-        return H(b''.join(h.encode() for h in shard_hashes))
+        merkle_root = H(b''.join(h.encode() for h in shard_hashes))
+
+        # Compliance: log shard distribution event
+        if self._audit_logger is not None:
+            from .compliance import AuditEvent, AuditEventType
+            self._audit_logger.log(AuditEvent(
+                event_type=AuditEventType.ENTITY_COMMITTED,
+                actor_id="system",
+                target_id=entity_id,
+                action="shards_distributed",
+                details={
+                    "shard_count": len(encrypted_shards),
+                    "replicas": replicas,
+                    "merkle_root": merkle_root,
+                },
+            ))
+
+        return merkle_root
 
     def fetch_encrypted_shards(
         self, entity_id: str, n: int, k: int
@@ -768,12 +822,25 @@ class CommitmentNetwork:
             if not replica_found:
                 lost += 1
 
-        return {
+        eviction_result = {
             "evicted_node": node.node_id,
             "shards_affected": len(orphaned_shards),
             "repaired": repaired,
             "lost": lost,
         }
+
+        # Compliance: log node eviction
+        if self._audit_logger is not None:
+            from .compliance import AuditEvent, AuditEventType
+            self._audit_logger.log(AuditEvent(
+                event_type=AuditEventType.NODE_EVICTED,
+                actor_id="system",
+                target_id=node.node_id,
+                action="node_evicted",
+                details=eviction_result,
+            ))
+
+        return eviction_result
 
     @property
     def active_node_count(self) -> int:

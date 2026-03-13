@@ -953,5 +953,284 @@ def demo() -> None:
     print("=" * 74)
 
 
+def compliance_demo() -> None:
+    """Demonstrate institutional compliance features."""
+
+    print()
+    print("=" * 74)
+    print("  INSTITUTIONAL COMPLIANCE FRAMEWORK")
+    print("  Standards: FIPS 140-3 | SOC 2 | FedRAMP | GDPR | Basel III")
+    print("=" * 74)
+    print()
+
+    from .compliance import (
+        AuditEvent,
+        AuditEventType,
+        ComplianceAuditLogger,
+        ComplianceConfig,
+        ComplianceFramework,
+        ComplianceRole,
+        CryptoProviderMode,
+        DeletionProof,
+        FIPSCryptoProvider,
+        GDPRDeletionManager,
+        GeoFencePolicy,
+        HSMConfig,
+        Jurisdiction,
+        KeyRotationManager,
+        KeyRotationPolicy,
+        Permission,
+        RBACManager,
+        SIEMExporter,
+        SIEMFormat,
+        SoftwareHSM,
+    )
+
+    # --- 1. FIPS Crypto Provider ---
+    print("▸ 1. FIPS 140-3 Crypto Provider")
+    provider = FIPSCryptoProvider(CryptoProviderMode.DEFAULT)
+    info = provider.algorithm_info()
+    print(f"  Mode: {info['mode']}")
+    print(f"  Hash: {info['hash']}")
+    print(f"  AEAD: {info['aead']}")
+    print(f"  KEM:  {info['kem']}")
+    print(f"  DSA:  {info['dsa']}")
+    print(f"  FIPS OpenSSL available: {info['fips_available']}")
+    # Test hashing
+    test_data = b"compliance test data"
+    h = provider.hash(test_data)
+    print(f"  Hash output: {h[:40]}...")
+    # Test AEAD round-trip
+    key = os.urandom(32)
+    nonce = os.urandom(16)
+    ct = provider.encrypt(key, test_data, nonce)
+    pt = provider.decrypt(key, ct, nonce)
+    assert pt == test_data, "AEAD round-trip failed"
+    print(f"  AEAD round-trip: OK ({len(ct)} bytes ciphertext)")
+    print()
+
+    # --- 2. RBAC ---
+    print("▸ 2. Role-Based Access Control (SOC 2 CC6.1)")
+    rbac = RBACManager()
+    rbac.create_policy("alice", {ComplianceRole.SENDER})
+    rbac.create_policy("bob", {ComplianceRole.RECEIVER})
+    rbac.create_policy("charlie", {ComplianceRole.AUDITOR})
+    rbac.create_policy("admin-0", {ComplianceRole.ADMIN})
+
+    checks = [
+        ("alice", Permission.ENTITY_COMMIT, True),
+        ("alice", Permission.SLASH_EXECUTE, False),
+        ("bob", Permission.ENTITY_MATERIALIZE, True),
+        ("bob", Permission.GDPR_DELETE, False),
+        ("charlie", Permission.AUDIT_LOG_READ, True),
+        ("charlie", Permission.ENTITY_COMMIT, False),
+        ("admin-0", Permission.CONFIG_MODIFY, True),
+    ]
+    for identity, perm, expected in checks:
+        result = rbac.check_permission(identity, perm)
+        status = "PASS" if result == expected else "FAIL"
+        print(f"  [{status}] {identity}.has({perm.value}) = {result}")
+    print()
+
+    # --- 3. Geo-Fencing ---
+    print("▸ 3. Geo-Fenced Shard Placement (Data Sovereignty)")
+    # FedRAMP policy: US-only
+    fed_policy = GeoFencePolicy(
+        allowed_jurisdictions={Jurisdiction.US, Jurisdiction.US_GOVCLOUD},
+    )
+    test_regions = [
+        ("us-east-1", True),
+        ("us-west-2", True),
+        ("us_gov-east-1", True),
+        ("eu-west-1", False),
+        ("ap-southeast-1", False),
+    ]
+    for region, expected in test_regions:
+        allowed = fed_policy.is_region_allowed(region)
+        status = "PASS" if allowed == expected else "FAIL"
+        print(f"  [{status}] Region '{region}' → {'allowed' if allowed else 'blocked'}")
+
+    # Create a network with geo-fencing
+    network = CommitmentNetwork()
+    network.set_geo_fence_policy(fed_policy)
+    us_node = network.add_node("us-node-1", "us-east-1")
+    us_node2 = network.add_node("us-node-2", "us-west-2")
+    eu_node = network.add_node("eu-node-1", "eu-west-1")
+    # Distribute shards — should only go to US nodes
+    test_shards = [os.urandom(64) for _ in range(4)]
+    merkle_root = network.distribute_encrypted_shards("test-entity", test_shards)
+    us_shards = us_node.shard_count + us_node2.shard_count
+    eu_shards = eu_node.shard_count
+    print(f"  Shards on US nodes: {us_shards}")
+    print(f"  Shards on EU nodes: {eu_shards} (geo-fenced out)")
+    assert eu_shards == 0, "Geo-fence violation: shards placed in EU"
+    print(f"  [PASS] Geo-fence enforced: all shards in US jurisdiction")
+    print()
+
+    # --- 4. Audit Logger ---
+    print("▸ 4. Immutable Audit Log (SOC 2 CC7.1, FedRAMP AU-2)")
+    logger = ComplianceAuditLogger(operator_id="ltp-operator-1")
+    events = [
+        AuditEvent(
+            event_type=AuditEventType.NODE_REGISTERED,
+            actor_id="us-node-1",
+            action="node_registered",
+            details={"region": "us-east-1"},
+            epoch=1,
+        ),
+        AuditEvent(
+            event_type=AuditEventType.ENTITY_COMMITTED,
+            actor_id="alice",
+            target_id="entity-001",
+            action="entity_committed",
+            epoch=2,
+        ),
+        AuditEvent(
+            event_type=AuditEventType.NODE_AUDITED,
+            actor_id="system",
+            target_id="us-node-1",
+            action="audit_passed",
+            details={"result": "PASS", "challenged": 4, "passed": 4},
+            epoch=3,
+        ),
+        AuditEvent(
+            event_type=AuditEventType.ACCESS_DENIED,
+            actor_id="eve",
+            action="unauthorized_materialize_attempt",
+            details={"reason": "no_permission"},
+            epoch=4,
+        ),
+    ]
+    for event in events:
+        chain_hash = logger.log(event)
+    print(f"  Log length: {logger.length} events")
+    print(f"  Head hash: {logger.head_hash[:40]}...")
+    valid, idx = logger.verify_chain_integrity()
+    print(f"  Chain integrity: {'VALID' if valid else 'INVALID at ' + str(idx)}")
+    # Query
+    denied = logger.query(event_type=AuditEventType.ACCESS_DENIED)
+    print(f"  Access denied events: {len(denied)}")
+    print()
+
+    # --- 5. SIEM Export ---
+    print("▸ 5. SIEM Export (FedRAMP AU-6)")
+    for fmt in [SIEMFormat.JSON, SIEMFormat.CEF, SIEMFormat.JSON_LD]:
+        output = SIEMExporter.export_event(events[3], fmt)
+        print(f"  [{fmt.value}] {output[:80]}...")
+    print()
+
+    # --- 6. Key Rotation ---
+    print("▸ 6. Key Rotation Manager (NIST SP 800-57)")
+    rotation_mgr = KeyRotationManager(
+        policy=KeyRotationPolicy(max_key_age_epochs=8760),
+        audit_logger=logger,
+    )
+    kv1 = rotation_mgr.register_key("bob", "fp-v1-abc123", epoch=0)
+    print(f"  Key v{kv1.version}: fingerprint={kv1.key_fingerprint}, expires={kv1.expires_epoch}")
+    needs, reason = rotation_mgr.check_rotation_needed("bob", current_epoch=8000)
+    print(f"  Rotation needed at epoch 8000: {needs} ({reason})")
+    needs, reason = rotation_mgr.check_rotation_needed("bob", current_epoch=8760)
+    print(f"  Rotation needed at epoch 8760: {needs} ({reason})")
+    # Register new version
+    kv2 = rotation_mgr.register_key("bob", "fp-v2-def456", epoch=8760)
+    print(f"  Key v{kv2.version}: fingerprint={kv2.key_fingerprint}")
+    active = rotation_mgr.get_active_key("bob")
+    print(f"  Active key: v{active.version}")
+    print()
+
+    # --- 7. GDPR Deletion ---
+    print("▸ 7. GDPR Right-to-Erasure (Article 17)")
+    gdpr = GDPRDeletionManager(audit_logger=logger)
+    # Store some shards first
+    test_network = CommitmentNetwork()
+    n1 = test_network.add_node("node-a", "eu-west-1")
+    n2 = test_network.add_node("node-b", "eu-central-1")
+    test_shards = [os.urandom(128) for _ in range(4)]
+    test_network.distribute_encrypted_shards("entity-to-delete", test_shards)
+    shards_before = n1.shard_count + n2.shard_count
+    print(f"  Shards before deletion: {shards_before}")
+    # Submit deletion request
+    request = gdpr.submit_request(
+        entity_id="entity-to-delete",
+        requester_id="data-subject-1",
+        epoch=100,
+        reason="gdpr_art17",
+    )
+    print(f"  Request ID: {request.request_id[:40]}...")
+    print(f"  Status: {request.status}")
+    # Execute deletion
+    proof = gdpr.execute_deletion(
+        request_id=request.request_id,
+        nodes=[n1, n2],
+        epoch=101,
+    )
+    shards_after = n1.shard_count + n2.shard_count
+    print(f"  Shards after deletion: {shards_after}")
+    print(f"  Status: {request.status}")
+    if proof:
+        print(f"  Deletion proof hash: {proof.proof_hash[:40]}...")
+        print(f"  Shards destroyed: {proof.shard_count_destroyed}")
+        print(f"  Nodes participating: {proof.node_count_participating}")
+        print(f"  Destruction Merkle root: {proof.destruction_merkle_root[:40]}...")
+    print()
+
+    # --- 8. HSM ---
+    print("▸ 8. Software HSM (PKCS#11 Interface)")
+    hsm = SoftwareHSM()
+    kp_result = hsm.generate_keypair("test-key")
+    print(f"  Key ID: {kp_result['key_id']}")
+    print(f"  Label: {kp_result['label']}")
+    keys = hsm.list_keys()
+    print(f"  Keys in HSM: {len(keys)}")
+    # Sign with HSM
+    test_msg = b"test message for HSM signing"
+    sig = hsm.sign(kp_result["key_id"], test_msg)
+    print(f"  Signature size: {len(sig)} bytes")
+    # Destroy key
+    destroyed = hsm.destroy_key(kp_result["key_id"])
+    print(f"  Key destroyed: {destroyed}")
+    print(f"  Keys remaining: {len(hsm.list_keys())}")
+    print()
+
+    # --- 9. Compliance Validation ---
+    print("▸ 9. Compliance Configuration Validation")
+    # FedRAMP config (should show violations without FIPS)
+    fed_config = ComplianceConfig(
+        frameworks={ComplianceFramework.FEDRAMP_MODERATE},
+        crypto_mode=CryptoProviderMode.DEFAULT,
+        enable_rbac=False,
+        enable_audit_logging=True,
+    )
+    valid, violations = fed_config.validate()
+    print(f"  FedRAMP Moderate (misconfigured): {'PASS' if valid else 'FAIL'}")
+    for v in violations:
+        print(f"    - {v}")
+
+    # Correctly configured SOC 2
+    soc2_config = ComplianceConfig(
+        frameworks={ComplianceFramework.SOC2_TYPE2},
+        enable_rbac=True,
+        enable_audit_logging=True,
+        enable_key_rotation=True,
+    )
+    valid, violations = soc2_config.validate()
+    print(f"  SOC 2 Type II (correct): {'PASS' if valid else 'FAIL'}")
+    if valid:
+        print(f"    All controls satisfied")
+
+    # Controls summary
+    summary = soc2_config.controls_summary()
+    print(f"  Controls summary:")
+    for k, v in summary.items():
+        print(f"    {k}: {v}")
+    print()
+
+    print("=" * 74)
+    print("  Institutional compliance framework operational.")
+    print("  9 control families | 8 regulatory frameworks | FIPS 140-3 ready")
+    print("=" * 74)
+
+
 if __name__ == "__main__":
     demo()
+    compliance_demo()

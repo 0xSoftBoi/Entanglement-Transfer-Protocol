@@ -85,6 +85,16 @@ class BackendConfig:
     enable_economics_engine: bool = False  # enable full economic incentive model
     economics_epoch_seconds: int = 3600   # epoch duration for reward cycles
 
+    # --- Compliance (SOC 2, FedRAMP, GDPR, Basel) ---
+    enable_compliance: bool = False       # enable institutional compliance features
+    compliance_frameworks: list = field(default_factory=list)  # target frameworks
+    compliance_crypto_mode: str = "default"  # "default", "fips", "hybrid"
+    compliance_enable_rbac: bool = False   # role-based access control
+    compliance_enable_geo_fence: bool = False  # jurisdiction-constrained placement
+    compliance_enable_audit_log: bool = False  # immutable audit logging
+    compliance_enable_gdpr: bool = False   # GDPR deletion capability
+    compliance_siem_format: str = "json"   # "json", "cef", "json-ld"
+
 
 # ---------------------------------------------------------------------------
 # Abstract backend
