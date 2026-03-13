@@ -44,6 +44,16 @@ CORRELATION_PENALTY_SCALE = 5.0  # Scaling factor: min(10.0, 1 + 5 × ratio)
 REPUTATION_DECAY_RATE = 0.95    # Per-epoch decay — offenses never fully decay
 REPUTATION_DECAY_FLOOR = 0.01   # Minimum retained offense weight
 
+# Graduated withholding schedule (Storj-inspired §6.3)
+# New nodes have earnings withheld to prevent extract-and-exit.
+# Withheld amounts are released on the schedule below.
+WITHHOLDING_SCHEDULE = [
+    (90 * 24 * 3600, 0.75),    # Months 1-3:  75% withheld
+    (180 * 24 * 3600, 0.50),   # Months 4-6:  50% withheld
+    (270 * 24 * 3600, 0.25),   # Months 7-9:  25% withheld
+]
+# After month 9: 0% withheld (full payout)
+
 
 # ---------------------------------------------------------------------------
 # AuditResult: typed return value for node audit operations
@@ -62,6 +72,7 @@ class AuditResult:
     avg_response_us: float
     result: str        # "PASS" or "FAIL"
     strikes: int
+    corrupt_shards: list = field(default_factory=list)  # [(entity_id, shard_index)]
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +132,10 @@ class CommitmentNode:
         self.registered_at: float = 0.0           # Registration timestamp
         self.evicted_at: float = 0.0              # Eviction timestamp (0 = never)
         self.eviction_count: int = 0              # Lifetime eviction count
+
+        # --- Graduated withholding (Storj-inspired §6.3) ---
+        self.withheld_earnings: float = 0.0       # Accumulated withheld LTP
+        self.total_earnings: float = 0.0          # Lifetime earnings for tracking
 
     def deposit_stake(self, amount: float, now: Optional[float] = None) -> bool:
         """Deposit stake with lockup period. Returns False if below minimum."""
@@ -222,6 +237,50 @@ class CommitmentNode:
             )
             penalty += offense["weight"] * age_factor
         self.reputation_score = max(0.0, 1.0 - min(1.0, penalty / 10.0))
+
+    def withholding_rate(self, now: Optional[float] = None) -> float:
+        """
+        Compute current withholding rate based on node age.
+
+        Graduated schedule (Storj-inspired):
+          Months 1-3:  75% withheld
+          Months 4-6:  50% withheld
+          Months 7-9:  25% withheld
+          Month 10+:    0% withheld
+        """
+        now = now or time.time()
+        age = now - self.registered_at
+        for threshold, rate in WITHHOLDING_SCHEDULE:
+            if age < threshold:
+                return rate
+        return 0.0
+
+    def accrue_earnings(
+        self, gross_amount: float, now: Optional[float] = None
+    ) -> float:
+        """
+        Accrue earnings with graduated withholding.
+
+        Returns the net amount actually paid out (gross minus withheld).
+        Withheld portion is stored in withheld_earnings for later release.
+        """
+        now = now or time.time()
+        rate = self.withholding_rate(now)
+        withheld = gross_amount * rate
+        net = gross_amount - withheld
+        self.withheld_earnings += withheld
+        self.total_earnings += gross_amount
+        return net
+
+    def release_withheld(self, fraction: float = 1.0) -> float:
+        """
+        Release withheld earnings (e.g., on graceful exit or schedule milestone).
+
+        Returns the amount released.
+        """
+        released = self.withheld_earnings * min(1.0, max(0.0, fraction))
+        self.withheld_earnings -= released
+        return released
 
     def store_shard(self, entity_id: str, shard_index: int, encrypted_data: bytes) -> bool:
         """Store an encrypted shard. Returns False if node is evicted."""
@@ -441,6 +500,53 @@ class CommitmentLog:
 # CommitmentNetwork
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# StorageEndowment: slash-and-burn fund (Sia-inspired §6.4)
+# ---------------------------------------------------------------------------
+
+class StorageEndowment:
+    """
+    Protocol endowment fund that receives burned slash proceeds.
+
+    Implements Sia's burn-not-redistribute model: slashed stake is burned
+    into the endowment rather than redistributed to reporters. This prevents
+    perverse incentives where reporters might sabotage nodes to collect
+    slash rewards.
+
+    The endowment funds long-term storage subsidies and network maintenance.
+    """
+
+    def __init__(self) -> None:
+        self.balance: float = 0.0
+        self.total_burned: float = 0.0
+        self.burn_history: list[dict] = []  # [{amount, reason, timestamp, node_id}]
+
+    def burn(
+        self, amount: float, reason: str,
+        node_id: str = "", now: Optional[float] = None
+    ) -> None:
+        """Burn slashed stake into the endowment. Irreversible."""
+        now = now or time.time()
+        self.balance += amount
+        self.total_burned += amount
+        self.burn_history.append({
+            "amount": amount,
+            "reason": reason,
+            "node_id": node_id,
+            "timestamp": now,
+        })
+
+    def spend(self, amount: float, purpose: str) -> float:
+        """
+        Spend from endowment for network maintenance.
+
+        Returns actual amount spent (capped at balance).
+        """
+        actual = min(amount, self.balance)
+        self.balance -= actual
+        return actual
+
+
 class CommitmentNetwork:
     """
     Manages the distributed commitment network.
@@ -449,10 +555,12 @@ class CommitmentNetwork:
       - Deterministic shard placement via consistent hashing
       - Distributing and fetching encrypted shards
       - Storage proof auditing with burst challenges + VDF-randomized scheduling
+      - Erasure-coded audit verification (corrupt shard identification)
       - Node eviction and shard repair
       - Correlated failure analysis (regional failure model)
       - Sybil resistance via stake bonding and re-registration cooldowns
       - Correlation penalty escalation
+      - Slash-and-burn endowment (no redistribution to reporters)
     """
 
     def __init__(self) -> None:
@@ -461,6 +569,7 @@ class CommitmentNetwork:
         self._eviction_registry: dict[str, dict] = {}  # node_id → eviction info
         self._audit_epoch: int = 0  # Monotonic audit epoch counter
         self._audit_seed: bytes = os.urandom(32)  # VDF seed for audit randomization
+        self.endowment = StorageEndowment()  # Slash-and-burn fund
 
     def add_node(self, node_id: str, region: str) -> CommitmentNode:
         """Add node without staking (legacy/test compatibility)."""
@@ -624,10 +733,12 @@ class CommitmentNetwork:
         Security features:
           - Anti-outsourcing: burst challenges multiply relay latency
           - VDF-randomized scheduling: prevents timing attacks
+          - Erasure-coded verification: identifies specific corrupt shards
           - Correlation penalty: escalated slashing for repeat offenders
           - Automatic escrow: failed audits create pending slashes
+          - Slash-and-burn: penalties go to endowment, not reporters
 
-        Returns: AuditResult with full challenge statistics.
+        Returns: AuditResult with full challenge statistics and corrupt shard list.
         """
         challenged = 0
         passed = 0
@@ -635,6 +746,7 @@ class CommitmentNetwork:
         missing = 0
         suspicious_latency = 0
         response_times: list[float] = []
+        corrupt_shards: list[tuple[str, int]] = []
 
         # VDF-randomized audit scheduling (prevents timing attacks)
         self._audit_epoch += 1
@@ -664,6 +776,7 @@ class CommitmentNetwork:
                         missing += 1
                         failed += 1
                         burst_pass = False
+                        corrupt_shards.append((entity_id, shard_index))
                     else:
                         known_good = self._get_known_good_hash(
                             entity_id, shard_index, nonce, exclude_node=node
@@ -675,6 +788,7 @@ class CommitmentNetwork:
                         else:
                             failed += 1
                             burst_pass = False
+                            corrupt_shards.append((entity_id, shard_index))
 
                 if burst > 1 and burst_pass and response_times:
                     burst_latencies = response_times[-burst:]
@@ -712,6 +826,7 @@ class CommitmentNetwork:
             avg_response_us=round(avg_latency * 1_000_000, 1),
             result=result,
             strikes=node.strikes,
+            corrupt_shards=corrupt_shards,
         )
 
     def _get_known_good_hash(
@@ -758,6 +873,23 @@ class CommitmentNetwork:
         # Finalize all pending slashes
         stake_slashed = node.finalize_pending_slashes()
 
+        # Burn slashed stake to endowment (Sia-inspired: no redistribution)
+        if stake_slashed > 0:
+            self.endowment.burn(
+                stake_slashed, "eviction_slash",
+                node_id=node.node_id, now=now,
+            )
+
+        # Forfeit withheld earnings to endowment (extract-and-exit prevention)
+        forfeited_earnings = 0.0
+        if node.withheld_earnings > 0:
+            forfeited_earnings = node.withheld_earnings
+            self.endowment.burn(
+                forfeited_earnings, "withheld_earnings_forfeiture",
+                node_id=node.node_id, now=now,
+            )
+            node.withheld_earnings = 0.0
+
         # Record in global eviction registry (survives node object lifetime)
         self._eviction_registry[node.node_id] = {
             "evicted_at": now,
@@ -796,6 +928,7 @@ class CommitmentNetwork:
             "repaired": repaired,
             "lost": lost,
             "stake_slashed": stake_slashed,
+            "forfeited_earnings": forfeited_earnings,
             "eviction_count": node.eviction_count,
         }
 

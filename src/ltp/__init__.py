@@ -40,6 +40,7 @@ from .entity import Entity, canonicalize_shape
 from .commitment import (
     AuditResult,
     StakeEscrow,
+    StorageEndowment,
     CommitmentNode,
     CommitmentRecord,
     CommitmentLog,
@@ -48,6 +49,7 @@ from .commitment import (
     STAKE_LOCKUP_SECONDS,
     EVICTION_COOLDOWN_SECONDS,
     CORRELATION_PENALTY_MAX,
+    WITHHOLDING_SCHEDULE,
 )
 from .lattice import LatticeKey
 from .protocol import LTPProtocol
@@ -76,10 +78,12 @@ __all__ = [
     "CommitmentRecord",
     "CommitmentLog",
     "CommitmentNetwork",
+    "StorageEndowment",
     "MIN_STAKE_LTP",
     "STAKE_LOCKUP_SECONDS",
     "EVICTION_COOLDOWN_SECONDS",
     "CORRELATION_PENALTY_MAX",
+    "WITHHOLDING_SCHEDULE",
     # Lattice key
     "LatticeKey",
     # Protocol
