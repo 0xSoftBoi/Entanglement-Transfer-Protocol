@@ -46,6 +46,29 @@ from .commitment import (
 )
 from .lattice import LatticeKey
 from .protocol import LTPProtocol
+from .enforcement import (
+    StorageProofStrategy,
+    PDPChallenge,
+    PDPProof,
+    PDPVerifier,
+    SlashingConditionRegistry,
+    AuditFailureCondition,
+    DataWithholdingCondition,
+    LatencyDegradationCondition,
+    ProofFailureCondition,
+    EnforcementInvariants,
+    DecentralizationMetrics,
+    GovernanceTransition,
+)
+from .economics import (
+    EconomicsConfig,
+    EconomicsEngine,
+    NodeEconomics,
+    NetworkPhase,
+    SlashingTier,
+    RewardBreakdown,
+    EpochSnapshot,
+)
 
 __all__ = [
     # Primitives
@@ -74,4 +97,25 @@ __all__ = [
     "LatticeKey",
     # Protocol
     "LTPProtocol",
+    # Economics
+    "EconomicsConfig",
+    "EconomicsEngine",
+    "NodeEconomics",
+    "NetworkPhase",
+    "SlashingTier",
+    "RewardBreakdown",
+    "EpochSnapshot",
+    # Enforcement
+    "StorageProofStrategy",
+    "PDPChallenge",
+    "PDPProof",
+    "PDPVerifier",
+    "SlashingConditionRegistry",
+    "AuditFailureCondition",
+    "DataWithholdingCondition",
+    "LatencyDegradationCondition",
+    "ProofFailureCondition",
+    "EnforcementInvariants",
+    "DecentralizationMetrics",
+    "GovernanceTransition",
 ]

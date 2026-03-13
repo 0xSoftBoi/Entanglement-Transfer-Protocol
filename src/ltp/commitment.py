@@ -70,6 +70,8 @@ class CommitmentNode:
         self.strikes: int = 0
         self.audit_passes: int = 0
         self.evicted: bool = False
+        # TTL tracking: (entity_id, shard_index) → (stored_at_epoch, ttl_epochs or None)
+        self._shard_ttl: dict[tuple[str, int], tuple[int, Optional[int]]] = {}
 
     def store_shard(self, entity_id: str, shard_index: int, encrypted_data: bytes) -> bool:
         """Store an encrypted shard. Returns False if node is evicted."""
@@ -77,6 +79,67 @@ class CommitmentNode:
             return False
         self.shards[(entity_id, shard_index)] = encrypted_data
         return True
+
+    def store_shard_with_ttl(
+        self,
+        entity_id: str,
+        shard_index: int,
+        encrypted_data: bytes,
+        stored_at_epoch: int,
+        ttl_epochs: Optional[int] = None,
+    ) -> bool:
+        """
+        Store an encrypted shard with TTL metadata.
+
+        Args:
+            ttl_epochs: Number of epochs before expiry. None = permanent.
+
+        Whitepaper §5.4.4: TTL-based eviction with renewal.
+        """
+        if self.evicted:
+            return False
+        key = (entity_id, shard_index)
+        self.shards[key] = encrypted_data
+        self._shard_ttl[key] = (stored_at_epoch, ttl_epochs)
+        return True
+
+    def is_shard_expired(
+        self, entity_id: str, shard_index: int, current_epoch: int
+    ) -> bool:
+        """Check if a shard has expired based on its TTL."""
+        key = (entity_id, shard_index)
+        ttl_info = self._shard_ttl.get(key)
+        if ttl_info is None:
+            return False  # No TTL metadata = permanent
+        stored_at, ttl = ttl_info
+        if ttl is None:
+            return False  # Explicit None TTL = permanent
+        return current_epoch >= stored_at + ttl
+
+    def renew_shard_ttl(
+        self, entity_id: str, shard_index: int, additional_epochs: int
+    ) -> bool:
+        """Extend the TTL of a shard. Returns False if shard not found."""
+        key = (entity_id, shard_index)
+        ttl_info = self._shard_ttl.get(key)
+        if ttl_info is None or key not in self.shards:
+            return False
+        stored_at, ttl = ttl_info
+        if ttl is None:
+            return True  # Already permanent
+        self._shard_ttl[key] = (stored_at, ttl + additional_epochs)
+        return True
+
+    def evict_expired_shards(self, current_epoch: int) -> int:
+        """Remove all expired shards. Returns count removed."""
+        expired_keys = [
+            key for key in list(self._shard_ttl.keys())
+            if self.is_shard_expired(key[0], key[1], current_epoch)
+        ]
+        for key in expired_keys:
+            self.shards.pop(key, None)
+            self._shard_ttl.pop(key, None)
+        return len(expired_keys)
 
     def fetch_shard(self, entity_id: str, shard_index: int) -> Optional[bytes]:
         """Fetch an encrypted shard. Returns None if missing or evicted."""
@@ -135,6 +198,7 @@ class CommitmentRecord:
     shape: str                # canonicalized media type
     shape_hash: str           # H(shape) — legacy lookup compatibility
     timestamp: float
+    ttl_epochs: Optional[int] = None  # §5.4.4: epochs until shard eviction (None = permanent)
     predecessor: Optional[str] = None
     signature: bytes = b""    # ML-DSA-65 signature (3309 bytes)
 
@@ -683,6 +747,83 @@ class CommitmentNetwork:
     @property
     def active_node_count(self) -> int:
         return sum(1 for n in self.nodes if not n.evicted)
+
+    # --- TTL-Based Shard Eviction (Whitepaper §5.4.4) ---
+
+    def evict_expired_shards(self, current_epoch: int) -> dict:
+        """
+        Evict all expired shards across the network.
+
+        Returns: {"total_evicted", "nodes_affected", "entities_affected"}
+        """
+        total_evicted = 0
+        nodes_affected = 0
+        entities_affected: set[str] = set()
+
+        for node in self.nodes:
+            if node.evicted:
+                continue
+            # Track which entities will be affected
+            for key in list(node._shard_ttl.keys()):
+                if node.is_shard_expired(key[0], key[1], current_epoch):
+                    entities_affected.add(key[0])
+            evicted = node.evict_expired_shards(current_epoch)
+            if evicted > 0:
+                total_evicted += evicted
+                nodes_affected += 1
+
+        return {
+            "total_evicted": total_evicted,
+            "nodes_affected": nodes_affected,
+            "entities_affected": len(entities_affected),
+        }
+
+    def renew_entity_ttl(self, entity_id: str, additional_epochs: int) -> int:
+        """
+        Extend TTL for all shards of an entity across all nodes.
+
+        Returns count of shards renewed.
+        """
+        renewed = 0
+        for node in self.nodes:
+            if node.evicted:
+                continue
+            for key in list(node._shard_ttl.keys()):
+                if key[0] == entity_id:
+                    if node.renew_shard_ttl(key[0], key[1], additional_epochs):
+                        renewed += 1
+        return renewed
+
+    def distribute_encrypted_shards_with_ttl(
+        self,
+        entity_id: str,
+        encrypted_shards: list[bytes],
+        epoch: int,
+        ttl_epochs: Optional[int] = None,
+        replicas: int = 2,
+    ) -> str:
+        """
+        Distribute encrypted shards with TTL metadata.
+
+        Like distribute_encrypted_shards but records TTL for each shard.
+        Returns: Merkle root of encrypted shard hashes.
+        """
+        shard_hashes = []
+
+        for i, enc_shard in enumerate(encrypted_shards):
+            shard_hash = H(enc_shard + entity_id.encode() + struct.pack('>I', i))
+            shard_hashes.append(shard_hash)
+
+            target_nodes = self._placement(entity_id, i, replicas)
+            for node in target_nodes:
+                node.store_shard_with_ttl(
+                    entity_id, i, enc_shard, epoch, ttl_epochs
+                )
+                self._node_shard_index.setdefault(node.node_id, set()).add(
+                    (entity_id, i)
+                )
+
+        return H(b''.join(h.encode() for h in shard_hashes))
 
     # --- Correlated Failure Analysis (Whitepaper §5.4.1.1) ---
 

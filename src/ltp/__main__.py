@@ -756,6 +756,117 @@ def demo() -> None:
         network.restore_region(regions[1])
         print("└─ Done\n")
 
+    # --- Economics Engine Demo ---
+    print("─" * 74)
+    print("▸ ECONOMICS ENGINE: Epoch Processing + Rewards")
+    print("─" * 74)
+    print()
+
+    from .economics import (
+        EconomicsConfig, EconomicsEngine, NodeEconomics, WEI_PER_LTP,
+    )
+
+    econ_config = EconomicsConfig()
+    engine = EconomicsEngine(econ_config)
+    epoch = 100  # Early bootstrap phase
+
+    econ_nodes = []
+    for nd in network.nodes:
+        if not nd.evicted:
+            ne = NodeEconomics(
+                node_id=nd.node_id,
+                stake=1_000 * WEI_PER_LTP,
+                shards_stored=nd.shard_count,
+                audit_score=100 if nd.strikes == 0 else max(0, 100 - nd.strikes * 20),
+            )
+            econ_nodes.append(ne)
+
+    print(f"┌─ EPOCH {epoch} PROCESSING (Phase: {engine.network_phase(epoch).value})")
+    snapshot = engine.process_epoch(
+        epoch=epoch,
+        nodes=econ_nodes,
+        total_commitments_this_epoch=network.log.length,
+        network_capacity=10_000,
+    )
+    print(f"  Active nodes:      {snapshot.active_nodes}")
+    print(f"  Total staked:      {snapshot.total_staked / WEI_PER_LTP:,.0f} LTP")
+    print(f"  Total shards:      {snapshot.total_shards}")
+    print(f"  Fee multiplier:    {snapshot.fee_multiplier:.4f}x")
+    print(f"  Rewards distributed: {snapshot.total_rewards_distributed / WEI_PER_LTP:.6f} LTP")
+    print(f"  Fees collected:    {snapshot.total_fees_collected / WEI_PER_LTP:.6f} LTP")
+    print(f"  Fees burned:       {snapshot.total_fees_burned / WEI_PER_LTP:.6f} LTP")
+    print(f"  Storage endowment: {snapshot.total_fees_to_endowment / WEI_PER_LTP:.6f} LTP")
+    print(f"  Insurance fund:    {snapshot.total_fees_to_insurance / WEI_PER_LTP:.6f} LTP")
+    if snapshot.rewards:
+        top = max(snapshot.rewards, key=lambda r: r.total)
+        print(f"  Top earner: {top.node_id} → {top.total / WEI_PER_LTP:.6f} LTP")
+    print("└─ Epoch complete\n")
+
+    # --- Enforcement Demo ---
+    print("─" * 74)
+    print("▸ ENFORCEMENT: PDP Audit + Programmable Slashing + Invariants")
+    print("─" * 74)
+    print()
+
+    from .enforcement import (
+        AuditFailureCondition,
+        SlashingConditionRegistry,
+        EnforcementInvariants,
+        DecentralizationMetrics,
+    )
+
+    print("┌─ PDP STORAGE PROOF AUDIT (Cryptographic)")
+    pdp_target = None
+    for nd in network.nodes:
+        if not nd.evicted and nd.shard_count > 0:
+            pdp_target = nd
+            break
+    if pdp_target:
+        pdp_result = network.audit_node_pdp(pdp_target, epoch=epoch, sample_size=4)
+        print(f"  Node: {pdp_result['node_id']}")
+        print(f"  Entities challenged: {pdp_result['entities_challenged']}")
+        print(f"  Passed: {pdp_result['passed']}, Failed: {pdp_result['failed']}")
+        print(f"  Result: {'✓ PASS' if pdp_result['result'] == 'PASS' else '✗ FAIL'}")
+        print(f"  Proof size: {pdp_result['proof_size_bytes']} bytes (compact)")
+    print("└─ PDP audit complete\n")
+
+    print("┌─ PROGRAMMABLE SLASHING CONDITIONS")
+    registry = SlashingConditionRegistry()
+    registry.register(AuditFailureCondition(stake_allocation_bps=5000))
+    import json as _json
+    evidence = _json.dumps({"consecutive_failures": 4}).encode()
+    slash_result = registry.evaluate("audit_failure", evidence)
+    print(f"  Condition: {slash_result.condition_id}")
+    print(f"  Violated: {'✓ YES' if slash_result.violated else '✗ NO'}")
+    print(f"  Severity: {slash_result.severity}")
+    print(f"  Explanation: {slash_result.explanation}")
+    if slash_result.violated and econ_nodes:
+        slash_amount, tier = engine.compute_slash_for_condition(
+            econ_nodes[0],
+            condition_allocation_bps=5000,
+            severity=slash_result.severity,
+        )
+        print(f"  Slash amount: {slash_amount / WEI_PER_LTP:.4f} LTP (tier: {tier.value})")
+    print("└─ Slashing evaluation complete\n")
+
+    print("┌─ FORMAL VERIFICATION INVARIANTS")
+    s4_ok = EnforcementInvariants.check_safety_s4(0, 1000 * WEI_PER_LTP)
+    l3_ok = EnforcementInvariants.check_liveness_l3(0)
+    c1_ok = EnforcementInvariants.check_correlation_c1(1.0, 3.0)
+    print(f"  INV-S4 (slash ≤ stake):          {'✓ HOLDS' if s4_ok else '✗ VIOLATED'}")
+    print(f"  INV-L3 (offense ≥ 0):            {'✓ HOLDS' if l3_ok else '✗ VIOLATED'}")
+    print(f"  INV-C1 (correlation ∈ [1, max]): {'✓ HOLDS' if c1_ok else '✗ VIOLATED'}")
+    print("└─ Invariant checks complete\n")
+
+    print("┌─ PROGRESSIVE DECENTRALIZATION METRICS")
+    stakes = [ne.stake for ne in econ_nodes]
+    hhi = DecentralizationMetrics.compute_hhi([float(s) for s in stakes])
+    gini = DecentralizationMetrics.compute_gini([float(s) for s in stakes])
+    print(f"  Operators: {len(econ_nodes)}")
+    print(f"  HHI (concentration): {hhi:.0f} ({'unconcentrated' if hhi < 1500 else 'moderate' if hhi < 2500 else 'concentrated'})")
+    print(f"  Gini (inequality):   {gini:.3f} ({'equal' if gini < 0.3 else 'moderate' if gini < 0.6 else 'unequal'})")
+    print("└─ Metrics complete\n")
+
     # --- Summary ---
     print("=" * 74)
     print("  TRANSFER SUMMARY — Post-Quantum Security (ML-KEM-768 + ML-DSA-65)")
