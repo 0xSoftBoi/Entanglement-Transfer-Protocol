@@ -32,7 +32,11 @@ Run demo:
   python -m ltp
 """
 
-from .primitives import H, H_bytes, AEAD, MLKEM, MLDSA
+from .primitives import (
+    H, H_bytes, AEAD, MLKEM, MLDSA,
+    SecurityProfile, HashFunction,
+    get_security_profile, set_security_profile,
+)
 from .keypair import KeyPair, SealedBox
 from .erasure import ErasureCoder
 from .shards import ShardEncryptor
@@ -53,14 +57,23 @@ from .commitment import (
 )
 from .lattice import LatticeKey
 from .protocol import LTPProtocol
+from .hsm import HSMBackend, SoftwareHSM
 
 __all__ = [
+    # Security profiles
+    "SecurityProfile",
+    "HashFunction",
+    "get_security_profile",
+    "set_security_profile",
     # Primitives
     "H",
     "H_bytes",
     "AEAD",
     "MLKEM",
     "MLDSA",
+    # HSM
+    "HSMBackend",
+    "SoftwareHSM",
     # Keypair
     "KeyPair",
     "SealedBox",

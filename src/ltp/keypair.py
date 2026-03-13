@@ -2,8 +2,12 @@
 Post-quantum asymmetric keypair and envelope encryption for LTP.
 
 Provides:
-  - KeyPair   — ML-KEM-768 + ML-DSA-65 combined keypair
-  - SealedBox — ML-KEM-768 + AEAD envelope encryption (seal/unseal)
+  - KeyPair   — ML-KEM + ML-DSA combined keypair (sizes per SecurityProfile)
+  - SealedBox — ML-KEM + AEAD envelope encryption (seal/unseal)
+
+Key sizes depend on the active SecurityProfile:
+  Level 3: ML-KEM-768 (ek=1184B) + ML-DSA-65 (vk=1952B)
+  Level 5: ML-KEM-1024 (ek=1568B) + ML-DSA-87 (vk=2592B)
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ __all__ = ["KeyPair", "SealedBox"]
 @dataclass
 class KeyPair:
     """
-    Post-quantum asymmetric keypair combining ML-KEM-768 and ML-DSA-65.
+    Post-quantum asymmetric keypair combining ML-KEM and ML-DSA.
 
     Contains:
       - ek (encapsulation key, public): used to seal lattice keys to this recipient
@@ -31,12 +35,11 @@ class KeyPair:
       - vk (verification key, public): used to verify commitment signatures
       - sk (signing key, private): used to sign commitment records
 
-    Key sizes (NIST FIPS 203/204):
-      ML-KEM-768: ek=1184B, dk=2400B, ciphertext=1088B, shared_secret=32B
-      ML-DSA-65:  vk=1952B, sk=4032B, signature=3309B
+    Key sizes depend on active SecurityProfile (NIST FIPS 203/204):
+      Level 3: ML-KEM-768 (ek=1184B, dk=2400B) + ML-DSA-65 (vk=1952B, sk=4032B)
+      Level 5: ML-KEM-1024 (ek=1568B, dk=3168B) + ML-DSA-87 (vk=2592B, sk=4896B)
 
-    Security level: NIST Level 3 (~AES-192), resistant to both classical and
-    quantum attacks (Grover, Shor).
+    Security level: Determined by active SecurityProfile.
     """
     ek: bytes          # ML-KEM encapsulation key (1184 bytes, public)
     dk: bytes          # ML-KEM decapsulation key (2400 bytes, private)
@@ -46,7 +49,7 @@ class KeyPair:
 
     @classmethod
     def generate(cls, label: str = "") -> 'KeyPair':
-        """Generate a fresh post-quantum keypair (ML-KEM-768 + ML-DSA-65)."""
+        """Generate a fresh post-quantum keypair (sizes per active SecurityProfile)."""
         ek, dk = MLKEM.keygen()
         vk, sk = MLDSA.keygen()
         return cls(ek=ek, dk=dk, vk=vk, sk=sk, label=label)
@@ -124,7 +127,7 @@ class SealedBox:
 
         Raises ValueError if wrong keypair or tampered data.
         """
-        min_len = MLKEM.CT_SIZE + 16 + AEAD.TAG_SIZE
+        min_len = MLKEM.CT_SIZE + 16 + AEAD._tag_size()
         if len(sealed_data) < min_len:
             raise ValueError(f"Sealed data too short ({len(sealed_data)} < {min_len})")
 
