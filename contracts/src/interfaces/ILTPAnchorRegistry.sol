@@ -42,6 +42,7 @@ interface ILTPAnchorRegistry {
 
     event SignerRegistered(bytes32 indexed vkHash);
     event SignerRevoked(bytes32 indexed vkHash);
+    event SignerAuthorized(bytes32 indexed vkHash, uint256 expiry);
 
     event StateTransition(
         bytes32 indexed entityIdHash,
@@ -75,6 +76,8 @@ interface ILTPAnchorRegistry {
     error BatchTooLarge(uint256 provided, uint256 max);
     error ArrayLengthMismatch();
     error ContractPaused();
+    error SignerExpired();
+    error BatchTooFrequent();
 
     // -----------------------------------------------------------------------
     // Write functions
@@ -118,6 +121,12 @@ interface ILTPAnchorRegistry {
 
     /// @notice Revoke an authorized signer. Admin only.
     function revokeSigner(bytes32 vkHash) external;
+
+    /// @notice Authorize signers with a default 365-day expiry. Admin only.
+    function authorizeSigners(bytes32[] calldata vkHashes) external;
+
+    /// @notice Authorize signers with an explicit expiry timestamp. Admin only.
+    function authorizeSignersWithExpiry(bytes32[] calldata vkHashes, uint256 expiry) external;
 
     // -----------------------------------------------------------------------
     // View functions

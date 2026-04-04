@@ -102,6 +102,11 @@ class ZKTransferMode:
     """
 
     def __init__(self, config: ZKConfig | None = None) -> None:
+        if os.environ.get("ETP_ALLOW_ZK_MODE", "0") != "1":
+            raise RuntimeError(
+                "ZK Transfer Mode uses Groth16 (not post-quantum safe) and is disabled by default. "
+                "Set ETP_ALLOW_ZK_MODE=1 to enable. Never use in production with post-quantum threat model."
+            )
         self.config = config or ZKConfig()
 
     def create_hiding_commitment(self, entity_id: str) -> ZKCommitment:
