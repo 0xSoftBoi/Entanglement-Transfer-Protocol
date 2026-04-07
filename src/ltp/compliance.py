@@ -38,7 +38,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
 
-from .primitives import canonical_hash, canonical_hash_bytes
+from .primitives import (
+    AssuranceMode,
+    canonical_hash,
+    canonical_hash_bytes,
+    get_assurance_mode,
+    get_runtime_assurance_status,
+)
 
 __all__ = [
     # Crypto provider
@@ -110,12 +116,21 @@ class FIPSCryptoProvider:
     def __init__(self, mode: CryptoProviderMode = CryptoProviderMode.DEFAULT) -> None:
         self.mode = mode
         self._fips_available = self._check_fips_available()
+        self._cryptography_available = self._check_cryptography_available()
 
         if mode == CryptoProviderMode.FIPS and not self._fips_available:
             raise RuntimeError(
                 "FIPS mode requested but OpenSSL FIPS module is not available. "
                 "Ensure OpenSSL 3.1.2+ is installed with FIPS provider enabled. "
                 "See: https://openssl-library.org/post/2025-03-11-fips-140-3/"
+            )
+        if (
+            mode == CryptoProviderMode.FIPS
+            and get_assurance_mode() == AssuranceMode.COMPLIANCE_STRICT
+            and not self._cryptography_available
+        ):
+            raise RuntimeError(
+                "Compliance-strict FIPS mode requires the cryptography AES-GCM backend."
             )
 
     @staticmethod
@@ -130,6 +145,15 @@ class FIPSCryptoProvider:
                 return True
             return False
         except Exception:
+            return False
+
+    @staticmethod
+    def _check_cryptography_available() -> bool:
+        """Check if AES-GCM support from cryptography is available."""
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
+            return True
+        except ImportError:
             return False
 
     @property
@@ -185,6 +209,10 @@ class FIPSCryptoProvider:
             ct_with_tag = aesgcm.encrypt(gcm_nonce, plaintext, None)
             return ct_with_tag  # ciphertext || 16-byte tag
         except ImportError:
+            if get_assurance_mode() == AssuranceMode.COMPLIANCE_STRICT:
+                raise RuntimeError(
+                    "Compliance-strict mode forbids fallback from AES-GCM to PoC AEAD behavior."
+                )
             # Fallback: use hashlib-based simulation for environments without
             # the cryptography package. NOT FIPS-compliant — for testing only.
             from .primitives import AEAD
@@ -200,6 +228,10 @@ class FIPSCryptoProvider:
             aesgcm = AESGCM(aes_key)
             return aesgcm.decrypt(gcm_nonce, ciphertext_with_tag, None)
         except ImportError:
+            if get_assurance_mode() == AssuranceMode.COMPLIANCE_STRICT:
+                raise RuntimeError(
+                    "Compliance-strict mode forbids fallback from AES-GCM to PoC AEAD behavior."
+                )
             from .primitives import AEAD
             return AEAD.decrypt(key, ciphertext_with_tag, nonce)
 
@@ -1468,12 +1500,8 @@ class ComplianceConfig:
     # HSM
     hsm_config: Optional[HSMConfig] = None
 
-    def validate(self) -> tuple[bool, list[str]]:
-        """
-        Validate configuration against target compliance frameworks.
-
-        Returns (is_valid, list_of_violations).
-        """
+    def _modeled_violations(self) -> list[str]:
+        """Return framework/config violations for modeled controls only."""
         violations = []
 
         if ComplianceFramework.FEDRAMP_MODERATE in self.frameworks or \
@@ -1578,13 +1606,69 @@ class ComplianceConfig:
                     "(set enable_audit_logging=True)"
                 )
 
+        return violations
+
+    def validate(self) -> tuple[bool, list[str]]:
+        """
+        Validate configuration against target compliance frameworks.
+
+        This validates the configured controls as modeled by the configuration.
+        It does not guarantee the current runtime can enforce those controls.
+
+        Returns (is_valid, list_of_violations).
+        """
+        violations = self._modeled_violations()
+
+        return (len(violations) == 0, violations)
+
+    def validate_enforcement(self) -> tuple[bool, list[str]]:
+        """
+        Validate that configured controls are also enforceable in this runtime.
+
+        This is stricter than validate(): it checks runtime assurance mode and
+        backend availability rather than configuration intent alone.
+        """
+        violations = self._modeled_violations()
+        status = get_runtime_assurance_status()
+        assurance_mode = get_assurance_mode()
+
+        if self.frameworks and assurance_mode != AssuranceMode.COMPLIANCE_STRICT:
+            violations.append(
+                "Compliance frameworks are configured, but runtime enforcement is "
+                "modeled-only outside assurance mode 'compliance-strict'"
+            )
+
+        if (self.require_fips or self.crypto_mode == CryptoProviderMode.FIPS):
+            if assurance_mode != AssuranceMode.COMPLIANCE_STRICT:
+                violations.append(
+                    "FIPS-oriented compliance claims are not enforcement-grade "
+                    "outside assurance mode 'compliance-strict'"
+                )
+            elif not status["cryptography_available"] or not status["fips_runtime_available"]:
+                violations.append(
+                    "FIPS-oriented compliance claims require both cryptography AES-GCM "
+                    "and a FIPS-capable OpenSSL runtime"
+                )
+
+        if self.hsm_config is not None and self.hsm_config.provider == "software":
+            violations.append(
+                "Software HSM configuration is modeled-only and does not provide "
+                "hardware-enforced key protection"
+            )
+
         return (len(violations) == 0, violations)
 
     def controls_summary(self) -> dict:
         """Generate a summary of enabled compliance controls."""
+        assurance_mode = get_assurance_mode()
+        runtime_status = get_runtime_assurance_status()
+        _, enforcement_violations = self.validate_enforcement()
+        enforcement_ready = len(enforcement_violations) == 0
         return {
             "crypto_provider": self.crypto_mode.value,
             "fips_required": self.require_fips,
+            "assurance_mode": assurance_mode.value,
+            "enforcement_posture": "enforced" if enforcement_ready else "modeled",
             "rbac_enabled": self.enable_rbac,
             "geo_fencing_enabled": self.enable_geo_fencing,
             "audit_logging_enabled": self.enable_audit_logging,
@@ -1599,4 +1683,6 @@ class ComplianceConfig:
                 self.hsm_config.provider if self.hsm_config else "none"
             ),
             "target_frameworks": [f.value for f in self.frameworks],
+            "runtime_status": runtime_status,
+            "enforcement_violations": enforcement_violations,
         }

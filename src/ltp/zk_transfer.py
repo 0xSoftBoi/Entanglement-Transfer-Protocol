@@ -21,7 +21,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from .primitives import canonical_hash, canonical_hash_bytes
+from .primitives import (
+    AssuranceMode,
+    canonical_hash,
+    canonical_hash_bytes,
+    get_assurance_mode,
+)
 
 __all__ = [
     "ZKProofSystem",
@@ -46,6 +51,7 @@ class ZKConfig:
     proof_system: ZKProofSystem = ZKProofSystem.SIMULATED
     curve: str = "bls12_381"   # Only relevant for Groth16
     hiding_commitment: bool = True  # Use hiding commitment for entity_id
+    allow_experimental_proof_systems: bool = False
 
 
 @dataclass
@@ -88,6 +94,10 @@ class ZKProof:
     def proof_size_bytes(self) -> int:
         return len(self.proof_bytes)
 
+    @property
+    def is_simulated(self) -> bool:
+        return self.public_inputs.get("simulated_backend", False) is True
+
 
 class ZKTransferMode:
     """
@@ -104,6 +114,41 @@ class ZKTransferMode:
     def __init__(self, config: ZKConfig | None = None) -> None:
         self.config = config or ZKConfig()
 
+    def get_runtime_status(self) -> dict:
+        """Return the current ZK runtime posture for this instance."""
+        return {
+            "enabled": self.config.enabled,
+            "assurance_mode": get_assurance_mode().value,
+            "proof_system": self.config.proof_system.value,
+            "simulated_backend": self._proof_system_is_simulated(),
+            "experimental_opt_in": self.config.allow_experimental_proof_systems,
+        }
+
+    def _proof_system_is_simulated(self) -> bool:
+        """All currently implemented proof systems are placeholders in this repo."""
+        return True
+
+    def _require_supported_runtime(self) -> None:
+        """Fail closed when ZK mode could be mistaken for production verification."""
+        assurance_mode = get_assurance_mode()
+        if assurance_mode in (
+            AssuranceMode.PRODUCTION,
+            AssuranceMode.COMPLIANCE_STRICT,
+        ):
+            raise RuntimeError(
+                "ZK transfer mode is unavailable in production assurance modes "
+                "because this repo only implements simulated proof backends."
+            )
+
+        if (
+            self.config.proof_system != ZKProofSystem.SIMULATED
+            and not self.config.allow_experimental_proof_systems
+        ):
+            raise RuntimeError(
+                f"{self.config.proof_system.value} is currently a simulated placeholder. "
+                "Set allow_experimental_proof_systems=True to use it in non-production modes."
+            )
+
     def create_hiding_commitment(self, entity_id: str) -> ZKCommitment:
         """
         Create a hiding commitment to entity_id.
@@ -111,6 +156,7 @@ class ZKTransferMode:
         Production: Pedersen commitment C = g^{entity_id} · h^r
         Simulation: C = H(entity_id || r)
         """
+        self._require_supported_runtime()
         blinding_factor = os.urandom(32)
 
         if self.config.proof_system == ZKProofSystem.SIMULATED:
@@ -140,6 +186,7 @@ class ZKTransferMode:
         Production: Groth16 proof (~192 bytes, ~2s generation)
         Simulation: H(entity_id || blinding_factor || "proof")
         """
+        self._require_supported_runtime()
         if commitment.entity_id != entity_id:
             raise ValueError("Entity ID does not match commitment")
 
@@ -173,6 +220,7 @@ class ZKTransferMode:
             proof_system=self.config.proof_system,
             public_inputs={
                 "commitment": commitment.commitment_value,
+                "simulated_backend": self._proof_system_is_simulated(),
             },
         )
 
@@ -187,6 +235,7 @@ class ZKTransferMode:
         Checks that the prover knows entity_id such that
         C = Commit(entity_id, r) without learning entity_id.
         """
+        self._require_supported_runtime()
         if proof.proof_system != self.config.proof_system:
             return False
 
@@ -227,6 +276,7 @@ class ZKTransferMode:
         This is NOT zero-knowledge (it reveals entity_id). Used for
         dispute resolution or selective disclosure.
         """
+        self._require_supported_runtime()
         expected = canonical_hash(entity_id.encode() + blinding_factor)
         return commitment.commitment_value == expected
 

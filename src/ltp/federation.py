@@ -10,12 +10,13 @@ Design decision: docs/design-decisions/CROSS_DEPLOYMENT_FEDERATION.md
 
 from __future__ import annotations
 
+import struct
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from .primitives import canonical_hash, internal_hash_bytes
+from .primitives import MLDSA, canonical_hash, internal_hash_bytes
 
 __all__ = [
     "TrustLevel",
@@ -225,7 +226,7 @@ class FederationRegistry:
             return False
 
         # Validate STH structure
-        required_fields = {"sequence", "root_hash", "timestamp", "record_count"}
+        required_fields = {"sequence", "root_hash", "timestamp", "record_count", "signature"}
         if not required_fields.issubset(sth.keys()):
             return False
 
@@ -236,10 +237,13 @@ class FederationRegistry:
             if sth["timestamp"] < network.last_sth["timestamp"]:
                 return False
 
-        # Simulated signature verification
-        # Production: MLDSA.verify(network.public_key, sth_bytes, sth_signature)
-        sth_hash = canonical_hash(str(sth).encode())
-        if not sth_hash:
+        try:
+            payload = self._sth_signable_payload(sth)
+            signature = self._coerce_signature(sth["signature"])
+        except (TypeError, ValueError):
+            return False
+
+        if not MLDSA.verify(network.public_key, payload, signature):
             return False
 
         # Update network state
@@ -252,6 +256,38 @@ class FederationRegistry:
             network.trust_level = TrustLevel.VERIFIED
 
         return True
+
+    @staticmethod
+    def _coerce_root_hash(root_hash: bytes | str) -> bytes:
+        """Normalize root_hash into bytes for signature verification."""
+        if isinstance(root_hash, bytes):
+            return root_hash
+        if isinstance(root_hash, str):
+            try:
+                return bytes.fromhex(root_hash)
+            except ValueError:
+                return root_hash.encode()
+        raise TypeError("root_hash must be bytes or str")
+
+    @staticmethod
+    def _coerce_signature(signature: bytes | str) -> bytes:
+        """Normalize a signature field into raw bytes."""
+        if isinstance(signature, bytes):
+            return signature
+        if isinstance(signature, str):
+            return bytes.fromhex(signature)
+        raise TypeError("signature must be bytes or hex string")
+
+    @classmethod
+    def _sth_signable_payload(cls, sth: dict) -> bytes:
+        """Canonical payload matching SignedTreeHead.signable_payload()."""
+        root_hash = cls._coerce_root_hash(sth["root_hash"])
+        return (
+            struct.pack(">Q", int(sth["sequence"]))
+            + struct.pack(">Q", int(sth["record_count"]))
+            + struct.pack(">d", float(sth["timestamp"]))
+            + root_hash
+        )
 
     def resolve_entity(
         self,

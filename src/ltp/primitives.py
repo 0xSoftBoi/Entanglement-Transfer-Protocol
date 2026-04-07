@@ -22,6 +22,7 @@ import hmac as hmac_mod
 import os
 import struct
 import warnings
+from enum import Enum
 
 # ---------------------------------------------------------------------------
 # Re-export dual-lane architecture (backward compatibility)
@@ -93,13 +94,22 @@ try:
 except ImportError:
     pass
 
+_cryptography_available = False
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM  # noqa: F401
+    _cryptography_available = True
+except ImportError:
+    pass
+
 
 __all__ = [
+    "AssuranceMode",
     "SecurityProfile", "HashFunction", "CryptoLane",
     "canonical_hash", "canonical_hash_bytes",
     "internal_hash", "internal_hash_bytes",
     "H", "H_bytes", "AEAD", "MLKEM", "MLDSA",
     "get_security_profile", "set_security_profile",
+    "get_assurance_mode", "set_assurance_mode", "get_runtime_assurance_status",
     "set_crypto_provider", "get_crypto_provider",
     "set_compliance_strict", "get_compliance_strict",
     "_pqcrypto_kem_available", "_pqcrypto_sign_available", "_pynacl_available",
@@ -116,6 +126,17 @@ __all__ = [
 _crypto_provider = None
 
 
+class AssuranceMode(Enum):
+    """Runtime assurance posture for cryptographic backends."""
+    DEVELOPMENT = "development"
+    SIMULATED = "simulated"
+    PRODUCTION = "production"
+    COMPLIANCE_STRICT = "compliance-strict"
+
+
+_assurance_mode: AssuranceMode = AssuranceMode.DEVELOPMENT
+
+
 def set_crypto_provider(provider) -> None:
     """Set the global crypto provider (e.g., FIPSCryptoProvider for FIPS mode)."""
     global _crypto_provider
@@ -125,6 +146,73 @@ def set_crypto_provider(provider) -> None:
 def get_crypto_provider():
     """Get the current crypto provider (None = default PoC primitives)."""
     return _crypto_provider
+
+
+def _check_fips_runtime_available() -> bool:
+    """Best-effort check for a FIPS-capable OpenSSL runtime."""
+    try:
+        import ssl
+        openssl_version = ssl.OPENSSL_VERSION
+        return "OpenSSL 3." in openssl_version or "OpenSSL 4." in openssl_version
+    except Exception:
+        return False
+
+
+def _validate_assurance_mode(mode: AssuranceMode) -> None:
+    """Fail closed when a stricter mode lacks required backends."""
+    if mode == AssuranceMode.PRODUCTION:
+        missing = []
+        if not _pqcrypto_kem_available:
+            missing.append("pqcrypto ML-KEM")
+        if not _pqcrypto_sign_available:
+            missing.append("pqcrypto ML-DSA")
+        if not _pynacl_available:
+            missing.append("PyNaCl XChaCha20-Poly1305")
+        if missing:
+            raise RuntimeError(
+                "Production mode requires real cryptographic backends. Missing: "
+                + ", ".join(missing)
+            )
+    elif mode == AssuranceMode.COMPLIANCE_STRICT:
+        _validate_assurance_mode(AssuranceMode.PRODUCTION)
+        missing = []
+        if not _cryptography_available:
+            missing.append("cryptography AES-GCM")
+        if not _check_fips_runtime_available():
+            missing.append("FIPS-capable OpenSSL runtime")
+        if missing:
+            raise RuntimeError(
+                "Compliance-strict mode requires compliance backends. Missing: "
+                + ", ".join(missing)
+            )
+
+
+def get_assurance_mode() -> AssuranceMode:
+    """Get the active runtime assurance mode."""
+    return _assurance_mode
+
+
+def set_assurance_mode(mode: AssuranceMode | str) -> AssuranceMode:
+    """Set the runtime assurance mode, failing closed if prerequisites are absent."""
+    global _assurance_mode
+    if isinstance(mode, str):
+        mode = AssuranceMode(mode)
+    _validate_assurance_mode(mode)
+    previous = _assurance_mode
+    _assurance_mode = mode
+    return previous
+
+
+def get_runtime_assurance_status() -> dict:
+    """Return the active assurance mode and backend availability."""
+    return {
+        "mode": _assurance_mode.value,
+        "pqcrypto_kem_available": _pqcrypto_kem_available,
+        "pqcrypto_sign_available": _pqcrypto_sign_available,
+        "pynacl_available": _pynacl_available,
+        "cryptography_available": _cryptography_available,
+        "fips_runtime_available": _check_fips_runtime_available(),
+    }
 
 
 # Maximum entries in PoC simulation lookup tables before LRU eviction.

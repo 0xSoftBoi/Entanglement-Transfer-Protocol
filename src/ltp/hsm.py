@@ -101,6 +101,24 @@ class HSMBackend(ABC):
         """
         ...
 
+    def generate_keypair(self, label: str) -> dict:
+        """Generate paired KEM and DSA keys and return public metadata.
+
+        This is a convenience helper for callers that need one logical keypair
+        without receiving any private key material back from the HSM.
+        """
+        kem_key_id = f"{label}:kem:{os.urandom(4).hex()}"
+        dsa_key_id = f"{label}:dsa:{os.urandom(4).hex()}"
+        ek = self.generate_kem_keypair(kem_key_id)
+        vk = self.generate_dsa_keypair(dsa_key_id)
+        return {
+            "label": label,
+            "kem_key_id": kem_key_id,
+            "dsa_key_id": dsa_key_id,
+            "ek": ek,
+            "vk": vk,
+        }
+
 
 class SoftwareHSM(HSMBackend):
     """

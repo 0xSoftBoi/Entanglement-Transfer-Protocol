@@ -177,13 +177,29 @@ class EthereumBackend(CommitmentBackend):
         "finalized": 96,  # ~19.2 min on L1 (2 epochs)
     }
 
-    def __init__(self, config: BackendConfig) -> None:
+    def __init__(
+        self,
+        config: BackendConfig,
+        mode: Optional[str] = None,
+    ) -> None:
         super().__init__(config)
 
-        # Real mode: route through AnchorClient when rpc_url is configured
-        self._real_mode = bool(
-            config.rpc_url and config.contract_address and config.operator_private_key
-        )
+        if mode == "live":
+            if not config.has_live_anchor_config():
+                raise ValueError(
+                    "ethereum-live requires rpc_url, contract_address, and operator_private_key"
+                )
+            self._real_mode = True
+        elif mode == "simulated":
+            if config.has_partial_live_anchor_config():
+                raise ValueError(
+                    "ethereum-sim must not be configured with live RPC or signer fields"
+                )
+            self._real_mode = False
+        else:
+            # Legacy compatibility mode for backend_type='ethereum'.
+            self._real_mode = config.has_live_anchor_config()
+
         self._anchor_client = None
         if self._real_mode:
             from ..anchor.client import AnchorClient
@@ -675,3 +691,17 @@ class EthereumBackend(CommitmentBackend):
     @property
     def transaction_count(self) -> int:
         return len(self._transactions)
+
+
+class EthereumSimulatedBackend(EthereumBackend):
+    """Explicit simulated Ethereum backend for local testing and parity checks."""
+
+    def __init__(self, config: BackendConfig) -> None:
+        super().__init__(config, mode="simulated")
+
+
+class EthereumLiveBackend(EthereumBackend):
+    """Explicit live Ethereum backend backed by AnchorClient / RPC infrastructure."""
+
+    def __init__(self, config: BackendConfig) -> None:
+        super().__init__(config, mode="live")

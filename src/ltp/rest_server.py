@@ -20,8 +20,19 @@ from urllib.parse import urlparse, parse_qs
 from .commitment import CommitmentLog, CommitmentRecord
 from .merkle_log.sth import SignedTreeHead
 from .merkle_log.tree import verify_consistency
+from .primitives import AssuranceMode, get_assurance_mode
 
 __all__ = ["CommitmentLogRestServer"]
+
+
+def _require_nonproduction_insecure_http(surface: str) -> None:
+    """Block insecure HTTP transport in production-oriented assurance modes."""
+    mode = get_assurance_mode()
+    if mode in (AssuranceMode.PRODUCTION, AssuranceMode.COMPLIANCE_STRICT):
+        raise RuntimeError(
+            f"{surface} uses insecure HTTP transport and is development-only in assurance mode "
+            f"'{mode.value}'. TLS/authenticated deployment is not implemented here."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +302,7 @@ class CommitmentLogRestServer:
     """
 
     def __init__(self, commitment_log: CommitmentLog, host: str = "127.0.0.1", port: int = 8080):
+        _require_nonproduction_insecure_http("CommitmentLogRestServer")
         self.commitment_log = commitment_log
         self.host = host
         self.port = port

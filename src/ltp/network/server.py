@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Iterator
 
 import grpc
 
+from ..primitives import AssuranceMode, get_assurance_mode
 from . import shard_service_pb2 as pb2
 from . import shard_service_pb2_grpc as pb2_grpc
 
@@ -21,6 +22,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = ["NodeServer"]
+
+
+def _require_nonproduction_insecure_transport(surface: str) -> None:
+    """Block insecure transport in production-oriented assurance modes."""
+    mode = get_assurance_mode()
+    if mode in (AssuranceMode.PRODUCTION, AssuranceMode.COMPLIANCE_STRICT):
+        raise RuntimeError(
+            f"{surface} uses insecure transport and is development-only in assurance mode "
+            f"'{mode.value}'. Secure transport is not implemented yet."
+        )
 
 
 class _ShardServicer(pb2_grpc.ShardServiceServicer):
@@ -102,6 +113,7 @@ class NodeServer:
         host: str = "0.0.0.0",
         max_workers: int = 10,
     ) -> None:
+        _require_nonproduction_insecure_transport("NodeServer")
         self._node = node
         self._port = port
         self._host = host

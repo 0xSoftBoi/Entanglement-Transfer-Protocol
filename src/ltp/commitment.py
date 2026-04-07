@@ -459,6 +459,10 @@ class CommitmentRecord:
         """Sign this record with the sender's ML-DSA-65 signing key."""
         self.signature = MLDSA.sign(sender_sk, self.signable_payload())
 
+    def sign_with_keypair(self, sender_keypair) -> None:
+        """Sign this record through a KeyPair abstraction."""
+        self.signature = sender_keypair.sign(self.signable_payload())
+
     def verify_signature(self, sender_vk: bytes) -> bool:
         """Verify this record's ML-DSA-65 signature against sender's vk."""
         if not self.signature:
