@@ -3,9 +3,13 @@ Tests for gRPC networking layer.
 
 Starts actual gRPC servers on localhost and verifies shard operations
 work over the network.
+
+These are true integration tests: they require the current environment
+to permit localhost socket binding for gRPC server startup.
 """
 
 import os
+import socket
 import time
 
 import pytest
@@ -21,6 +25,23 @@ from src.ltp.primitives import canonical_hash
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
+def _can_bind_localhost() -> bool:
+    """Return True when the test environment allows localhost socket binds."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("localhost", 0))
+        sock.close()
+        return True
+    except OSError:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _can_bind_localhost(),
+    reason="Requires localhost socket bind permissions for gRPC integration tests",
+)
+
 @pytest.fixture
 def node():
     return CommitmentNode("test-node", "US-East")
@@ -30,20 +51,10 @@ def node():
 def server_and_client(node):
     """Start a gRPC server on a random port and return (server, client)."""
     server = NodeServer(node, port=0, host="localhost")
-    # Port 0 = OS assigns an available port
-    # We need to use a specific port since gRPC server doesn't expose the bound port easily
-    # Use a fixed high port instead
-    import socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(('localhost', 0))
-    port = sock.getsockname()[1]
-    sock.close()
-
-    server = NodeServer(node, port=port, host="localhost")
     server.start()
     time.sleep(0.1)  # brief wait for server to bind
 
-    client = NodeClient(f"localhost:{port}", timeout=5.0)
+    client = NodeClient(server.address, timeout=5.0)
     yield server, client, node
 
     client.close()

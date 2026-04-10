@@ -27,7 +27,11 @@ def get_anchor_client(
     contract_address: str,
     private_key: str,
     chain_id: int,
+    verify_live_config: bool = False,
 ) -> "AnchorClient":
-    """Factory for AnchorClient. Requires ltp[chain] extra."""
+    """Factory for AnchorClient. Optionally verifies live RPC configuration."""
     from .client import AnchorClient
-    return AnchorClient(rpc_url, contract_address, private_key, chain_id)
+    client = AnchorClient(rpc_url, contract_address, private_key, chain_id)
+    if verify_live_config:
+        client.verify_live_configuration()
+    return client

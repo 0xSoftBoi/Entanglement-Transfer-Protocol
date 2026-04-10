@@ -121,20 +121,31 @@ class NodeServer:
         pb2_grpc.add_ShardServiceServicer_to_server(
             _ShardServicer(node), self._server,
         )
-        self._server.add_insecure_port(f"{host}:{port}")
+        self._bound_port = self._server.add_insecure_port(f"{host}:{port}")
+        if self._bound_port == 0:
+            raise RuntimeError(f"NodeServer failed to bind {host}:{port}")
 
     @property
     def node(self) -> "CommitmentNode":
         return self._node
 
     @property
+    def port(self) -> int:
+        return self._bound_port
+
+    @property
     def address(self) -> str:
-        return f"{self._host}:{self._port}"
+        return f"{self._host}:{self._bound_port}"
 
     def start(self) -> None:
         """Start serving (non-blocking)."""
         self._server.start()
-        logger.info("NodeServer %s listening on %s:%d", self._node.node_id, self._host, self._port)
+        logger.info(
+            "NodeServer %s listening on %s:%d",
+            self._node.node_id,
+            self._host,
+            self._bound_port,
+        )
 
     def stop(self, grace: float = 1.0) -> None:
         """Stop the server."""
