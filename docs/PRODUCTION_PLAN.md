@@ -1,6 +1,16 @@
 # ETP Production Implementation Plan
 
-From PoC (current: 821 tests, in-memory, simulated crypto) to production-grade post-quantum bridge.
+From the current PoC/runtime baseline to a production-grade post-quantum bridge target.
+
+Current implementation reality:
+
+- The repo now contains stricter runtime boundaries than the original PoC:
+  - insecure gRPC/HTTP transport is blocked in strict assurance modes
+  - `LiveBridge` fails closed by default if real chain state cannot be queried
+  - `AnchorClient` can fail fast on bad live RPC configuration
+  - simulated ZK and VDF surfaces are explicitly gated
+- Even with those guardrails, this document is still a roadmap, not a statement that the repo is production-ready today.
+- Read [DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md) alongside this plan for the current live anchor / bridge prerequisites and environment-dependent validation steps.
 
 ---
 
@@ -382,7 +392,7 @@ Users submit Merkle proof → execute withdrawal (~60-100K gas)
 - Latency: 7-day challenge period
 - Trust: 1-of-n honest watcher
 
-#### Phase 4b: ZK-Verified Bridge (production target)
+#### Phase 4b: ZK-Verified Bridge (target state, not current runtime)
 
 ```
 Operator posts STH root + zkVM proof → L1 contract
@@ -398,7 +408,7 @@ Users submit Merkle proof → execute withdrawal
 - Latency: Minutes (proving time)
 - Trust: Cryptographic soundness only
 
-#### Phase 4c: STARK Bridge (full PQ security)
+#### Phase 4c: STARK Bridge (target state, not current runtime)
 
 - Replace SNARK wrapper with STARK for end-to-end post-quantum security
 - SNARK proofs use pairing-based crypto (not PQ-safe) — STARKs use only hashes
@@ -508,7 +518,7 @@ Production: Kubernetes with Helm charts. Each shard node as a StatefulSet with p
 | **5: Hardening** | 5 days | Week 12 | HSM, monitoring, container orchestration |
 | **4c: STARK Bridge** | 10 days | Week 13-14 | Full PQ on-chain verification |
 
-**Total: ~14 weeks** from PoC to production-ready PQ bridge with full on-chain verification.
+**Total: ~14 weeks** from the guarded PoC/runtime baseline to a production-ready PQ bridge target with full on-chain verification.
 
 ```mermaid
 gantt

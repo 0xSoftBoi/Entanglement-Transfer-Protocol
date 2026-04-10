@@ -18,7 +18,7 @@ The Entanglement Transfer Protocol documentation is organized into six categorie
 | | [Cross-Deployment Federation](design-decisions/CROSS_DEPLOYMENT_FEDERATION.md) | Network discovery, trust levels, cross-network materialization |
 | | [ZK Transfer Mode](design-decisions/ZK_TRANSFER_MODE.md) | Hiding commitments, Groth16 proofs, post-quantum upgrade path |
 | **Operations** | [Production Plan](PRODUCTION_PLAN.md) | PoC to production roadmap — 7 phases, 14 weeks |
-| | [Deployment Guide](DEPLOYMENT_GUIDE.md) | Docker, Kubernetes, CI/CD, key management, monitoring |
+| | [Deployment Guide](DEPLOYMENT_GUIDE.md) | Docker, Kubernetes, CI/CD, key management, monitoring, and live anchor/bridge prerequisites |
 | | [Bridge MVP](bridge-mvp-scope.md) | L1-L2 cross-chain bridge scope and components |
 | **Security** | [Security Review](design-decisions/Security/SECURITY_REVIEW-2-24-2026.md) | Formal security review (2026-02-24) |
 | | [Shard Exposure Analysis](design-decisions/Security/001-lattice-key-shard-exposure.md) | Attack chain analysis and Option A-D comparison |
@@ -74,3 +74,8 @@ New to ETP? Read in this order:
 4. **[Technical Report](../LTP_COMPREHENSIVE_REPORT.md)** — Full system deep dive
 5. **[Security Review](design-decisions/Security/SECURITY_REVIEW-2-24-2026.md)** — Understand the threat model
 6. **[Production Plan](PRODUCTION_PLAN.md)** — See the path to production
+
+If you are specifically trying to run live on-chain anchoring or `LiveBridge`, read this before copying env vars or deployment steps:
+
+1. **[Deployment Guide](DEPLOYMENT_GUIDE.md)** — Includes live anchor / bridge prerequisites and `VERIFY_LIVE_CONFIG`
+2. **[Production Plan](PRODUCTION_PLAN.md)** — Explains which pieces are still roadmap items versus current runtime behavior

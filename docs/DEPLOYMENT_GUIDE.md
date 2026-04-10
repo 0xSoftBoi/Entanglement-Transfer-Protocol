@@ -9,6 +9,41 @@ Concrete steps to deploy the Entanglement Transfer Protocol from local dev to pr
 
 ---
 
+## Live Anchor / Bridge Reality
+
+Before using any "live" anchor or bridge path in this repo, treat these as hard prerequisites:
+
+- `AnchorClient` is the live RPC adapter. It is not a simulated backend and should only be used when you have a reachable chain RPC, the correct registry address, and a valid signer key.
+- `LiveBridge` now fails closed by default if it cannot query real chain state from its `AnchorClient`.
+- Development-only fallback behavior exists, but it must be explicitly opted into with `allow_simulated_finality_fallback=True`. That mode should not be treated as live-chain verification.
+- Contract integration and live bridge validation are environment-dependent. They are not self-contained unit tests.
+
+Recommended setup rule:
+
+- When constructing `AnchorClient` from environment, set `VERIFY_LIVE_CONFIG=1` so startup fails fast on bad RPC endpoints or chain ID mismatches.
+
+Required live anchor environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `RPC_URL` | Reachable chain RPC endpoint |
+| `ANCHOR_REGISTRY` | Deployed registry/proxy contract address |
+| `OPERATOR_KEY` | Signer private key for transactions |
+| `CHAIN_ID` | Expected chain ID for RPC validation and transaction signing |
+
+Optional but recommended:
+
+| Variable | Purpose |
+|----------|---------|
+| `VERIFY_LIVE_CONFIG` | Set to `1` to verify RPC connectivity and chain ID during `AnchorClient.from_env()` |
+| `ANCHOR_TX_TIMEOUT` | Receipt wait timeout |
+| `ANCHOR_MAX_TPS` | Client-side rate limiting |
+| `ANCHOR_BURST` | Rate limiter burst size |
+| `ANCHOR_FAILURE_THRESHOLD` | Circuit-breaker trip threshold |
+| `ANCHOR_COOLDOWN_SECONDS` | Circuit-breaker cooldown |
+
+---
+
 ## Prerequisites
 
 | Tool | Version | Purpose |
@@ -38,7 +73,14 @@ pytest tests/ -v
 python -m ltp
 ```
 
-All 821 tests pass with zero external dependencies (stdlib-only PoC crypto).
+The stable local path is still primarily PoC/development-oriented.
+
+Notes:
+
+- Some integration suites require external tooling or explicit opt-in.
+- `tests/test_contract_integration.py` requires `RUN_CONTRACT_INTEGRATION=1`, `forge`, `web3`, and `anvil`.
+- `tests/test_network.py` requires localhost socket binding to be permitted by the environment.
+- Live anchor / bridge behavior should be validated separately from the default local test path.
 
 ---
 

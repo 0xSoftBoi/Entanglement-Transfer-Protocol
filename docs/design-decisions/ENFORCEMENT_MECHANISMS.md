@@ -234,6 +234,12 @@ DisputeResolution process:
 
 ## Mechanism 4: VDF-Enhanced Audit Timing
 
+> Current runtime note:
+> The repository's current implementation exposes VDF-enhanced audits as a
+> simulation-backed interface. Named constructions such as Pietrzak and
+> Wesolowski are design targets here, not fully implemented backends, and
+> strict assurance modes intentionally fail closed on VDF usage.
+
 ### Problem
 
 The time bound T in burst challenges is calibrated against network RTT
