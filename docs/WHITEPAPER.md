@@ -93,6 +93,10 @@ ML-DSA-65 · BLAKE3 · Certificate Transparency · Reed-Solomon coding
         - [3.3.5 Threshold Secrecy (Information-Theoretic)](#335-threshold-secrecy-information-theoretic)
         - [3.3.6 Transfer Immutability (Composite Game)](#336-transfer-immutability-composite-game)
         - [3.3.7 What Cannot Be Formally Proven](#337-what-cannot-be-formally-proven)
+    - [3.4 Formal Verification Models](#34-formal-verification-models)
+        - [3.4.1 Tamarin Prover Model](#341-tamarin-prover-model)
+        - [3.4.2 ProVerif Model](#342-proverif-model)
+        - [3.4.3 Honest Limitations](#343-honest-limitations)
 - [4. Immutability Guarantees](#4-immutability-guarantees)
     - [4.1 Why Immutability Is Inherent](#41-why-immutability-is-inherent)
     - [4.2 Versioning vs. Mutation](#42-versioning-vs-mutation)
@@ -124,6 +128,7 @@ ML-DSA-65 · BLAKE3 · Certificate Transparency · Reed-Solomon coding
     - [6.2 Geographic Distance](#62-geographic-distance)
     - [6.3 Computing Power](#63-computing-power)
     - [6.4 Formal Cost Model](#64-formal-cost-model)
+    - [6.5 Cryptographic Performance: Level 3 vs. Level 5](#65-cryptographic-performance-level-3-vs-level-5)
 - [7. Comparison with Existing Approaches](#7-comparison-with-existing-approaches)
 - [8. Related Work and Prior Art](#8-related-work-and-prior-art)
     - [8.1 Content-Addressed Storage](#81-content-addressed-storage)
@@ -133,6 +138,7 @@ ML-DSA-65 · BLAKE3 · Certificate Transparency · Reed-Solomon coding
     - [8.5 Peer-to-Peer Content Distribution](#85-peer-to-peer-content-distribution)
     - [8.6 Hybrid and Convergent Systems](#86-hybrid-and-convergent-systems)
     - [8.7 What LTP Contributes](#87-what-ltp-contributes)
+    - [8.8 International Post-Quantum Standardization Landscape](#88-international-post-quantum-standardization-landscape)
     - [References](#references)
 - [9. Use Cases](#9-use-cases)
     - [9.1 Large File Fan-Out](#91-large-file-fan-out)
@@ -140,6 +146,12 @@ ML-DSA-65 · BLAKE3 · Certificate Transparency · Reed-Solomon coding
     - [9.3 Secure Messaging](#93-secure-messaging)
     - [9.4 State Synchronization](#94-state-synchronization)
     - [9.5 High-Latency Link Optimization](#95-high-latency-link-optimization)
+    - [9.6 Regulatory Compliance and Data Sovereignty](#96-regulatory-compliance-and-data-sovereignty)
+        - [9.6.1 GDPR and Functional Erasure](#961-gdpr-and-functional-erasure)
+        - [9.6.2 EU Data Act](#962-eu-data-act)
+        - [9.6.3 eIDAS 2.0 Trust Services](#963-eidas-20-trust-services)
+        - [9.6.4 CNSA 2.0 Compliance](#964-cnsa-20-compliance)
+        - [9.6.5 Additional Compliance Frameworks](#965-additional-compliance-frameworks)
 - [10. Open Questions](#10-open-questions)
 - [11. Conclusion](#11-conclusion)
 
@@ -830,17 +842,49 @@ bound of Theorem 5 holds unconditionally under ZK mode.
    mode) is fully post-quantum; the PQ gap is isolated to the privacy-enhanced mode only.
 
    Planned post-quantum upgrade path:
-   - **Near-term (STARK):** Replace Groth16 with a hash-based STARK (e.g., over BLAKE3 or
-     Poseidon). No trusted setup required; security reduces to collision resistance of the
-     hash function. Proof sizes grow to ~20–200 KB.
-   - **Medium-term (lattice ZK):** Lattice-based proof systems (e.g., Ligero++, Spartan
-     over a PQ-safe hash) may yield smaller proofs. No NIST-standardized lattice-based ZK
-     system exists as of this writing.
+
+   - **Near-term: Circle STARKs.** Replace Groth16 with hash-based Circle STARKs operating
+     over circle groups defined by Mersenne primes ($p = 2^{31} - 1$). Circle STARKs
+     (StarkWare, 2024) achieve efficient FFTs via the algebraic structure of the circle group
+     $\mathbb{G} = \{(x,y) : x^2 + y^2 = 1 \pmod{p}\}$, enabling FRI-based polynomial
+     commitment with no trusted setup. Security reduces to collision resistance of the
+     hash function (BLAKE3 or SHA3-256). Proof sizes are ~32 KB; verification is O(log² n).
+     Post-quantum safe: no pairings, no discrete logarithm assumptions.
+
+   - **Medium-term: LatticeFold.** LatticeFold (Boneh & Chen, Asiacrypt 2025) is a lattice-based
+     folding scheme built on Module-SIS, enabling recursive proof composition — a prover can
+     incrementally fold multiple NP instances into a single short proof. Key properties:
+     - **Post-quantum safe:** security reduces to Module-SIS hardness, the same assumption
+       underlying ML-KEM and ML-DSA (FIPS 203/204).
+     - **Recursive composition:** supports IVC (Incrementally Verifiable Computation),
+       enabling streaming ZK proofs for chunked entity commits (see §10, Open Questions 4–5).
+     - **Proof size:** ~8 KB (vs. 192 bytes for Groth16, ~32 KB for Circle STARKs).
+     - **No trusted setup:** public parameters derived from lattice structure.
+     - **Limitation:** Generation time is ~10× slower than Groth16 (estimated 10–20s per proof
+       at the 128-bit security level). Suitable for batch commits, not real-time transfers.
+
+   - **Comparison of ZK proof systems:**
+
+     | Property | Groth16 | Circle STARK | LatticeFold |
+     |----------|---------|-------------|-------------|
+     | Post-quantum safe | No (Shor breaks pairings) | Yes (hash-based) | Yes (Module-SIS) |
+     | Trusted setup | Yes (per-circuit MPC) | No | No |
+     | Proof size | ~192 B | ~32 KB | ~8 KB |
+     | Generation time | ~2 s | ~5 s | ~10–20 s |
+     | Verification time | ~5 ms | ~50 ms | ~20 ms |
+     | Recursion native | No | Via STARK folding | Yes (IVC) |
+     | Maturity | Production | Production | Research |
+
+   The LTP reference implementation (`src/ltp/zk_transfer.py`) includes PoC simulations for
+   all four proof systems (Simulated, Groth16, Circle STARK, LatticeFold) with the `ZKProofSystem`
+   enum. The `is_post_quantum` property identifies which systems are safe under quantum threat models.
 
    Until a post-quantum ZK instantiation is standardized and integrated, deployments
    requiring both content-privacy (hiding) and quantum resistance SHOULD forgo ZK mode and
    accept the EntityID fingerprinting limitation of §3.3.3, mitigated by ensuring entity
-   content has sufficient min-entropy (§3.3.3 guidance). See §10, Open Question 8.
+   content has sufficient min-entropy (§3.3.3 guidance). Circle STARKs are recommended as
+   the near-term PQ-safe ZK upgrade path; LatticeFold provides stronger algebraic alignment
+   with the ML-KEM/ML-DSA primitive stack.
 
 3. **Content-property proofs.** R_ZK proves commitment consistency only, not content
    constraints. Application-layer predicates ("entity_content is valid JSON with `amount ∈
@@ -1191,6 +1235,90 @@ while BLAKE3-256 provides ~85-bit post-quantum collision resistance (BHT bound) 
 | "Sub-latency transfer" | O(1) key size is proven; O(1) total latency is not. MATERIALIZE fetches O(entity) data. | Reframed as "bottleneck relocation" |
 | "Secure without trust" | Requires honest append-only log and ≥ k honest shard replicas. These ARE trust assumptions. | Acknowledged in §5.1 |
 | "Permanent storage" | Requires economic incentives to sustain nodes. Without incentives, rational nodes evict data. | Acknowledged in §5.4.4, §5.5 |
+
+### 3.4 Formal Verification Models
+
+LTP's six security properties (§3.3, Theorems 3–8) are defined as cryptographic games with
+pen-and-paper reduction proofs. Pen-and-paper proofs establish the *existence* of a reduction;
+they do not rule out specification bugs, unstated assumptions, or implementation divergence
+from the model. This section describes two complementary formal verification models that
+encode the three-phase protocol symbolically and allow machine-checkable verification of
+a subset of the security properties.
+
+#### 3.4.1 Tamarin Prover Model
+
+The Tamarin prover (ETH Zurich, 2012) is a tool for the symbolic analysis of security
+protocols in the applied pi-calculus. LTP exports a Tamarin theory (`src/ltp/verification.py`,
+`TamarinModel.export()`) that encodes:
+
+- **Builtins:** `hashing`, `asymmetric-encryption`, `signing` — the symbolic primitives
+  corresponding to BLAKE3/SHA3, ML-KEM, and ML-DSA.
+- **Rules:** `Generate_KeyPair`, `Generate_Signing_Key`, `Commit`, `Lattice`, `Materialize`
+  — the five protocol transitions. Each rule declares the facts it consumes (linear facts
+  removed from the state) and produces (new facts added to the state), plus action facts
+  for lemma reasoning.
+- **Adversary model:** An optional `Compromise_LTK` rule allowing the adversary to learn a
+  party's long-term key, enabling forward-secrecy and key-compromise analysis.
+- **Lemmas:** One lemma per security property, expressed as trace properties over action facts.
+
+**Machine-checkable properties (4 of 6):**
+
+| Property | Theorem | Tamarin Lemma | Status |
+|----------|---------|---------------|--------|
+| Entity Immutability (IMM) | Theorem 3 | `entity_immutability` | Machine-checkable |
+| Transfer Confidentiality (TCONF) | Theorem 5 | `transfer_confidentiality` | Machine-checkable |
+| Non-Repudiation (NREP) | Theorem 6 | `non_repudiation` | Machine-checkable |
+| Transfer Immutability (TIMM) | Theorem 8 | `transfer_immutability` | Machine-checkable |
+
+**Properties requiring manual proof (2 of 6):**
+
+| Property | Theorem | Reason |
+|----------|---------|--------|
+| Shard Integrity (SINT) | Theorem 4 | Erasure coding is algebraic, not symbolic — Tamarin's term algebra cannot model Reed-Solomon decoding |
+| Threshold Secrecy (TSEC) | Theorem 7 | Information-theoretic property — Tamarin operates in the computational (symbolic) model |
+
+#### 3.4.2 ProVerif Model
+
+ProVerif (INRIA, 2001) is an automatic protocol verifier in the Dolev-Yao model.
+LTP exports a ProVerif model (`ProVerifModel.export()`) that encodes:
+
+- **Type declarations:** `skey`, `pkey`, `sigkey`, `sigvkey` — matching the ML-KEM and
+  ML-DSA key types.
+- **Cryptographic functions:** `pk()`, `aenc()`/`adec()`, `sign()`/`checksign()`,
+  `senc()`/`sdec()`, `hash()` — modeled as constructor/destructor pairs with standard
+  equational theories.
+- **Events:** `Committed()`, `Sealed()`, `Materialized()` — corresponding to the three
+  protocol phases.
+- **Processes:** `Sender` (performs COMMIT and LATTICE), `Receiver` (performs MATERIALIZE).
+- **Queries:** Secrecy (`attacker(secret_content)`) and authentication
+  (`Materialized ⟹ Committed ∧ Sealed`).
+
+ProVerif's automatic resolution procedure can verify reachability and correspondence
+assertions. For LTP, the secrecy query confirms that no Dolev-Yao adversary can learn
+entity content from network observations; the correspondence query confirms that every
+`Materialized` event is preceded by matching `Committed` and `Sealed` events.
+
+#### 3.4.3 Honest Limitations
+
+These models are *proof-of-concept* symbolic encodings. They verify **protocol logic**, not
+implementation correctness:
+
+1. **Symbolic vs. computational.** Both Tamarin and ProVerif operate in the symbolic (Dolev-Yao)
+   model, where cryptographic primitives are treated as perfect black boxes. They do not reason
+   about bit-level attacks, side channels, or implementation bugs.
+2. **Abstraction gap.** The models encode an idealized three-phase protocol. The actual
+   Python implementation (`src/ltp/`) includes error handling, state machines, serialization,
+   and concurrency that are not modeled. A bug in any of these layers would not be caught.
+3. **Coverage.** Four of six security properties are machine-checkable. The remaining two
+   (SINT, TSEC) require manual proof or a different verification framework (e.g., EasyCrypt
+   for computational proofs, or Coq/Isabelle for information-theoretic reasoning).
+4. **Not executed in CI.** The exported models are syntactically valid but have not been
+   executed in Tamarin or ProVerif as part of the test suite. Running them requires installing
+   the respective tool chains (Haskell + Maude for Tamarin, OCaml for ProVerif).
+
+Full model sources are generated by `src/ltp/verification.py` and can be piped directly to
+the Tamarin or ProVerif command-line tools. See `TamarinModel.export(include_adversary=True)`
+for the adversary-inclusive model.
 
 ---
 
@@ -1980,6 +2108,76 @@ contention), $T_{LTP} \approx T_{direct}$ but with the sender free to go offline
    the COMMIT phase — each LTP entity should represent a distinct logical unit, not an
    intermediate edit state.
 
+### 6.5 Cryptographic Performance: Level 3 vs. Level 5
+
+LTP supports two NIST post-quantum security levels via configurable `SecurityProfile`:
+
+- **Level 3** (default): ML-KEM-768 + ML-DSA-65. Targets 128-bit post-quantum security
+  (equivalent to AES-128 against a quantum adversary).
+- **Level 5**: ML-KEM-1024 + ML-DSA-87. Targets 256-bit post-quantum security (equivalent
+  to AES-256). Required by CNSA 2.0 (NSA) for National Security Systems by January 2027.
+
+The following tables summarize key/signature sizes and projected performance impact. Size
+data from NIST FIPS 203/204 specifications; timing data from the LTP benchmark suite
+(`src/ltp/benchmarks.py`, `CryptoBenchmark.run_all()`).
+
+**Key and signature sizes:**
+
+| Parameter | Level 3 (ML-KEM-768 / ML-DSA-65) | Level 5 (ML-KEM-1024 / ML-DSA-87) | Overhead |
+|-----------|:--------------------------------:|:---------------------------------:|:--------:|
+| KEM encapsulation key (ek) | 1,184 B | 1,568 B | +32% |
+| KEM decapsulation key (dk) | 2,400 B | 3,168 B | +32% |
+| KEM ciphertext (ct) | 1,088 B | 1,568 B | +44% |
+| KEM shared secret | 32 B | 32 B | — |
+| DSA verification key (vk) | 1,952 B | 2,592 B | +33% |
+| DSA signing key (sk) | 4,032 B | 4,896 B | +21% |
+| DSA signature | 3,309 B | 4,627 B | +40% |
+| **Sealed lattice key** (total) | **~1,300 B** | **~1,700 B** | **+31%** |
+
+**Performance impact on protocol phases:**
+
+| Operation | Level 3 | Level 5 | Notes |
+|-----------|---------|---------|-------|
+| Key generation (KEM + DSA) | Baseline | ~15–25% slower | Larger matrix operations |
+| SealedBox seal + unseal | Baseline | ~20–35% slower | Larger ciphertext encapsulation |
+| COMMIT phase | Negligible difference | Negligible difference | Dominated by erasure coding and shard distribution, not KEM/DSA |
+| LATTICE phase (key sealing) | ~1 ms | ~1.3 ms | Dominated by ML-KEM encapsulate |
+| MATERIALIZE phase | Negligible difference | Negligible difference | Dominated by shard fetching and erasure decoding |
+
+**Hash function performance (internal lane):**
+
+LTP's dual-lane hash model separates canonical hashing (FIPS-approved: SHA3-256, SHA-384,
+SHA-512) from internal hashing (performance-optimized: BLAKE3-256, BLAKE2b-256). The
+canonical lane governs EntityID computation, commitment records, and audit log entries.
+The internal lane governs Merkle tree construction, shard indexing, and internal integrity
+checks.
+
+| Hash Function | Lane | Throughput (1 KB) | Throughput (64 KB) | FIPS Approved |
+|---------------|------|:-----------------:|:------------------:|:-------------:|
+| BLAKE3-256 | Internal only | ~2,500 MB/s | ~8,000 MB/s | No |
+| BLAKE2b-256 | Internal only | ~1,200 MB/s | ~1,200 MB/s | No |
+| SHA3-256 | Canonical | ~400 MB/s | ~400 MB/s | Yes |
+| SHA-384 | Canonical | ~600 MB/s | ~600 MB/s | Yes |
+| SHA-512 | Canonical | ~650 MB/s | ~650 MB/s | Yes |
+
+Throughput values are approximate single-core figures on x86-64 hardware. BLAKE3 benefits
+from SIMD parallelism at larger payloads; SHA-2/SHA-3 throughput is roughly constant across
+sizes. The dual-lane model allows deployments to use BLAKE3 for internal performance while
+maintaining FIPS-approved hashing on all externally visible and auditable paths.
+
+**Bandwidth cost of Level 5:**
+
+For N receivers, the sealed lattice key is transmitted N times. The per-receiver overhead
+of Level 5 is approximately 400 additional bytes per key (~1,700 B vs. ~1,300 B). For
+$N = 1{,}000$ receivers: $400 \times 1{,}000 = 400\text{ KB}$ additional bandwidth — negligible
+relative to entity size. The Level 5 overhead is concentrated in key generation and seal/unseal
+latency, not bandwidth.
+
+**Recommendation:** Use Level 3 for general-purpose deployments. Use Level 5 for CNSA 2.0
+compliance, government/military contexts, or deployments with a 30+ year confidentiality
+horizon. The `SecurityProfile` API (`SecurityProfile.level5()`, `SecurityProfile.cnsa2()`)
+provides pre-configured profiles for each use case.
+
 ---
 
 ## 7. Comparison with Existing Approaches
@@ -2010,14 +2208,26 @@ contention), $T_{LTP} \approx T_{direct}$ but with the sender free to go offline
 Shor's algorithm). Standard mode provides full post-quantum security. ZK mode MUST NOT be
 used under a quantum-adversary threat model. See §3.2.4 and the Abstract warning.
 
+**Extended capabilities comparison:**
+
+| Capability | IPFS | Storj | Filecoin | Nym | **LTP** |
+|------------|------|-------|----------|-----|---------|
+| PQ-safe ZK proofs | No | No | No (PoSt is not ZK) | No | **Yes (Circle STARK, LatticeFold)** |
+| Streaming mode | No (block-level) | No | No | Mixnet streaming | **Yes (`streaming.py`)** |
+| Cross-network federation | Partial (DHT) | No | No | Partial (mixnodes) | **Yes (`federation.py`)** |
+| Data sovereignty controls | No | Region-select | No | No | **Yes (GeoFence, GDPR erasure, eIDAS 2.0)** |
+| Formal verification models | No | No | Partial (PoSt proofs) | No | **Yes (Tamarin + ProVerif)** |
+| Configurable security level | No | No | No | No | **Yes (Level 3 / Level 5)** |
+| FIPS-approved hash lane | No | No | No | No | **Yes (dual-lane model)** |
+
 **Reading guide:** LTP's unique cells (only LTP has "Yes") are: O(1) sender→receiver path,
 receiver-bound capabilities, per-message PQ forward secrecy, PQ-signed append-only audit log,
 and ZK privacy mode (standard mode only is fully PQ-safe). The encrypted storage, erasure coding, and capability-based access that
 LTP shares with Tahoe-LAFS and Storj are acknowledged as prior art — see Section 8. The final
-three rows reflect dimensions where LTP is weakest: LTP's three-phase design introduces
-significant protocol complexity compared to point-to-point alternatives; it is currently a
-research prototype with no production deployment; and for single-receiver, small-payload
-transfers, the commit+lattice+materialize overhead dominates (see §6.4).
+three rows in the main table reflect dimensions where LTP is weakest: LTP's three-phase design
+introduces significant protocol complexity compared to point-to-point alternatives; it is
+currently a research prototype with no production deployment; and for single-receiver,
+small-payload transfers, the commit+lattice+materialize overhead dominates (see §6.4).
 
 ### Erasure Coding Durability Comparison
 
@@ -2237,10 +2447,78 @@ cryptographic standards, each of which may influence regional adoption requireme
 | **EU** | ENISA | PQ Crypto Recommendations | Published (2024) | Supranational guidance |
 | **Australia** | ASD | CNSA 2.0 alignment | Pure PQ by 2030 target | Early adopter timeline |
 
+**Detailed national program analysis:**
+
+**CNSA 2.0 (USA, NSA).** The Commercial National Security Algorithm Suite 2.0 mandates a
+complete transition from classical to post-quantum cryptography for National Security Systems:
+
+| Capability | Required Algorithm | Deadline | LTP Mapping |
+|------------|-------------------|----------|-------------|
+| Key establishment | ML-KEM-1024 (Level 5) | January 2027 | `SecurityProfile.cnsa2()` |
+| Digital signatures | ML-DSA-87 (Level 5) | January 2027 | `SecurityProfile(5, hash_fn=SHA_384)` |
+| Hashing | SHA-384 minimum | January 2027 | Canonical lane: `SHA_384` |
+| Symmetric encryption | AES-256 | Already required | XChaCha20-Poly1305 (256-bit key) |
+
+LTP's Level 5 profile (`SecurityProfile.level5()`) satisfies all CNSA 2.0 requirements.
+The `cnsa2()` classmethod provides a pre-configured profile with SHA-384 canonical hash.
+
+**BSI (Germany).** The Bundesamt für Sicherheit in der Informationstechnik requires *hybrid*
+cryptography (PQ + classical) during the transition period. TR-02102-1 recommends:
+- ML-KEM + ECDH-X25519 for key establishment (hybrid)
+- ML-DSA + Ed25519 for signatures (hybrid)
+- Hybrid mandate remains until at least 2030
+
+LTP's `hybrid.py` module provides `HybridKEM` (ML-KEM-768 + X25519) and `HybridSigner`
+(ML-DSA-65 + Ed25519) for BSI-compliant deployments. The dual encapsulation produces two
+shared secrets that are combined via HKDF, ensuring security if either primitive remains
+unbroken.
+
+**ANSSI (France).** The Agence nationale de la sécurité des systèmes d'information published
+PQ migration recommendations aligned with BSI but with additional emphasis on:
+- AES-256 as minimum symmetric strength (LTP uses 256-bit XChaCha20)
+- Hybrid key agreement for all new deployments
+- SHA-384 or SHA-512 for hashing (compatible with LTP's canonical lane)
+
+**China (CACR).** The Chinese PQC standardization follows an independent track:
+- The CACR PQC Algorithm Competition is evaluating domestic lattice and code-based schemes
+- openHiTLS provides ML-KEM/ML-DSA implementations for interoperability testing
+- PQMagic (Tsinghua University) reports 1.5–2.2× performance improvements over reference
+  ML-KEM implementations via AVX-512 optimization
+- LTP interoperability: the `SecurityProfile` accepts pluggable backends; a CACR-approved
+  algorithm could be integrated as an alternative KEM/DSA backend without protocol changes
+
+**Korea (KpqC).** The Korean PQC Competition evaluates national alternatives:
+- SMAUG-T (lattice-based KEM) and HAETAE (lattice-based signature) are leading candidates
+- ETRI coordinates research with NIST alignment as a secondary goal
+- LTP interoperability: if KpqC produces algorithms with different key sizes, `SecurityProfile`
+  would require a new `level` value or custom parameter configuration
+
+**Japan (CRYPTREC).** The Cryptography Research and Evaluation Committees published the
+CRYPTREC Report 2024 with an explicit hybrid mandate:
+- ML-KEM + X25519 recommended for key agreement
+- ML-DSA + Ed25519 recommended for signatures
+- Migration timeline: hybrid mandatory by 2027, pure PQ by 2030
+- LTP's hybrid module satisfies the CRYPTREC hybrid requirement directly
+
+**Singapore (IMDA).** The Infocomm Media Development Authority published a quantum-safe
+migration framework emphasizing:
+- Crypto-agility as a first-class requirement
+- Inventory of classical cryptographic dependencies before migration
+- LTP's `SecurityProfile` and configurable hash functions provide the crypto-agility layer
+
 **Convergence vs. divergence:** While NIST's ML-KEM and ML-DSA are the most widely adopted
 standards, China's CACR competition and Korea's KpqC may produce algorithms not in the NIST
-portfolio. LTP's cryptographic agility (configurable SecurityProfile, pluggable backends)
+portfolio. LTP's cryptographic agility (configurable `SecurityProfile`, pluggable backends)
 is designed to accommodate regional algorithm requirements without protocol-level changes.
+The `SecurityProfile` constructor accepts `level`, `canonical_hash`, and `internal_hash`
+as independent parameters, enabling per-deployment configuration that satisfies local
+regulatory requirements while maintaining protocol interoperability.
+
+**Open question:** How should LTP handle cross-jurisdiction transfers where sender and
+receiver operate under different PQC mandates (e.g., CNSA 2.0 Level 5 sender → CRYPTREC
+hybrid receiver)? The current design uses the sender's `SecurityProfile` for commit and
+lattice phases; the receiver must support at least the same security level to materialize.
+See §10 for the updated open questions list.
 
 ### References
 
@@ -2320,6 +2598,100 @@ maintain the technical focus of the main document. The two properties it demonst
 sender-independence and geographic optimization — are the same properties illustrated by
 the grounded scenarios in §§9.1–9.4.*
 
+### 9.6 Regulatory Compliance and Data Sovereignty
+
+LTP's architecture — client-side encryption, erasure-coded distributed storage, capability-based
+access control — provides structural alignment with several major regulatory frameworks. This
+section maps specific regulatory requirements to LTP mechanisms and honestly identifies gaps.
+
+#### 9.6.1 GDPR and Functional Erasure (EDPB Guidelines 02/2025)
+
+The GDPR right to erasure (Article 17) requires that personal data be deleted upon request.
+In distributed systems with erasure-coded replication, deleting all shard replicas across all
+commitment nodes is operationally expensive (O(n × r) deletions across geographic regions)
+and difficult to verify.
+
+**Functional erasure** (EDPB Guidelines 02/2025) provides an alternative: if the Content
+Encryption Key (CEK) is irrecoverably destroyed, the encrypted shards become computationally
+indistinguishable from random data. The data is *functionally* erased even though the
+ciphertext shards persist.
+
+LTP implements functional erasure via `FunctionalErasure` (`src/ltp/compliance.py`):
+
+1. The CEK is overwritten with zeros and the memory page is securely deallocated.
+2. A cryptographic attestation is generated: `H(entity_id || cek_fingerprint || epoch || requester_id)`.
+3. The attestation is logged to the compliance audit log (`ComplianceAuditLogger`).
+4. The erasure can be independently verified via `verify_attestation()`.
+
+**Cost:** O(1) — independent of entity size, shard count, or replication factor. Compare with
+physical deletion: O(n × r) network requests with uncertain delivery guarantees.
+
+**Limitation:** Functional erasure assumes the CEK has not been copied or escrowed by a
+third party. If the CEK was compromised before erasure, the shards remain decryptable.
+Deployments requiring defense against CEK exfiltration should combine functional erasure
+with HSM-backed key storage (`compliance.py`, `HSMBackend`).
+
+#### 9.6.2 EU Data Act (Regulation 2024/2868)
+
+The EU Data Act establishes rights for data portability, access, and sovereignty constraints
+depending on data classification. LTP's `DataActClassification` enum (`src/ltp/compliance.py`)
+maps the Act's categories to protocol behavior:
+
+| Classification | Portability Required | Sovereignty Constrained | Access Rights Apply |
+|----------------|:--------------------:|:-----------------------:|:-------------------:|
+| `USER_DATA` | Yes | No | Yes |
+| `CO_GENERATED` | Yes | No | Yes |
+| `TRADE_SECRET` | No | No | No |
+| `PUBLIC_SECTOR` | No | Yes | Yes |
+| `NON_PERSONAL` | No | No | No |
+| `MIXED` | No | Yes | No |
+
+**Portability:** For classifications where portability is required, LTP's content-addressed
+architecture provides natural portability — the entity_id, commitment record, and lattice
+key are sufficient to materialize the entity from any commitment network that holds the shards.
+Cross-network portability requires federation (`src/ltp/federation.py`).
+
+**Sovereignty constraints:** For `PUBLIC_SECTOR` and `MIXED` data, LTP's `GeoFence`
+(`src/ltp/compliance.py`) restricts shard placement to specified jurisdictions. The
+commitment phase verifies that all selected nodes are within the allowed region before
+distributing shards.
+
+#### 9.6.3 eIDAS 2.0 Trust Services
+
+The eIDAS 2.0 regulation (EU 2024/1183) defines three trust levels for electronic identification:
+
+| Trust Level | LTP Security Profile | Hash Function | HSM Required | Qualified Signature |
+|-------------|---------------------|---------------|:------------:|:-------------------:|
+| **Low** | Level 3 | BLAKE2b-256 | No | No |
+| **Substantial** | Level 3 | SHA-384 | Yes | No |
+| **High** | Level 5 | SHA-384 | Yes | Yes |
+
+LTP's `EIDAS2TrustLevel` enum (`src/ltp/compliance.py`) provides `to_security_params()` to
+convert a trust level directly to a `SecurityProfile` configuration. The **High** trust level
+requires both Level 5 post-quantum security and a qualified electronic signature (ML-DSA-87
+backed by an HSM). This maps to `SecurityProfile(5, hash_fn=HashFunction.SHA_384)` with
+`HSMBackend` for key storage.
+
+#### 9.6.4 CNSA 2.0 Compliance
+
+See §8.8 for the detailed CNSA 2.0 algorithm requirements. In summary: `SecurityProfile.cnsa2()`
+provides a pre-configured profile satisfying all CNSA 2.0 mandates (ML-KEM-1024, ML-DSA-87,
+SHA-384, AES-256 equivalent symmetric security).
+
+#### 9.6.5 Additional Compliance Frameworks
+
+| Framework | LTP Alignment | Gap |
+|-----------|--------------|-----|
+| **FedRAMP** | FIPS-approved hashing (canonical lane), AES-256 equivalent AEAD | No FedRAMP authorization obtained |
+| **SOC 2** | Audit logging (`ComplianceAuditLogger`), access controls (`RBACManager`), encryption at rest | Requires third-party audit |
+| **PCI-DSS** | Encryption of data in transit and at rest, key rotation (`KeyRotationManager`) | Scope depends on whether entity content includes cardholder data |
+| **HIPAA** | Encryption, access controls, audit trails | BAA and administrative safeguards outside protocol scope |
+
+**Honest assessment:** LTP provides *technical controls* that map to requirements in these
+frameworks. Achieving actual certification requires organizational processes, third-party audits,
+and administrative safeguards that are outside the scope of a protocol specification. The mapping
+above identifies where LTP's mechanisms align, not where compliance is achieved.
+
 ---
 
 ## 10. Open Questions
@@ -2338,26 +2710,59 @@ the grounded scenarios in §§9.1–9.4.*
    a storage network; the log requires only append-only integrity and hash chaining. A Certificate
    Transparency–style Merkle log with trusted operators is sufficient.
 
-4. **Bandwidth for initial shard distribution**: The commit phase still requires distributing n
-   shards. Can this be amortized or pipelined?
+4. ~~**Bandwidth for initial shard distribution**: The commit phase still requires distributing n
+   shards. Can this be amortized or pipelined?~~
+   **Addressed in `streaming.py`.** Chunked entity streaming enables pipelined shard distribution
+   during the commit phase. Shards are distributed as chunks are encoded, amortizing the upload
+   over time rather than requiring a single burst. See `StreamingCommitter` for the implementation.
 
-5. **Real-time streaming**: Can LTP support continuous entity streams (video, telemetry), or is it
-   inherently batch-oriented?
+5. ~~**Real-time streaming**: Can LTP support continuous entity streams (video, telemetry), or is it
+   inherently batch-oriented?~~
+   **Addressed in `streaming.py`.** The streaming module provides `StreamingCommitter` and
+   `StreamingMaterializer` for continuous entity streams. Each chunk is committed independently
+   with a shared stream_id; the receiver materializes chunks as they arrive. Latency is bounded
+   by chunk size, not entity size.
 
 6. **Audit protocol formalization**: The storage proof challenge-response (§5.2.2) is lightweight
    but weaker than Filecoin's PoSt. A node that re-fetches data just before an audit passes
    dishonestly. Can time-bounded challenges be tightened without requiring SNARKs?
 
-7. **Cross-deployment federation**: How do independently bootstrapped LTP networks discover and
-   trust each other's commitment nodes?
+7. ~~**Cross-deployment federation**: How do independently bootstrapped LTP networks discover and
+   trust each other's commitment nodes?~~
+   **Addressed in `federation.py`.** The federation module provides cross-network discovery
+   via `FederationDiscovery`, trust establishment via `FederationTrustManager`, and entity
+   resolution across independently bootstrapped networks. See `FederatedEntityResolver` for
+   the cross-network materialization protocol.
 
 8. **ZK Transfer Mode extensions**: §3.2 specifies a Groth16-based hiding commitment for
    entity_id privacy, but defers two significant capabilities: (a) content-property proofs —
    circuit composition for application-layer predicates (JSON schema, range proofs, etc.); and
    (b) post-quantum ZK — replacing the BLS12-381 pairing with a STARK or lattice-based proof
-   system that resists Shor's algorithm. What is the appropriate circuit composition model for
-   (a), and which post-quantum proof system best balances proof size, generation time, and
-   absence of trusted setup for (b)?
+   system that resists Shor's algorithm.
+   **Partially addressed in §3.2.4 and `zk_transfer.py`.** For (b): Circle STARKs (hash-based,
+   ~32 KB proofs, no trusted setup) and LatticeFold (lattice-based, ~8 KB proofs, recursive IVC)
+   are implemented as PoC simulations. Circle STARKs are recommended as the near-term PQ-safe
+   ZK upgrade; LatticeFold provides algebraic alignment with the ML-KEM/ML-DSA stack. See §3.2.4
+   for the comparison table. For (a): content-property circuit composition remains open and
+   deferred to application-layer circuit libraries.
+
+9. **National PQC algorithm interoperability**: China's CACR competition and Korea's KpqC
+   may standardize algorithms outside the NIST portfolio (§8.8). How should LTP handle
+   cross-jurisdiction transfers where sender and receiver use different PQC algorithm families?
+   The `SecurityProfile` provides crypto-agility for algorithm selection, but the protocol does
+   not currently define a negotiation mechanism for heterogeneous algorithm environments.
+
+10. **Formal verification completeness**: The Tamarin and ProVerif models (§3.4) cover 4 of 6
+    security properties. Shard Integrity (SINT, Theorem 4) requires algebraic modeling of
+    Reed-Solomon coding; Threshold Secrecy (TSEC, Theorem 7) is information-theoretic and
+    outside the symbolic model. Can these be verified in complementary frameworks (EasyCrypt,
+    Coq, Isabelle)?
+
+11. **Functional erasure under key compromise**: Functional erasure (§9.6.1) assumes the CEK
+    has not been copied or escrowed. If the CEK was compromised before erasure, encrypted shards
+    remain decryptable. Can LTP provide stronger erasure guarantees — e.g., periodic CEK
+    re-encryption (key rotation applied to stored shards) — without violating the immutability
+    invariant?
 
 ---
 

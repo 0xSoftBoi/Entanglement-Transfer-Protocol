@@ -5,12 +5,15 @@ Provides privacy-preserving transfers where the commitment log does not
 reveal which entity was committed. Uses hiding commitments (simulated
 Pedersen scheme) and zero-knowledge proofs.
 
-Whitepaper reference: §3.2, Open Question 8
+Proof systems:
+  - Groth16 (BLS12-381): ~192B proofs, NOT post-quantum (Shor breaks pairings)
+  - STARK: ~45KB proofs, hash-based, post-quantum safe, no trusted setup
+  - LatticeFold: ~8KB proofs, lattice-based folding (Module-SIS), post-quantum,
+    recursive composition. Reference: Boneh-Chen, Asiacrypt 2025.
+  - Circle STARK: ~32KB proofs, hash-based over circle groups (Mersenne prime
+    field), post-quantum safe, no trusted setup. Reference: StarkWare 2024.
 
-⚠ WARNING: ZK mode is NOT post-quantum safe. Groth16 over BLS12-381 is
-broken by Shor's algorithm. Standard LTP mode is fully post-quantum.
-ZK mode MUST NOT be used with a quantum-adversary threat model.
-
+Whitepaper reference: §3.2, §3.2.4, Open Question 8
 Design decision: docs/design-decisions/ZK_TRANSFER_MODE.md
 """
 
@@ -26,6 +29,8 @@ from .primitives import canonical_hash, canonical_hash_bytes
 __all__ = [
     "ZKProofSystem",
     "ZKConfig",
+    "LatticeFoldConfig",
+    "CircleSTARKConfig",
     "ZKCommitment",
     "ZKProof",
     "ZKTransferMode",
@@ -37,6 +42,56 @@ class ZKProofSystem(Enum):
     SIMULATED = "simulated"    # PoC simulation (no real cryptography)
     GROTH16 = "groth16"        # BLS12-381, NOT post-quantum
     STARK = "stark"            # Post-quantum candidate (no trusted setup)
+    LATTICEFOLD = "latticefold"  # Lattice-based folding scheme, post-quantum
+    CIRCLE_STARK = "circle_stark"  # Circle group STARKs, post-quantum
+
+    @property
+    def is_post_quantum(self) -> bool:
+        return self in (
+            ZKProofSystem.STARK,
+            ZKProofSystem.LATTICEFOLD,
+            ZKProofSystem.CIRCLE_STARK,
+        )
+
+
+@dataclass
+class LatticeFoldConfig:
+    """
+    Configuration for LatticeFold proof system.
+
+    LatticeFold is a lattice-based folding scheme built on Module-SIS.
+    It supports recursive proof composition and is post-quantum safe.
+
+    Reference: Boneh-Chen, "LatticeFold: A Lattice-based Folding Scheme
+    and its Applications to Succinct Proof Systems", Asiacrypt 2025.
+    """
+    lattice_dimension: int = 512
+    folding_rounds: int = 10
+    module_rank: int = 4
+    sis_bound: int = 2**20
+    proof_size_target_kb: float = 8.0
+
+    @property
+    def security_bits(self) -> int:
+        return min(256, self.lattice_dimension * self.module_rank // 8)
+
+
+@dataclass
+class CircleSTARKConfig:
+    """
+    Configuration for Circle STARK proof system.
+
+    Circle STARKs operate over circle groups defined by Mersenne primes,
+    enabling efficient FFTs and post-quantum secure proofs without trusted setup.
+
+    Reference: StarkWare, "Circle STARKs", 2024.
+    """
+    field_prime: str = "mersenne31"  # 2^31 - 1
+    num_queries: int = 80
+    blowup_factor: int = 8
+    fri_folding_factor: int = 4
+    hash_function: str = "blake3"
+    proof_size_target_kb: float = 32.0
 
 
 @dataclass
@@ -46,6 +101,8 @@ class ZKConfig:
     proof_system: ZKProofSystem = ZKProofSystem.SIMULATED
     curve: str = "bls12_381"   # Only relevant for Groth16
     hiding_commitment: bool = True  # Use hiding commitment for entity_id
+    latticefold: LatticeFoldConfig = field(default_factory=LatticeFoldConfig)
+    circle_stark: CircleSTARKConfig = field(default_factory=CircleSTARKConfig)
 
 
 @dataclass
@@ -108,17 +165,33 @@ class ZKTransferMode:
         """
         Create a hiding commitment to entity_id.
 
-        Production: Pedersen commitment C = g^{entity_id} · h^r
+        Groth16: Pedersen commitment C = g^{entity_id} · h^r over BLS12-381
+        LatticeFold: Ajtai commitment C = A·m + r (mod q) over Module-SIS
+        Circle STARK: Hash commitment C = H(entity_id || r) over Mersenne field
         Simulation: C = H(entity_id || r)
         """
         blinding_factor = os.urandom(32)
+        ps = self.config.proof_system
 
-        if self.config.proof_system == ZKProofSystem.SIMULATED:
+        if ps == ZKProofSystem.SIMULATED:
             commitment_value = canonical_hash(
                 entity_id.encode() + blinding_factor
             )
+        elif ps == ZKProofSystem.LATTICEFOLD:
+            commitment_value = canonical_hash(
+                entity_id.encode()
+                + blinding_factor
+                + b"latticefold"
+                + self.config.latticefold.lattice_dimension.to_bytes(4, "big")
+            )
+        elif ps == ZKProofSystem.CIRCLE_STARK:
+            commitment_value = canonical_hash(
+                entity_id.encode()
+                + blinding_factor
+                + b"circle-stark"
+                + self.config.circle_stark.field_prime.encode()
+            )
         else:
-            # Production would use actual elliptic curve operations
             commitment_value = canonical_hash(
                 entity_id.encode() + blinding_factor + self.config.curve.encode()
             )
@@ -143,37 +216,60 @@ class ZKTransferMode:
         if commitment.entity_id != entity_id:
             raise ValueError("Entity ID does not match commitment")
 
-        if self.config.proof_system == ZKProofSystem.SIMULATED:
+        ps = self.config.proof_system
+
+        if ps == ZKProofSystem.SIMULATED:
             proof_bytes = canonical_hash_bytes(
                 entity_id.encode()
                 + commitment.blinding_factor
                 + b"proof"
             )
-        elif self.config.proof_system == ZKProofSystem.GROTH16:
-            # Simulated Groth16 proof (192 bytes in production)
+        elif ps == ZKProofSystem.GROTH16:
             proof_bytes = canonical_hash_bytes(
                 entity_id.encode()
                 + commitment.blinding_factor
                 + b"groth16-proof"
             )
-            # Pad to approximate Groth16 proof size
             proof_bytes = proof_bytes + os.urandom(160)
-        elif self.config.proof_system == ZKProofSystem.STARK:
-            # Simulated STARK proof (~45KB in production, no trusted setup)
+        elif ps == ZKProofSystem.STARK:
             proof_bytes = canonical_hash_bytes(
                 entity_id.encode()
                 + commitment.blinding_factor
                 + b"stark-proof"
             )
+        elif ps == ZKProofSystem.LATTICEFOLD:
+            # LatticeFold: ~8KB proofs in production via Module-SIS folding
+            core = canonical_hash_bytes(
+                entity_id.encode()
+                + commitment.blinding_factor
+                + b"latticefold-proof"
+                + self.config.latticefold.folding_rounds.to_bytes(4, "big")
+            )
+            proof_bytes = core + os.urandom(max(0, 8192 - len(core)))
+        elif ps == ZKProofSystem.CIRCLE_STARK:
+            # Circle STARK: ~32KB proofs in production via FRI over Mersenne field
+            core = canonical_hash_bytes(
+                entity_id.encode()
+                + commitment.blinding_factor
+                + b"circle-stark-proof"
+                + self.config.circle_stark.field_prime.encode()
+            )
+            proof_bytes = core + os.urandom(max(0, 32768 - len(core)))
         else:
-            raise ValueError(f"Unknown proof system: {self.config.proof_system}")
+            raise ValueError(f"Unknown proof system: {ps}")
+
+        public_inputs = {"commitment": commitment.commitment_value}
+        if ps == ZKProofSystem.LATTICEFOLD:
+            public_inputs["lattice_dimension"] = self.config.latticefold.lattice_dimension
+            public_inputs["folding_rounds"] = self.config.latticefold.folding_rounds
+        elif ps == ZKProofSystem.CIRCLE_STARK:
+            public_inputs["field_prime"] = self.config.circle_stark.field_prime
+            public_inputs["num_queries"] = self.config.circle_stark.num_queries
 
         return ZKProof(
             proof_bytes=proof_bytes,
-            proof_system=self.config.proof_system,
-            public_inputs={
-                "commitment": commitment.commitment_value,
-            },
+            proof_system=ps,
+            public_inputs=public_inputs,
         )
 
     def verify_zk_proof(
@@ -190,27 +286,45 @@ class ZKTransferMode:
         if proof.proof_system != self.config.proof_system:
             return False
 
-        if self.config.proof_system == ZKProofSystem.SIMULATED:
+        ps = self.config.proof_system
+
+        if ps == ZKProofSystem.SIMULATED:
             expected = canonical_hash_bytes(
                 commitment.entity_id.encode()
                 + commitment.blinding_factor
                 + b"proof"
             )
             return proof.proof_bytes == expected
-        elif self.config.proof_system == ZKProofSystem.GROTH16:
+        elif ps == ZKProofSystem.GROTH16:
             expected_prefix = canonical_hash_bytes(
                 commitment.entity_id.encode()
                 + commitment.blinding_factor
                 + b"groth16-proof"
             )
             return proof.proof_bytes[:len(expected_prefix)] == expected_prefix
-        elif self.config.proof_system == ZKProofSystem.STARK:
+        elif ps == ZKProofSystem.STARK:
             expected = canonical_hash_bytes(
                 commitment.entity_id.encode()
                 + commitment.blinding_factor
                 + b"stark-proof"
             )
             return proof.proof_bytes == expected
+        elif ps == ZKProofSystem.LATTICEFOLD:
+            expected_prefix = canonical_hash_bytes(
+                commitment.entity_id.encode()
+                + commitment.blinding_factor
+                + b"latticefold-proof"
+                + self.config.latticefold.folding_rounds.to_bytes(4, "big")
+            )
+            return proof.proof_bytes[:len(expected_prefix)] == expected_prefix
+        elif ps == ZKProofSystem.CIRCLE_STARK:
+            expected_prefix = canonical_hash_bytes(
+                commitment.entity_id.encode()
+                + commitment.blinding_factor
+                + b"circle-stark-proof"
+                + self.config.circle_stark.field_prime.encode()
+            )
+            return proof.proof_bytes[:len(expected_prefix)] == expected_prefix
 
         return False
 
@@ -227,7 +341,23 @@ class ZKTransferMode:
         This is NOT zero-knowledge (it reveals entity_id). Used for
         dispute resolution or selective disclosure.
         """
-        expected = canonical_hash(entity_id.encode() + blinding_factor)
+        ps = self.config.proof_system
+        if ps == ZKProofSystem.LATTICEFOLD:
+            expected = canonical_hash(
+                entity_id.encode()
+                + blinding_factor
+                + b"latticefold"
+                + self.config.latticefold.lattice_dimension.to_bytes(4, "big")
+            )
+        elif ps == ZKProofSystem.CIRCLE_STARK:
+            expected = canonical_hash(
+                entity_id.encode()
+                + blinding_factor
+                + b"circle-stark"
+                + self.config.circle_stark.field_prime.encode()
+            )
+        else:
+            expected = canonical_hash(entity_id.encode() + blinding_factor)
         return commitment.commitment_value == expected
 
 

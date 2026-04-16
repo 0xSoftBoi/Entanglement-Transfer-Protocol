@@ -113,7 +113,12 @@ from .compliance import (
     SoftwareHSM as ComplianceSoftwareHSM,
     ComplianceConfig,
     ComplianceFramework,
+    FunctionalErasure,
+    EIDAS2TrustLevel,
+    DataActClassification,
 )
+from .benchmarks import BenchmarkResult, CryptoBenchmark
+from .verification import VerificationProperty, TamarinModel, ProVerifModel
 from .hsm import HSMBackend, SoftwareHSM
 
 # GSX Pre-Blockchain Trust Packaging Layer
@@ -256,8 +261,18 @@ __all__ = [
     "ComplianceSoftwareHSM",
     "ComplianceConfig",
     "ComplianceFramework",
+    "FunctionalErasure",
+    "EIDAS2TrustLevel",
+    "DataActClassification",
     "set_crypto_provider",
     "get_crypto_provider",
+    # Benchmarking
+    "BenchmarkResult",
+    "CryptoBenchmark",
+    # Formal verification
+    "VerificationProperty",
+    "TamarinModel",
+    "ProVerifModel",
     # GSX Pre-Blockchain Trust Packaging Layer
     "CanonicalEncoder",
     "DOMAIN_ENTITY_ID", "DOMAIN_COMMIT_SIGN", "DOMAIN_COMMIT_RECORD",
