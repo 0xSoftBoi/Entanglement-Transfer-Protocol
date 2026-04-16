@@ -85,6 +85,7 @@ class LiveBridge:
         dest_chain: str = "optimism",
         policy_hash: bytes = b"\x00" * 32,
         chain_id_int: int = 1,
+        allow_simulated_finality_fallback: bool = False,
     ) -> None:
         self._protocol = protocol
         self._client = anchor_client
@@ -92,6 +93,7 @@ class LiveBridge:
         self._l2_verifier_kp = l2_verifier_keypair
         self._policy_hash = policy_hash
         self._chain_id_int = chain_id_int
+        self._allow_simulated_finality_fallback = allow_simulated_finality_fallback
 
         # Bridge components
         self._l1_anchor = L1Anchor(
@@ -186,8 +188,16 @@ class LiveBridge:
             block_height = self._client._w3.eth.block_number
             self._materializer.set_l1_block_height(block_height)
             logger.info("[LiveBridge] Real block height: %d", block_height)
-        except Exception:
-            # Fallback: use simulated height high enough for finality
+        except Exception as exc:
+            if not self._allow_simulated_finality_fallback:
+                raise RuntimeError(
+                    "LiveBridge could not query real block height from the anchor client. "
+                    "Live mode must fail closed instead of falling back to simulated finality."
+                ) from exc
+            logger.warning(
+                "[LiveBridge] Falling back to simulated finality height; "
+                "this is development-only and should not be used as live-chain verification."
+            )
             self._materializer.set_l1_block_height(1000)
             block_height = 1000
 

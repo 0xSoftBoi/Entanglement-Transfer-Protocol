@@ -6,10 +6,13 @@ identical accept/reject behavior for anchoring, state transitions,
 sequence tracking, and signer authorization.
 
 Requires:
+  - RUN_CONTRACT_INTEGRATION=1
   - anvil running on localhost:8545 (Foundry local EVM)
+  - forge installed and available on PATH
   - web3 installed: pip install web3>=6.0.0
 
 Usage:
+  export RUN_CONTRACT_INTEGRATION=1
   anvil &
   cd contracts && forge script script/Deploy.s.sol --rpc-url http://localhost:8545 --broadcast
   pytest tests/test_contract_integration.py -v
@@ -21,6 +24,7 @@ import json
 import os
 import subprocess
 import time
+import shutil
 
 import pytest
 
@@ -41,9 +45,26 @@ def _anvil_running() -> bool:
     except Exception:
         return False
 
+
+def _has_forge() -> bool:
+    return shutil.which("forge") is not None
+
+
+def _contract_integration_enabled() -> bool:
+    return os.getenv("RUN_CONTRACT_INTEGRATION") == "1"
+
+
 pytestmark = pytest.mark.skipif(
-    not HAS_WEB3 or not _anvil_running(),
-    reason="Requires web3 and anvil running on localhost:8545",
+    (
+        not _contract_integration_enabled()
+        or not HAS_WEB3
+        or not _has_forge()
+        or not _anvil_running()
+    ),
+    reason=(
+        "Requires RUN_CONTRACT_INTEGRATION=1, web3, forge on PATH, "
+        "and anvil running on localhost:8545"
+    ),
 )
 
 # Anvil default deployer private key and address

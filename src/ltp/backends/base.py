@@ -56,7 +56,7 @@ class BackendCapabilities:
 @dataclass
 class BackendConfig:
     """Configuration for instantiating a commitment backend."""
-    backend_type: str = "local"           # "local", "monad-l1", "ethereum"
+    backend_type: str = "local"           # "local", "monad-l1-sim", "ethereum-sim", "ethereum-live"
 
     # --- Network endpoints ---
     rpc_url: Optional[str] = None
@@ -94,6 +94,23 @@ class BackendConfig:
     compliance_enable_audit_log: bool = False  # immutable audit logging
     compliance_enable_gdpr: bool = False   # GDPR deletion capability
     compliance_siem_format: str = "json"   # "json", "cef", "json-ld"
+
+    def has_live_anchor_config(self) -> bool:
+        """Return True when the minimum live Ethereum adapter config is present."""
+        return bool(
+            self.rpc_url and self.contract_address and self.operator_private_key
+        )
+
+    def has_partial_live_anchor_config(self) -> bool:
+        """Return True when any live Ethereum adapter field is present."""
+        return any(
+            value is not None
+            for value in (
+                self.rpc_url,
+                self.contract_address,
+                self.operator_private_key,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------

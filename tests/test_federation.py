@@ -1,5 +1,7 @@
 """Tests for Cross-Deployment Federation (Open Question 7)."""
 
+import struct
+
 import pytest
 
 from src.ltp.federation import (
@@ -10,6 +12,7 @@ from src.ltp.federation import (
     EntityResolution,
     FederationRegistry,
 )
+from src.ltp.primitives import MLDSA
 
 
 # ---------------------------------------------------------------------------
@@ -196,14 +199,24 @@ class TestFederationRegistrySTH:
     def setup_method(self):
         self.reg = FederationRegistry(FederationConfig(enabled=True))
         self.reg.set_local_network_id("local-net")
-        self.reg.register_network("net-1", "N1", "url", b"pk")
+        self.vk, self.sk = MLDSA.keygen()
+        self.reg.register_network("net-1", "N1", "url", self.vk)
 
-    def _make_sth(self, seq=1, root="abc", ts=1000.0, count=10):
+    def _make_sth(self, seq=1, root=None, ts=1000.0, count=10, signing_key=None):
+        root = root or (b"\xab" * 32)
+        payload = (
+            seq.to_bytes(8, "big")
+            + count.to_bytes(8, "big")
+            + struct.pack(">d", ts)
+            + root
+        )
+        signature = MLDSA.sign(signing_key or self.sk, payload)
         return {
             "sequence": seq,
             "root_hash": root,
             "timestamp": ts,
             "record_count": count,
+            "signature": signature,
         }
 
     def test_verify_sth_success(self):
@@ -221,6 +234,12 @@ class TestFederationRegistrySTH:
 
     def test_verify_sth_missing_fields(self):
         bad_sth = {"sequence": 1}
+        assert self.reg.verify_sth("net-1", bad_sth, current_epoch=100) is False
+
+    def test_verify_sth_rejects_invalid_signature(self):
+        other_vk, other_sk = MLDSA.keygen()
+        del other_vk
+        bad_sth = self._make_sth(signing_key=other_sk)
         assert self.reg.verify_sth("net-1", bad_sth, current_epoch=100) is False
 
     def test_verify_sth_monotonicity_sequence(self):

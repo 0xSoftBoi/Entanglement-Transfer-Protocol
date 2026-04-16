@@ -13,6 +13,12 @@ Provides seven layered enforcement mechanisms:
 
 Design decision: docs/design-decisions/ENFORCEMENT_MECHANISMS.md
 Whitepaper reference: §5.2, §5.3, §5.4, §5.5, Open Questions 6 & 8
+
+Runtime note:
+  - The PDP, slashing, dispute, and invariant layers are implemented as Python control logic.
+  - The VDF layer remains simulation-backed in this repo.
+  - Strict assurance modes fail closed on VDF usage, and named non-simulated
+    constructions require explicit experimental opt-in in non-production modes.
 """
 
 from __future__ import annotations
@@ -26,7 +32,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from .primitives import canonical_hash, canonical_hash_bytes, internal_hash_bytes
+from .primitives import (
+    AssuranceMode,
+    canonical_hash,
+    canonical_hash_bytes,
+    get_assurance_mode,
+    internal_hash_bytes,
+)
 
 __all__ = [
     # Storage proofs
@@ -719,8 +731,8 @@ class DisputeRegistry:
 
 class VDFConstruction(Enum):
     """Available VDF constructions."""
-    PIETRZAK = "pietrzak"         # RSA-based, trusted setup, production-ready
-    WESOLOWSKI = "wesolowski"     # RSA-based, trusted setup, production-ready
+    PIETRZAK = "pietrzak"         # Placeholder naming only; not implemented here
+    WESOLOWSKI = "wesolowski"     # Placeholder naming only; not implemented here
     CLASS_GROUP = "class_group"   # Trustless, partial PQ resistance, research
     SIMULATED = "simulated"       # For testing only
 
@@ -732,6 +744,7 @@ class VDFConfig:
     construction: VDFConstruction = VDFConstruction.SIMULATED
     difficulty: int = 1000          # Sequential steps (~50ms target)
     group_bits: int = 2048          # Security parameter
+    allow_experimental_constructions: bool = False
 
 
 @dataclass
@@ -760,11 +773,47 @@ class VDFVerifier:
     Verifies VDF proofs for timing-enhanced audits.
 
     In simulation mode, uses a hash-chain VDF for testing.
-    Production mode would use Pietrzak or Wesolowski constructions.
+    Pietrzak, Wesolowski, and class-group names are currently placeholders
+    only in this repo and do not correspond to real VDF implementations.
     """
 
     def __init__(self, config: VDFConfig) -> None:
         self.config = config
+
+    def get_runtime_status(self) -> dict:
+        """Return the current VDF runtime posture."""
+        return {
+            "enabled": self.config.enabled,
+            "assurance_mode": get_assurance_mode().value,
+            "construction": self.config.construction.value,
+            "simulated_backend": self._construction_is_simulated(),
+            "experimental_opt_in": self.config.allow_experimental_constructions,
+        }
+
+    def _construction_is_simulated(self) -> bool:
+        """All currently exposed VDF constructions are placeholder implementations."""
+        return True
+
+    def _require_supported_runtime(self) -> None:
+        """Fail closed when simulated VDFs could be mistaken for production timing guarantees."""
+        assurance_mode = get_assurance_mode()
+        if assurance_mode in (
+            AssuranceMode.PRODUCTION,
+            AssuranceMode.COMPLIANCE_STRICT,
+        ):
+            raise RuntimeError(
+                "VDF-enhanced audits are unavailable in production assurance modes "
+                "because this repo only implements simulated VDF backends."
+            )
+
+        if (
+            self.config.construction != VDFConstruction.SIMULATED
+            and not self.config.allow_experimental_constructions
+        ):
+            raise RuntimeError(
+                f"{self.config.construction.value} is currently a simulated placeholder. "
+                "Set allow_experimental_constructions=True to use it in non-production modes."
+            )
 
     def generate_challenge(
         self,
@@ -773,6 +822,7 @@ class VDFVerifier:
         epoch: int,
     ) -> VDFChallenge:
         """Generate a VDF-enhanced audit challenge."""
+        self._require_supported_runtime()
         nonce = os.urandom(16)
         input_seed = internal_hash_bytes(
             f"{entity_id}:{shard_index}:{epoch}:vdf".encode() + nonce
@@ -795,6 +845,7 @@ class VDFVerifier:
         In production, this would use repeated squaring in Z/nZ.
         The simulation uses iterated hashing to model sequential work.
         """
+        self._require_supported_runtime()
         t0 = time.monotonic()
 
         # Simulated VDF: iterated hashing (sequential by construction)
@@ -824,6 +875,7 @@ class VDFVerifier:
         The simulation re-computes the hash chain (this would be replaced
         by the efficient Pietrzak/Wesolowski verification).
         """
+        self._require_supported_runtime()
         if result.challenge_id != challenge.challenge_id:
             return False
 

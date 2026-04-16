@@ -3,6 +3,7 @@
 import os
 import pytest
 
+from src.ltp.primitives import AssuranceMode, get_assurance_mode, set_assurance_mode
 from src.ltp.zk_transfer import (
     ZKProofSystem,
     ZKConfig,
@@ -17,6 +18,13 @@ from src.ltp.zk_transfer import (
 def allow_zk_mode(monkeypatch):
     """Set ETP_ALLOW_ZK_MODE=1 for all ZK transfer tests."""
     monkeypatch.setenv("ETP_ALLOW_ZK_MODE", "1")
+
+
+@pytest.fixture(autouse=True)
+def restore_assurance_mode():
+    original = get_assurance_mode()
+    yield
+    set_assurance_mode(original)
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +43,10 @@ class TestZKConfig:
         cfg = ZKConfig(enabled=True, proof_system=ZKProofSystem.GROTH16)
         assert cfg.enabled is True
         assert cfg.proof_system == ZKProofSystem.GROTH16
+
+    def test_experimental_proof_systems_default_off(self):
+        cfg = ZKConfig()
+        assert cfg.allow_experimental_proof_systems is False
 
 
 # ---------------------------------------------------------------------------
@@ -76,8 +88,10 @@ class TestZKProof:
         p = ZKProof(
             proof_bytes=b"\x00" * 64,
             proof_system=ZKProofSystem.SIMULATED,
+            public_inputs={"simulated_backend": True},
         )
         assert p.proof_size_bytes == 64
+        assert p.is_simulated is True
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +120,14 @@ class TestZKTransferModeSimulated:
         proof = self.zk.create_zk_proof("entity-1", c)
         assert isinstance(proof, ZKProof)
         assert proof.proof_system == ZKProofSystem.SIMULATED
+        assert proof.is_simulated is True
         assert self.zk.verify_zk_proof(c, proof)
+
+    def test_runtime_status_reports_simulated_backend(self):
+        status = self.zk.get_runtime_status()
+        assert status["proof_system"] == "simulated"
+        assert status["simulated_backend"] is True
+        assert status["experimental_opt_in"] is False
 
     def test_proof_fails_for_wrong_entity(self):
         c = self.zk.create_hiding_commitment("entity-1")
@@ -151,7 +172,12 @@ class TestZKTransferModeSimulated:
 
 class TestZKTransferModeGroth16:
     def setup_method(self):
-        self.zk = ZKTransferMode(ZKConfig(proof_system=ZKProofSystem.GROTH16))
+        self.zk = ZKTransferMode(
+            ZKConfig(
+                proof_system=ZKProofSystem.GROTH16,
+                allow_experimental_proof_systems=True,
+            )
+        )
 
     def test_create_and_verify_proof(self):
         c = self.zk.create_hiding_commitment("entity-g16")
@@ -159,12 +185,18 @@ class TestZKTransferModeGroth16:
         assert proof.proof_system == ZKProofSystem.GROTH16
         # Groth16 simulated proof is larger (hash + 160 random bytes)
         assert proof.proof_size_bytes > 32
+        assert proof.is_simulated is True
         assert self.zk.verify_zk_proof(c, proof)
 
     def test_commitment_uses_curve(self):
         c = self.zk.create_hiding_commitment("entity-curve")
         # Just ensure commitment is created without error
         assert len(c.commitment_value) > 0
+
+    def test_requires_experimental_opt_in(self):
+        zk = ZKTransferMode(ZKConfig(proof_system=ZKProofSystem.GROTH16))
+        with pytest.raises(RuntimeError, match="simulated placeholder"):
+            zk.create_hiding_commitment("entity-g16")
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +205,24 @@ class TestZKTransferModeGroth16:
 
 class TestZKTransferModeSTARK:
     def setup_method(self):
-        self.zk = ZKTransferMode(ZKConfig(proof_system=ZKProofSystem.STARK))
+        self.zk = ZKTransferMode(
+            ZKConfig(
+                proof_system=ZKProofSystem.STARK,
+                allow_experimental_proof_systems=True,
+            )
+        )
 
     def test_create_and_verify_proof(self):
         c = self.zk.create_hiding_commitment("entity-stark")
         proof = self.zk.create_zk_proof("entity-stark", c)
         assert proof.proof_system == ZKProofSystem.STARK
+        assert proof.is_simulated is True
         assert self.zk.verify_zk_proof(c, proof)
+
+    def test_requires_experimental_opt_in(self):
+        zk = ZKTransferMode(ZKConfig(proof_system=ZKProofSystem.STARK))
+        with pytest.raises(RuntimeError, match="simulated placeholder"):
+            zk.create_hiding_commitment("entity-stark")
 
 
 # ---------------------------------------------------------------------------
@@ -234,3 +277,18 @@ class TestZKTransferModeDefault:
         monkeypatch.delenv("ETP_ALLOW_ZK_MODE", raising=False)
         with pytest.raises(RuntimeError, match="ETP_ALLOW_ZK_MODE"):
             ZKTransferMode()
+
+    def test_production_mode_fails_closed(self):
+        set_assurance_mode(AssuranceMode.PRODUCTION)
+        zk = ZKTransferMode(ZKConfig(enabled=True))
+        with pytest.raises(RuntimeError, match="unavailable in production assurance modes"):
+            zk.create_hiding_commitment("entity-prod")
+
+    def test_compliance_strict_mode_fails_closed(self):
+        try:
+            set_assurance_mode(AssuranceMode.COMPLIANCE_STRICT)
+        except RuntimeError:
+            pytest.skip("Compliance-strict prerequisites unavailable in test environment")
+        zk = ZKTransferMode(ZKConfig(enabled=True))
+        with pytest.raises(RuntimeError, match="unavailable in production assurance modes"):
+            zk.create_hiding_commitment("entity-strict")

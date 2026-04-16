@@ -204,7 +204,7 @@ class LTPProtocol:
             timestamp=timestamp,
         )
 
-        record.sign(sender_keypair.sk)
+        record.sign_with_keypair(sender_keypair)
         sig_size = len(record.signature)
 
         commitment_ref = self.network.log.append(record)

@@ -52,6 +52,9 @@ class KeyPair:
     created_at: float = 0.0        # Unix timestamp of generation
     expires_at: float = 0.0        # Unix timestamp of expiry (0 = never)
     predecessor_vk_hash: str = ""  # H(previous vk) for key chain verification
+    _hsm: object | None = field(default=None, repr=False, compare=False)
+    _hsm_kem_key_id: str = field(default="", repr=False, compare=False)
+    _hsm_dsa_key_id: str = field(default="", repr=False, compare=False)
 
     @classmethod
     def generate(cls, label: str = "", hsm=None) -> 'KeyPair':
@@ -65,15 +68,19 @@ class KeyPair:
         """
         if hsm is not None:
             result = hsm.generate_keypair(label)
-            # HSM returns combined public material; we need split keys
-            # The HSM stores private keys internally — these are proxies
-            key_id = result["key_id"]
-            # For HSM-backed keys, generate normal keys but tag with HSM ID
-            ek, dk = MLKEM.keygen()
-            vk, sk = MLDSA.keygen()
-            kp = cls(ek=ek, dk=dk, vk=vk, sk=sk, label=f"{label}[hsm:{key_id}]")
+            # HSM-backed keys expose public material only. Private key operations
+            # must stay routed through the HSM interface.
+            kp = cls(
+                ek=result["ek"],
+                dk=b"",
+                vk=result["vk"],
+                sk=b"",
+                label=label,
+                created_at=_time.time(),
+            )
             kp._hsm = hsm
-            kp._hsm_key_id = key_id
+            kp._hsm_kem_key_id = result["kem_key_id"]
+            kp._hsm_dsa_key_id = result["dsa_key_id"]
             return kp
         ek, dk = MLKEM.keygen()
         vk, sk = MLDSA.keygen()
@@ -89,6 +96,31 @@ class KeyPair:
     def public_key(self) -> bytes:
         """ML-KEM encapsulation key (for sealing to this recipient)."""
         return self.ek
+
+    @property
+    def is_hsm_backed(self) -> bool:
+        """True if private-key operations are delegated to an HSM."""
+        return self._hsm is not None
+
+    def sign(self, message: bytes) -> bytes:
+        """Sign with either local private material or the configured HSM."""
+        if self._hsm is not None:
+            if not self._hsm_dsa_key_id:
+                raise ValueError("HSM-backed keypair is missing DSA key handle")
+            return self._hsm.sign(self._hsm_dsa_key_id, message)
+        if not self.sk:
+            raise ValueError("Signing key material is unavailable")
+        return MLDSA.sign(self.sk, message)
+
+    def decapsulate(self, kem_ciphertext: bytes) -> bytes:
+        """Decapsulate with either local private material or the configured HSM."""
+        if self._hsm is not None:
+            if not self._hsm_kem_key_id:
+                raise ValueError("HSM-backed keypair is missing KEM key handle")
+            return self._hsm.kem_decaps(self._hsm_kem_key_id, kem_ciphertext)
+        if not self.dk:
+            raise ValueError("Decapsulation key material is unavailable")
+        return MLKEM.decaps(self.dk, kem_ciphertext)
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +335,7 @@ class SealedBox:
         aead_ct = sealed_data[MLKEM.CT_SIZE + AEAD.NONCE_SIZE:]
 
         try:
-            shared_secret = MLKEM.decaps(receiver_keypair.dk, kem_ct)
+            shared_secret = receiver_keypair.decapsulate(kem_ct)
         except ValueError:
             raise ValueError(
                 "Cannot unseal — ML-KEM decapsulation failed "

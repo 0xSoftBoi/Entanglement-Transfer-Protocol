@@ -33,11 +33,13 @@ Run demo:
 """
 
 from .primitives import (
+    AssuranceMode,
     H, H_bytes, AEAD, MLKEM, MLDSA,
     SecurityProfile, HashFunction, CryptoLane,
     canonical_hash, canonical_hash_bytes,
     internal_hash, internal_hash_bytes,
     get_security_profile, set_security_profile,
+    get_assurance_mode, set_assurance_mode, get_runtime_assurance_status,
     set_crypto_provider, get_crypto_provider,
     set_compliance_strict, get_compliance_strict,
 )
@@ -152,11 +154,15 @@ def reset_poc_state() -> None:
 
 __all__ = [
     # Security profiles
+    "AssuranceMode",
     "SecurityProfile",
     "HashFunction",
     "CryptoLane",
     "get_security_profile",
     "set_security_profile",
+    "get_assurance_mode",
+    "set_assurance_mode",
+    "get_runtime_assurance_status",
     # Dual-lane hash API
     "canonical_hash",
     "canonical_hash_bytes",

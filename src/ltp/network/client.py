@@ -9,12 +9,23 @@ from typing import Optional
 
 import grpc
 
+from ..primitives import AssuranceMode, get_assurance_mode
 from . import shard_service_pb2 as pb2
 from . import shard_service_pb2_grpc as pb2_grpc
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["NodeClient"]
+
+
+def _require_nonproduction_insecure_transport(surface: str) -> None:
+    """Block insecure transport in production-oriented assurance modes."""
+    mode = get_assurance_mode()
+    if mode in (AssuranceMode.PRODUCTION, AssuranceMode.COMPLIANCE_STRICT):
+        raise RuntimeError(
+            f"{surface} uses insecure transport and is development-only in assurance mode "
+            f"'{mode.value}'. Secure transport is not implemented yet."
+        )
 
 
 class NodeClient:
@@ -28,6 +39,7 @@ class NodeClient:
     """
 
     def __init__(self, address: str, timeout: float = 10.0) -> None:
+        _require_nonproduction_insecure_transport("NodeClient")
         self._address = address
         self._timeout = timeout
         self._channel = grpc.insecure_channel(address)

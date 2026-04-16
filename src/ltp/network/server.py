@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Iterator
 
 import grpc
 
+from ..primitives import AssuranceMode, get_assurance_mode
 from . import shard_service_pb2 as pb2
 from . import shard_service_pb2_grpc as pb2_grpc
 
@@ -21,6 +22,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = ["NodeServer"]
+
+
+def _require_nonproduction_insecure_transport(surface: str) -> None:
+    """Block insecure transport in production-oriented assurance modes."""
+    mode = get_assurance_mode()
+    if mode in (AssuranceMode.PRODUCTION, AssuranceMode.COMPLIANCE_STRICT):
+        raise RuntimeError(
+            f"{surface} uses insecure transport and is development-only in assurance mode "
+            f"'{mode.value}'. Secure transport is not implemented yet."
+        )
 
 
 class _ShardServicer(pb2_grpc.ShardServiceServicer):
@@ -102,6 +113,7 @@ class NodeServer:
         host: str = "0.0.0.0",
         max_workers: int = 10,
     ) -> None:
+        _require_nonproduction_insecure_transport("NodeServer")
         self._node = node
         self._port = port
         self._host = host
@@ -109,20 +121,31 @@ class NodeServer:
         pb2_grpc.add_ShardServiceServicer_to_server(
             _ShardServicer(node), self._server,
         )
-        self._server.add_insecure_port(f"{host}:{port}")
+        self._bound_port = self._server.add_insecure_port(f"{host}:{port}")
+        if self._bound_port == 0:
+            raise RuntimeError(f"NodeServer failed to bind {host}:{port}")
 
     @property
     def node(self) -> "CommitmentNode":
         return self._node
 
     @property
+    def port(self) -> int:
+        return self._bound_port
+
+    @property
     def address(self) -> str:
-        return f"{self._host}:{self._port}"
+        return f"{self._host}:{self._bound_port}"
 
     def start(self) -> None:
         """Start serving (non-blocking)."""
         self._server.start()
-        logger.info("NodeServer %s listening on %s:%d", self._node.node_id, self._host, self._port)
+        logger.info(
+            "NodeServer %s listening on %s:%d",
+            self._node.node_id,
+            self._host,
+            self._bound_port,
+        )
 
     def stop(self, grace: float = 1.0) -> None:
         """Stop the server."""

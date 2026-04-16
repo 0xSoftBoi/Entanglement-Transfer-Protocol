@@ -6,7 +6,7 @@
 
 > *"Don't move the data. Transfer the proof. Reconstruct the truth."*
 
-[![Tests](https://img.shields.io/badge/tests-1,251+_passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-unit%20%2B%20integration-blue)]()
 [![Python](https://img.shields.io/badge/python-3.10+-blue)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 [![Version](https://img.shields.io/badge/version-3.0.0-orange)]()
@@ -67,10 +67,27 @@ The entity is never serialized and shipped as a monolithic payload. It is
 
 | Pillar | Implementation | Status |
 |--------|---------------|--------|
-| **Post-Quantum Cryptography** | ML-KEM-768 (FIPS 203) + ML-DSA-65 (FIPS 204) + XChaCha20-Poly1305 | Active — real crypto, no simulations |
+| **Post-Quantum Cryptography** | ML-KEM-768 (FIPS 203) + ML-DSA-65 (FIPS 204) + XChaCha20-Poly1305 | Assurance-mode gated; PoC defaults remain simulation-backed unless real backends are installed |
 | **Lattice Transfer Protocol** | 3-phase lifecycle with Shamir sharing, Merkle audit log, threshold reconstruction | Complete |
 | **Dual-Lane Hashing** | SHA3-256 (canonical/on-chain) + BLAKE3-256 (internal/performance) | Enforced separation |
-| **On-Chain Settlement** | LTPAnchorRegistry v5 with UUPS proxy + MultiSig + Timelock governance | Deployed on GSX Testnet |
+| **On-Chain Settlement** | LTPAnchorRegistry v5 with UUPS proxy + MultiSig + Timelock governance | Contracts and deployment scripts present; live verification remains environment-dependent |
+
+## Implementation Reality
+
+This repo is a strong protocol/security PoC, but it is not a uniformly production-ready stack.
+
+Current reality by area:
+
+| Area | Runtime truth |
+|------|---------------|
+| Core protocol path | Implemented and exercised by the most stable unit tests |
+| PQ crypto | Fail-closed assurance modes exist, but default development mode still permits simulation-backed primitives when real backends are absent |
+| HSM integration | HSM-backed keypairs now avoid local private-key material, but enforcement depends on the chosen HSM backend |
+| Network transport | Current gRPC/REST transports are development-only and are blocked in strict assurance modes |
+| Backends | `local`, `monad-l1-sim`, and `ethereum-sim` are simulated; `ethereum-live` is an explicit live adapter path |
+| ZK transfer mode | Experimental only; all current proof-system labels are placeholder/simulated implementations and are disabled in strict assurance modes |
+| Compliance | Control modeling is richer than runtime enforcement; strict enforcement is gated separately |
+| Contract / live-chain integration | Present in repo, but not a self-contained proof of production deployment or end-to-end operational readiness |
 
 ## What's Implemented
 
@@ -82,14 +99,14 @@ The entity is never serialized and shipped as a monolithic payload. It is
 | ML-KEM-768 sealed envelope | Done | `keypair.py` |
 | ML-DSA-65 commitment signatures | Done | `primitives.py` |
 | Append-only Merkle commitment log | Done | `commitment.py` |
-| Pluggable backends (Local, Monad L1, Ethereum L2) | Done | `backends/` |
+| Pluggable backends (Local, Monad simulation, Ethereum simulation/live adapter) | Done | `backends/` |
 | Cross-chain bridge (L1Anchor, Relayer, L2Materializer) | Done | `bridge/` |
 | Cross-deployment federation | Done | `federation.py` |
 | Chunked streaming with backpressure | Done | `streaming.py` |
-| ZK transfer mode (hiding commitments) | Done | `zk_transfer.py` |
+| ZK transfer mode (hiding commitments) | Experimental / simulated | `zk_transfer.py` |
 | Economics engine (staking, slashing, rewards) | Done | `economics.py` |
 | Enforcement pipeline (PDP, programmable slashing) | Done | `enforcement.py` |
-| Compliance framework (9 control families) | Done | `compliance.py` |
+| Compliance framework (9 control families) | Implemented with modeled vs enforced split | `compliance.py` |
 
 ## Architecture
 
@@ -122,8 +139,8 @@ flowchart TD
     subgraph Backends["Commitment Backends"]
         BF[factory.py]
         BL[local.py]
-        BM[monad_l1.py]
-        BE[ethereum.py]
+        BM[monad_l1.py<br/>simulated]
+        BE[ethereum.py<br/>simulated/live adapter]
     end
 
     subgraph Bridge["Bridge Protocol"]
@@ -149,7 +166,7 @@ flowchart TD
 flowchart BT
     L1["Layer 1: Information-Theoretic Security\nErasure coding (k-of-n threshold)\n< k shards reveal nothing"]
     L2["Layer 2: Cryptographic Integrity\nBLAKE2b content addressing\nMerkle root + ML-DSA-65 signatures"]
-    L3["Layer 3: Zero-Knowledge (Optional)\nPoseidon hiding commitments\nGroth16 proofs (not PQ-safe)"]
+    L3["Layer 3: Zero-Knowledge (Optional / Experimental)\nSimulated hiding commitments\nPlaceholder Groth16/STARK modes"]
     L4["Layer 4: Shard Encryption\nAEAD with random 256-bit CEK\nPer-shard nonce derivation"]
     L5["Layer 5: Sealed Envelope\nML-KEM-768 encapsulation\nForward secrecy per transfer"]
     L6["Layer 6: Access Policy\nOne-time materialization\nTime-bounded, delegatable, revocable"]
@@ -161,7 +178,7 @@ flowchart BT
     L5 --> L6
 ```
 
-## Smart Contracts — GSX Testnet
+## Smart Contracts — GSX Testnet Metadata
 
 Deployed on GSX Testnet (Chain ID `103115120`), block 687609.
 
@@ -174,13 +191,13 @@ Deployed on GSX Testnet (Chain ID `103115120`), block 687609.
 
 **Governance chain:** MultiSig → Timelock → Registry
 
-**Deployment evolution:**
+**Deployment evolution recorded in repo:**
 ```
 v1 (Mar 23)   Implementation only          No proxy, no governance
 v2 (Mar 23)   + UUPS Proxy + MultiSig      Upgradeable, 2-of-2 control
 v3 (Mar 23)   + TimelockController          Time-delayed governance
-v4 (Mar 25)   Verified production deploy    84 Solidity + 1,167 Python tests
-v5 (Mar 25)   Author attribution + v5      Current production
+v4 (Mar 25)   Testnet verification snapshot 84 Solidity + Python test metadata recorded
+v5 (Mar 25)   Author attribution + v5       Current repo contract revision
 ```
 
 ---
@@ -196,12 +213,17 @@ pip install -e ".[dev]"
 # Run the demo
 python run_trust_layer.py
 
-# Run all tests
+# Run Python tests
 pytest tests/ -v
 
 # Run Solidity tests (requires Foundry)
 cd contracts && forge test -vvv
 ```
+
+Notes:
+- Some suites depend on external tooling or live-chain prerequisites.
+- The network transport stack is intentionally blocked in strict assurance modes until secure transport is implemented.
+- ZK transfer paths are experimental and should not be treated as production verification.
 
 ## Project Structure
 
@@ -222,10 +244,10 @@ Entanglement-Transfer-Protocol/
 │   ├── compliance.py           # 9-family compliance framework
 │   ├── federation.py           # Cross-deployment discovery and trust
 │   ├── streaming.py            # Chunked streaming with backpressure
-│   ├── zk_transfer.py          # ZK hiding commitments (Poseidon + Groth16)
+│   ├── zk_transfer.py          # Experimental ZK hiding commitments (simulated placeholders)
 │   ├── hsm.py                  # HSM interface for key management
 │   ├── anchor/                 # On-chain anchoring client
-│   ├── backends/               # Local, MonadL1, Ethereum backends
+│   ├── backends/               # Local, simulated backends, and explicit Ethereum live adapter
 │   ├── bridge/                 # Cross-chain bridge protocol
 │   ├── dual_lane/              # SHA3/BLAKE3 lane separation
 │   ├── merkle_log/             # RFC 6962 Merkle tree + proofs

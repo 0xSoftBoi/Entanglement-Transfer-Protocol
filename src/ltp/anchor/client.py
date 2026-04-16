@@ -256,6 +256,15 @@ class AnchorClient:
                 "Install with: pip install 'ltp[chain]'"
             ) from e
 
+        if not rpc_url:
+            raise ValueError("rpc_url is required for AnchorClient")
+        if not contract_address:
+            raise ValueError("contract_address is required for AnchorClient")
+        if not private_key:
+            raise ValueError("private_key is required for AnchorClient")
+        if chain_id <= 0:
+            raise ValueError("chain_id must be a positive integer")
+
         self._w3 = Web3(Web3.HTTPProvider(rpc_url))
         self._account = self._w3.eth.account.from_key(private_key)
         self._chain_id = chain_id
@@ -275,6 +284,27 @@ class AnchorClient:
             cooldown_seconds=cooldown_seconds,
         )
 
+    def verify_live_configuration(self) -> None:
+        """Fail fast when the client is pointed at an unusable live environment."""
+        if not self._w3.is_connected():
+            raise RuntimeError(
+                "AnchorClient could not connect to the configured RPC endpoint. "
+                "Live anchoring requires a reachable chain RPC."
+            )
+
+        try:
+            chain_id = self._w3.eth.chain_id
+        except Exception as exc:
+            raise RuntimeError(
+                "AnchorClient could not query chain_id from the configured RPC endpoint."
+            ) from exc
+
+        if chain_id != self._chain_id:
+            raise RuntimeError(
+                f"AnchorClient chain_id mismatch: configured {self._chain_id}, "
+                f"RPC reports {chain_id}"
+            )
+
     @classmethod
     def from_env(cls, prefix: str = "") -> "AnchorClient":
         """Create an AnchorClient from environment variables.
@@ -286,7 +316,7 @@ class AnchorClient:
                           {prefix}OPERATOR_KEY, {prefix}CHAIN_ID
         Optional: {prefix}ANCHOR_MAX_TPS, {prefix}ANCHOR_BURST,
                   {prefix}ANCHOR_FAILURE_THRESHOLD, {prefix}ANCHOR_COOLDOWN_SECONDS,
-                  {prefix}ANCHOR_TX_TIMEOUT
+                  {prefix}ANCHOR_TX_TIMEOUT, {prefix}VERIFY_LIVE_CONFIG
         """
         def _get(name: str, default: str | None = None) -> str:
             val = os.environ.get(f"{prefix}{name}", default)
@@ -296,17 +326,41 @@ class AnchorClient:
                 )
             return val
 
-        return cls(
+        def _get_int(name: str, default: int | None = None) -> int:
+            raw_default = str(default) if default is not None else None
+            raw = _get(name, raw_default)
+            try:
+                return int(raw)
+            except ValueError as exc:
+                raise EnvironmentError(
+                    f"Invalid integer env var {prefix}{name}: {raw!r}"
+                ) from exc
+
+        def _get_float(name: str, default: float | None = None) -> float:
+            raw_default = str(default) if default is not None else None
+            raw = _get(name, raw_default)
+            try:
+                return float(raw)
+            except ValueError as exc:
+                raise EnvironmentError(
+                    f"Invalid float env var {prefix}{name}: {raw!r}"
+                ) from exc
+
+        client = cls(
             rpc_url=_get("RPC_URL"),
             contract_address=_get("ANCHOR_REGISTRY"),
             private_key=_get("OPERATOR_KEY"),
-            chain_id=int(_get("CHAIN_ID")),
-            tx_timeout=int(_get("ANCHOR_TX_TIMEOUT", str(_TX_RECEIPT_TIMEOUT))),
-            max_tps=float(_get("ANCHOR_MAX_TPS", str(_DEFAULT_MAX_TPS))),
-            burst=int(_get("ANCHOR_BURST", str(_DEFAULT_BURST))),
-            failure_threshold=int(_get("ANCHOR_FAILURE_THRESHOLD", str(_DEFAULT_FAILURE_THRESHOLD))),
-            cooldown_seconds=float(_get("ANCHOR_COOLDOWN_SECONDS", str(_DEFAULT_COOLDOWN_SECONDS))),
+            chain_id=_get_int("CHAIN_ID"),
+            tx_timeout=_get_int("ANCHOR_TX_TIMEOUT", _TX_RECEIPT_TIMEOUT),
+            max_tps=_get_float("ANCHOR_MAX_TPS", _DEFAULT_MAX_TPS),
+            burst=_get_int("ANCHOR_BURST", _DEFAULT_BURST),
+            failure_threshold=_get_int("ANCHOR_FAILURE_THRESHOLD", _DEFAULT_FAILURE_THRESHOLD),
+            cooldown_seconds=_get_float("ANCHOR_COOLDOWN_SECONDS", _DEFAULT_COOLDOWN_SECONDS),
         )
+        verify_live = os.environ.get(f"{prefix}VERIFY_LIVE_CONFIG", "0") == "1"
+        if verify_live:
+            client.verify_live_configuration()
+        return client
 
     def _send_tx(self, fn) -> dict:
         """Build, sign, send, and wait for a contract function call.

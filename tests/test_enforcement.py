@@ -57,7 +57,14 @@ from src.ltp.economics import (
     SlashingTier,
     WEI_PER_LTP,
 )
-from src.ltp.primitives import H
+from src.ltp.primitives import AssuranceMode, H, get_assurance_mode, set_assurance_mode
+
+
+@pytest.fixture(autouse=True)
+def restore_assurance_mode():
+    original = get_assurance_mode()
+    yield
+    set_assurance_mode(original)
 
 
 # ===========================================================================
@@ -544,6 +551,9 @@ class TestVDFVerifier:
 
         # Verification should pass
         assert verifier.verify(challenge, result)
+        status = verifier.get_runtime_status()
+        assert status["simulated_backend"] is True
+        assert status["experimental_opt_in"] is False
 
     def test_wrong_challenge_fails_verification(self):
         config = VDFConfig(enabled=True, difficulty=10)
@@ -571,6 +581,48 @@ class TestVDFVerifier:
             computation_time_ms=result.computation_time_ms,
         )
         assert not verifier.verify(challenge, tampered)
+
+    def test_non_simulated_construction_requires_experimental_opt_in(self):
+        config = VDFConfig(
+            enabled=True,
+            construction=VDFConstruction.PIETRZAK,
+            difficulty=10,
+        )
+        verifier = VDFVerifier(config)
+
+        with pytest.raises(RuntimeError, match="simulated placeholder"):
+            verifier.generate_challenge("entity-1", 0, 100)
+
+    def test_non_simulated_construction_can_be_opted_into_for_dev(self):
+        config = VDFConfig(
+            enabled=True,
+            construction=VDFConstruction.WESOLOWSKI,
+            difficulty=10,
+            allow_experimental_constructions=True,
+        )
+        verifier = VDFVerifier(config)
+        challenge = verifier.generate_challenge("entity-1", 0, 100)
+        result = verifier.evaluate(challenge)
+
+        assert verifier.verify(challenge, result)
+        assert verifier.get_runtime_status()["experimental_opt_in"] is True
+
+    def test_production_mode_fails_closed(self):
+        set_assurance_mode(AssuranceMode.PRODUCTION)
+        verifier = VDFVerifier(VDFConfig(enabled=True, difficulty=10))
+
+        with pytest.raises(RuntimeError, match="unavailable in production assurance modes"):
+            verifier.generate_challenge("entity-1", 0, 100)
+
+    def test_compliance_strict_mode_fails_closed(self):
+        try:
+            set_assurance_mode(AssuranceMode.COMPLIANCE_STRICT)
+        except RuntimeError:
+            pytest.skip("Compliance-strict prerequisites unavailable in test environment")
+
+        verifier = VDFVerifier(VDFConfig(enabled=True, difficulty=10))
+        with pytest.raises(RuntimeError, match="unavailable in production assurance modes"):
+            verifier.generate_challenge("entity-1", 0, 100)
 
 
 # ===========================================================================

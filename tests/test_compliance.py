@@ -47,9 +47,12 @@ from src.ltp.primitives import (
     AEAD,
     MLKEM,
     MLDSA,
+    AssuranceMode,
     SecurityProfile,
     HashFunction,
+    get_assurance_mode,
     get_security_profile,
+    set_assurance_mode,
     set_security_profile,
     set_crypto_provider,
     get_crypto_provider,
@@ -68,9 +71,12 @@ from src.ltp.protocol import LTPProtocol
 def restore_default_profile():
     """Ensure every test starts and ends with the default Level 3 profile."""
     original = get_security_profile()
+    original_mode = get_assurance_mode()
     set_security_profile(SecurityProfile.level3())
     yield
     set_security_profile(original)
+    import src.ltp.primitives as primitives_module
+    primitives_module._assurance_mode = original_mode
 
 
 # ============================================================================
@@ -941,6 +947,31 @@ class TestComplianceConfig:
         assert summary["rbac_enabled"] is True
         assert summary["audit_logging_enabled"] is True
         assert "soc2-type2" in summary["target_frameworks"]
+
+    def test_validate_enforcement_requires_compliance_strict(self):
+        set_assurance_mode(AssuranceMode.DEVELOPMENT)
+        config = ComplianceConfig(
+            frameworks={ComplianceFramework.SOC2_TYPE2},
+            enable_rbac=True,
+            enable_audit_logging=True,
+            enable_key_rotation=True,
+        )
+        valid, violations = config.validate_enforcement()
+        assert not valid
+        assert any("modeled-only" in v for v in violations)
+
+    def test_controls_summary_reports_modeled_posture(self):
+        set_assurance_mode(AssuranceMode.DEVELOPMENT)
+        config = ComplianceConfig(
+            frameworks={ComplianceFramework.SOC2_TYPE2},
+            enable_rbac=True,
+            enable_audit_logging=True,
+            enable_key_rotation=True,
+        )
+        summary = config.controls_summary()
+        assert summary["assurance_mode"] == "development"
+        assert summary["enforcement_posture"] == "modeled"
+        assert summary["enforcement_violations"]
 
     def test_empty_frameworks_always_valid(self):
         config = ComplianceConfig()
