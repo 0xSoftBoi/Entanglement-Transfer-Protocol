@@ -26,6 +26,9 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
     /// @notice Maximum items per batchAnchor call (gas DoS protection).
     uint256 public constant MAX_BATCH_SIZE = 100;
 
+    /// @notice Minimum block interval between batchAnchor calls per signer (spam protection).
+    uint256 public constant MIN_BATCH_INTERVAL = 2;
+
     // -----------------------------------------------------------------------
     // Storage (must be append-only for upgrade safety)
     // -----------------------------------------------------------------------
@@ -44,6 +47,12 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
 
     /// @notice signerVkHash => authorized flag
     mapping(bytes32 => bool) public authorizedSigners;
+
+    /// @notice signerVkHash => authorization expiry timestamp
+    mapping(bytes32 => uint256) public signerExpiry;
+
+    /// @notice signerVkHash => block number of last batchAnchor call (rate limiting)
+    mapping(bytes32 => uint256) public lastBatchTimestamp;
 
     // -----------------------------------------------------------------------
     // Constructor — disables initializers on the implementation contract
@@ -159,6 +168,20 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
             validUntils.length != len ||
             receiptTypes.length != len
         ) revert ArrayLengthMismatch();
+        // Batch rate limiting: enforce MIN_BATCH_INTERVAL blocks between batches per signer.
+        // Check all signers upfront before any state changes.
+        for (uint256 i = 0; i < len; ++i) {
+            bytes32 svkHash = signerVkHashes[i];
+            uint256 lastBlock = lastBatchTimestamp[svkHash];
+            if (lastBlock != 0 && block.number < lastBlock + MIN_BATCH_INTERVAL) {
+                revert BatchTooFrequent();
+            }
+        }
+        // Update lastBatchTimestamp for each signer after validation passes.
+        for (uint256 i = 0; i < len; ++i) {
+            lastBatchTimestamp[signerVkHashes[i]] = block.number;
+        }
+
         for (uint256 i = 0; i < len; ++i) {
             _anchor(
                 anchorDigests[i],
@@ -186,6 +209,14 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
         // 1. Signer authorization
         if (!authorizedSigners[signerVkHash]) {
             revert UnauthorizedSigner(signerVkHash);
+        }
+
+        // 1a. Signer expiry
+        {
+            uint256 _expiry = signerExpiry[signerVkHash];
+            if (_expiry != 0 && block.timestamp >= _expiry) {
+                revert SignerExpired();
+            }
         }
 
         // 2. Sequence monotonicity
@@ -225,6 +256,29 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
     function revokeSigner(bytes32 vkHash) external onlyAdmin {
         authorizedSigners[vkHash] = false;
         emit SignerRevoked(vkHash);
+    }
+
+    /// @notice Authorize signers with a default expiry of 365 days. Admin only.
+    /// @param vkHashes Array of signer VK hashes to authorize.
+    function authorizeSigners(bytes32[] calldata vkHashes) external onlyAdmin {
+        uint256 expiry = block.timestamp + 365 days;
+        for (uint256 i = 0; i < vkHashes.length; ++i) {
+            authorizedSigners[vkHashes[i]] = true;
+            signerExpiry[vkHashes[i]] = expiry;
+            emit SignerAuthorized(vkHashes[i], expiry);
+        }
+    }
+
+    /// @notice Authorize signers with an explicit expiry timestamp. Admin only.
+    /// @param vkHashes Array of signer VK hashes to authorize.
+    /// @param expiry   Unix timestamp after which the signers are no longer valid.
+    function authorizeSignersWithExpiry(bytes32[] calldata vkHashes, uint256 expiry) external onlyAdmin {
+        if (expiry <= block.timestamp) revert SignerExpired();
+        for (uint256 i = 0; i < vkHashes.length; ++i) {
+            authorizedSigners[vkHashes[i]] = true;
+            signerExpiry[vkHashes[i]] = expiry;
+            emit SignerAuthorized(vkHashes[i], expiry);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -284,7 +338,7 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
 
     /// @notice Returns the implementation version for upgrade tracking.
     function version() external pure returns (uint256) {
-        return 5;
+        return 6;
     }
 
     // -----------------------------------------------------------------------
@@ -310,6 +364,12 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
         // 2. Signer authorization (mirrors governance.py:143-173)
         if (!authorizedSigners[signerVkHash]) {
             revert UnauthorizedSigner(signerVkHash);
+        }
+
+        // 2a. Signer expiry
+        uint256 expiry = signerExpiry[signerVkHash];
+        if (expiry != 0 && block.timestamp >= expiry) {
+            revert SignerExpired();
         }
 
         // 3. Sequence monotonicity (mirrors sequencing.py:68-74)

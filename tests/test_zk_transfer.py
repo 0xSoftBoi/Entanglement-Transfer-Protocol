@@ -1,5 +1,6 @@
 """Tests for ZK Transfer Mode (Open Question 8, §3.2)."""
 
+import os
 import pytest
 
 from src.ltp.zk_transfer import (
@@ -10,6 +11,12 @@ from src.ltp.zk_transfer import (
     ZKTransferMode,
     ContentPropertyProof,
 )
+
+
+@pytest.fixture(autouse=True)
+def allow_zk_mode(monkeypatch):
+    """Set ETP_ALLOW_ZK_MODE=1 for all ZK transfer tests."""
+    monkeypatch.setenv("ETP_ALLOW_ZK_MODE", "1")
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +226,11 @@ class TestZKTransferModeDefault:
     def test_default_config(self):
         zk = ZKTransferMode()
         assert zk.config.enabled is False
-        # Still functional even when disabled (config is advisory)
+        # Functional when ETP_ALLOW_ZK_MODE=1 (set by allow_zk_mode fixture)
         c = zk.create_hiding_commitment("test")
         assert c.is_hiding
+
+    def test_guard_blocks_without_env_var(self, monkeypatch):
+        monkeypatch.delenv("ETP_ALLOW_ZK_MODE", raising=False)
+        with pytest.raises(RuntimeError, match="ETP_ALLOW_ZK_MODE"):
+            ZKTransferMode()
