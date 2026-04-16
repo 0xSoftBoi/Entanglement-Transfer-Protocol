@@ -14,6 +14,12 @@ from src.ltp.zk_transfer import (
 from src.ltp.primitives import canonical_hash
 
 
+@pytest.fixture(autouse=True)
+def allow_zk_mode(monkeypatch):
+    """Set ETP_ALLOW_ZK_MODE=1 for all ZK transfer tests."""
+    monkeypatch.setenv("ETP_ALLOW_ZK_MODE", "1")
+
+
 # ---------------------------------------------------------------------------
 # ZKProofSystem enum
 # ---------------------------------------------------------------------------
@@ -87,6 +93,7 @@ class TestLatticeFoldTransfer:
     def test_create_commitment(self):
         mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.LATTICEFOLD,
+            allow_experimental_proof_systems=True,
         ))
         entity_id = canonical_hash(b"test-entity-latticefold")
         commitment = mode.create_hiding_commitment(entity_id)
@@ -98,6 +105,7 @@ class TestLatticeFoldTransfer:
     def test_create_and_verify_proof(self):
         mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.LATTICEFOLD,
+            allow_experimental_proof_systems=True,
         ))
         entity_id = canonical_hash(b"test-entity-lf-proof")
         commitment = mode.create_hiding_commitment(entity_id)
@@ -113,6 +121,7 @@ class TestLatticeFoldTransfer:
     def test_wrong_entity_id_fails(self):
         mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.LATTICEFOLD,
+            allow_experimental_proof_systems=True,
         ))
         entity_id = canonical_hash(b"correct-entity")
         wrong_id = canonical_hash(b"wrong-entity")
@@ -124,6 +133,7 @@ class TestLatticeFoldTransfer:
     def test_open_commitment(self):
         mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.LATTICEFOLD,
+            allow_experimental_proof_systems=True,
         ))
         entity_id = canonical_hash(b"test-open-lf")
         commitment = mode.create_hiding_commitment(entity_id)
@@ -139,6 +149,7 @@ class TestLatticeFoldTransfer:
     def test_cross_system_proof_rejected(self):
         lf_mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.LATTICEFOLD,
+            allow_experimental_proof_systems=True,
         ))
         sim_mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.SIMULATED,
@@ -158,6 +169,7 @@ class TestCircleSTARKTransfer:
     def test_create_commitment(self):
         mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.CIRCLE_STARK,
+            allow_experimental_proof_systems=True,
         ))
         entity_id = canonical_hash(b"test-entity-circle")
         commitment = mode.create_hiding_commitment(entity_id)
@@ -168,6 +180,7 @@ class TestCircleSTARKTransfer:
     def test_create_and_verify_proof(self):
         mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.CIRCLE_STARK,
+            allow_experimental_proof_systems=True,
         ))
         entity_id = canonical_hash(b"test-circle-proof")
         commitment = mode.create_hiding_commitment(entity_id)
@@ -184,6 +197,7 @@ class TestCircleSTARKTransfer:
     def test_open_commitment(self):
         mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.CIRCLE_STARK,
+            allow_experimental_proof_systems=True,
         ))
         entity_id = canonical_hash(b"test-open-cs")
         commitment = mode.create_hiding_commitment(entity_id)
@@ -195,9 +209,11 @@ class TestCircleSTARKTransfer:
     def test_wrong_proof_system_rejected(self):
         cs_mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.CIRCLE_STARK,
+            allow_experimental_proof_systems=True,
         ))
         groth_mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.GROTH16,
+            allow_experimental_proof_systems=True,
         ))
         entity_id = canonical_hash(b"cross-test")
         commitment = cs_mode.create_hiding_commitment(entity_id)
@@ -208,6 +224,7 @@ class TestCircleSTARKTransfer:
     def test_custom_config(self):
         mode = ZKTransferMode(ZKConfig(
             proof_system=ZKProofSystem.CIRCLE_STARK,
+            allow_experimental_proof_systems=True,
             circle_stark=CircleSTARKConfig(
                 num_queries=128,
                 blowup_factor=16,
