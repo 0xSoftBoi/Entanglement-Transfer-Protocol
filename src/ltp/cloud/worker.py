@@ -37,9 +37,12 @@ def _try_anchor_client():
 
 
 def main() -> int:
+    from .keys import signer_from_env
     store = open_store(os.environ.get("ETP_CLOUD_DB", "custody-cloud.db"))
     interval = float(os.environ.get("ETP_CLOUD_WORKER_INTERVAL", "600"))
-    operator = store.get_or_create_operator()
+    # Same custody resolution as the API (anchor digests bind the operator vk,
+    # so worker and API must agree on it).
+    operator = signer_from_env(store)
     dispatcher = WebhookDispatcher(store)
     client = _try_anchor_client()
     # Production gating: anchoring is the paid "Verified" tier.

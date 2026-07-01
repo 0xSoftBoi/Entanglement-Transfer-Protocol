@@ -25,6 +25,7 @@ from .anchoring import AnchorWorker
 from .indexer import EventIndexer, AnchoredEvent
 from .webhooks import WebhookDispatcher, sign_payload
 from .witness import Witness, Cosignature
+from .keys import LocalSigner, KMSSigner, signer_from_env
 from .metrics import render_metrics
 from .billing import usage_deltas, run_billing_export
 from .report import build_report, render_markdown
@@ -35,6 +36,7 @@ __all__ = [
     "AnchorWorker", "EventIndexer", "AnchoredEvent",
     "WebhookDispatcher", "sign_payload",
     "Witness", "Cosignature", "render_metrics",
+    "LocalSigner", "KMSSigner", "signer_from_env",
     "usage_deltas", "run_billing_export",
     "build_report", "render_markdown",
 ]

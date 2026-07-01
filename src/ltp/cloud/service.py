@@ -53,13 +53,16 @@ class CloudNotaryService:
         store: CloudStore,
         *,
         admin_token: str,
-        operator: KeyPair | None = None,
+        operator: KeyPair | None = None,  # KeyPair or any Signer (cloud/keys.py)
         sync_webhooks: bool = False,
         rate_per_minute: float | None = 300.0,
         witness: KeyPair | None = None,
     ) -> None:
+        from .keys import signer_from_env
         self._store = store
-        self._operator = operator or store.get_or_create_operator()
+        # Custody resolution: explicit operator wins; otherwise the env decides
+        # (ETP_CLOUD_KMS_KEY_ID → KMS-held key, else the store-persisted pair).
+        self._operator = operator or signer_from_env(store)
         self._admin_token = admin_token
         self._sync_webhooks = sync_webhooks
         self._dispatcher = WebhookDispatcher(store)

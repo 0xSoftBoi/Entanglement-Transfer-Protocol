@@ -102,6 +102,7 @@ digests/roots. Verification never *requires* the service or the chain.
 | Metrics | `cloud/metrics.py` — Prometheus text exposition at `GET /metrics` (both HTTP layers) | Scraped; alert rules (anchor-stuck, signer balance) in the Prometheus config |
 | Witness | `cloud/witness.py` — independent keypair cosigns STHs; cosignature served in `/v1/sth` | Second operator on separate infrastructure |
 | Audit report | `cloud/report.py` — evidence bundle (JSON+MD), STH chain verified at generation time | Vertical framing (21 CFR 11 / NERC-CIP) layers on per design partner |
+| Key custody | `cloud/keys.py` — Signer seam: `LocalSigner` (reference) / `KMSSigner` (AWS KMS `ML_DSA_65`, key non-exportable, fail-fast verify per signature); `ETP_CLOUD_KMS_KEY_ID` switches | Operator STH key in KMS/HSM; anchoring EOA (secp256k1 via KMS) is the remaining half, gated on a funded account |
 | Console | `website/console.html` — static, API-key auth (v1) | Next.js 14 + OAuth upgrade on the existing `website/` domain |
 | Contracts | **already deployed** (v5) | Proxy `0xB29d…0bF4`, MultiSig→Timelock governance — unchanged |
 
@@ -273,7 +274,7 @@ independent, publicly checkable timestamp.
 
 - **Packaging:** one container (`Dockerfile`, shipped) runs api / worker / indexer by role flag; reference `python -m ltp.cloud.service` behind Caddy for TLS.
 - **Environments:** dev (SQLite, FakeAnchorClient) → staging (Postgres, GSX Testnet) → prod (Postgres HA, GSX; later mainnet per contract roadmap).
-- **Config/secrets:** 12-factor env (`ETP_CLOUD_DB`, `ETP_CLOUD_ADMIN_TOKEN`, `GSX_RPC_URL`); anchoring key + operator signing key in KMS/HSM (reference stores operator key in DB `service_config` — explicitly a reference-only shortcut).
+- **Config/secrets:** 12-factor env (`ETP_CLOUD_DB`, `ETP_CLOUD_ADMIN_TOKEN`, `GSX_RPC_URL`); operator signing key in KMS via `ETP_CLOUD_KMS_KEY_ID` (`cloud/keys.py`, AWS KMS KeySpec `ML_DSA_65` — the DB-stored keypair remains only as the reference/dev default). Anchoring EOA key in KMS (secp256k1) is designed but lands with the funded-account smoke test.
 - **Data:** Postgres with PITR; the append-only tables make backups trivially consistent; receipts held by clients mean even total DB loss doesn't invalidate issued proofs.
 - **Rollout:** blue/green for the API (stateless); the worker is single-flight (advisory lock) to avoid duplicate submissions (DB uniqueness backstops it anyway).
 

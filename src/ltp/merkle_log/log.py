@@ -47,16 +47,25 @@ class MerkleLog:
     concurrent appends.
     """
 
-    def __init__(self, operator_vk: bytes, operator_sk: bytes) -> None:
+    def __init__(self, operator_vk: bytes, operator_sk: bytes | None = None,
+                 *, signer=None) -> None:
         """
         Args:
             operator_vk: ML-DSA-65 verification key (public — included in every STH).
             operator_sk: ML-DSA-65 signing key (private — never leaves this object).
+            signer: alternative to operator_sk — an external Signer
+                (`.vk` + `.sign(payload)`, e.g. KMS-held; see cloud/keys.py).
+                Exactly one of operator_sk / signer must be provided.
         """
+        if (operator_sk is None) == (signer is None):
+            raise ValueError("provide exactly one of operator_sk or signer")
+        if signer is not None and signer.vk != operator_vk:
+            raise ValueError("signer.vk does not match operator_vk")
         self._tree = MerkleTree()
         self._records: list[bytes] = []   # raw record bytes, parallel to tree leaves
         self._operator_vk = operator_vk
         self._operator_sk = operator_sk
+        self._signer = signer
         self._sths: list[SignedTreeHead] = []
         self._sequence: int = 0
 
@@ -95,13 +104,21 @@ class MerkleLog:
 
         Returns the signed STH (also stored in self._sths).
         """
-        sth = SignedTreeHead.sign(
-            sequence=self._sequence,
-            tree_size=self._tree.size,
-            root_hash=self._tree.root(),
-            operator_vk=self._operator_vk,
-            operator_sk=self._operator_sk,
-        )
+        if self._signer is not None:
+            sth = SignedTreeHead.sign_with(
+                self._signer,
+                sequence=self._sequence,
+                tree_size=self._tree.size,
+                root_hash=self._tree.root(),
+            )
+        else:
+            sth = SignedTreeHead.sign(
+                sequence=self._sequence,
+                tree_size=self._tree.size,
+                root_hash=self._tree.root(),
+                operator_vk=self._operator_vk,
+                operator_sk=self._operator_sk,
+            )
         self._sths.append(sth)
         self._sequence += 1
         return sth
