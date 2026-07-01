@@ -68,6 +68,7 @@ __all__ = [
     "BundleManifest",
     "bundle_sealed",
     "reassemble_sealed",
+    "seal_capture",
     "SEAL_OVERHEAD",
 ]
 
@@ -183,6 +184,41 @@ class SealedCapture:
         return len(self.sealed)
 
 
+def seal_capture(
+    artifact: bytes,
+    recipient_ek: bytes,
+    *,
+    originator_id: str,
+    originator: KeyPair | None = None,
+    capture_id: str | None = None,
+    captured_at: float | None = None,
+    meta: dict | None = None,
+) -> SealedCapture:
+    """
+    Seal an artifact to a recipient and build its (optionally device-signed)
+    manifest — WITHOUT touching any log. This is the client-side half shared by
+    the local notary (ProvenanceLog.record_capture) and the hosted notary client
+    (which seals locally, then submits only the manifest).
+    """
+    sealed = SealedBox.seal(artifact, recipient_ek)
+    sealed_hash = H_bytes(sealed)
+    manifest = CaptureManifest(
+        capture_id=capture_id if capture_id is not None else sealed_hash.hex()[:32],
+        originator_id=originator_id,
+        captured_at=captured_at if captured_at is not None else time.time(),
+        content_hash=H_bytes(artifact),
+        sealed_hash=sealed_hash,
+        originator_vk=originator.vk if originator is not None else b"",
+        meta=meta or {},
+    )
+    if originator is not None:
+        manifest = replace(
+            manifest,
+            originator_sig=MLDSA.sign(originator.sk, manifest.originator_signed_payload()),
+        )
+    return SealedCapture(manifest=manifest, sealed=sealed)
+
+
 class ProvenanceLog:
     """
     Operator-run notary: seals captures and commits their manifests to an
@@ -247,24 +283,12 @@ class ProvenanceLog:
         generate inclusion proofs. Call publish_sth() afterward (optionally
         batching several captures per STH) to attest the new log state.
         """
-        sealed = SealedBox.seal(artifact, recipient_ek)
-        sealed_hash = H_bytes(sealed)
-        manifest = CaptureManifest(
-            capture_id=capture_id if capture_id is not None else sealed_hash.hex()[:32],
-            originator_id=originator_id,
-            captured_at=captured_at if captured_at is not None else time.time(),
-            content_hash=H_bytes(artifact),
-            sealed_hash=sealed_hash,
-            originator_vk=originator.vk if originator is not None else b"",
-            meta=meta or {},
+        capture = seal_capture(
+            artifact, recipient_ek, originator_id=originator_id, originator=originator,
+            capture_id=capture_id, captured_at=captured_at, meta=meta,
         )
-        if originator is not None:
-            manifest = replace(
-                manifest,
-                originator_sig=MLDSA.sign(originator.sk, manifest.originator_signed_payload()),
-            )
-        idx = self._log.append(manifest.canonical_bytes())
-        return SealedCapture(manifest=manifest, sealed=sealed), idx
+        idx = self._log.append(capture.manifest.canonical_bytes())
+        return capture, idx
 
     def publish_sth(self) -> SignedTreeHead:
         """Sign and publish the current log state (operator attestation)."""

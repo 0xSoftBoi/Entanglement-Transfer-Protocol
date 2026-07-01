@@ -686,6 +686,19 @@ def cmd_audit(args) -> int:
     return 1
 
 
+def cmd_serve(args) -> int:
+    from .notary_server import NotaryService, serve
+    operator = _read_key(Path(args.operator))
+    if not operator.sk:
+        raise SystemExit("error: --operator must be a full (secret) key")
+    if not args.api_key:
+        raise SystemExit("error: provide at least one --api-key")
+    api_keys = {k: f"tenant-{i}" for i, k in enumerate(args.api_key)}
+    service = NotaryService(operator, api_keys)
+    serve(service, host=args.host, port=args.port)
+    return 0
+
+
 def cmd_log(args) -> int:
     store = NotaryStore(Path(args.dir))
     plog = store.load_log()
@@ -824,6 +837,13 @@ def build_parser() -> argparse.ArgumentParser:
     au.add_argument("receipt_a", help="first receipt")
     au.add_argument("receipt_b", help="second receipt")
     au.set_defaults(func=cmd_audit)
+
+    sv = sub.add_parser("serve", help="run the hosted notary HTTP service (SaaS backend)")
+    sv.add_argument("--operator", required=True, help="operator secret key file")
+    sv.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
+    sv.add_argument("--port", type=int, default=8080, help="bind port (default 8080)")
+    sv.add_argument("--api-key", action="append", help="authorized API key (repeatable)")
+    sv.set_defaults(func=cmd_serve)
 
     lg = sub.add_parser("log", help="show notary state")
     lg.add_argument("dir", help="notary directory")

@@ -116,6 +116,41 @@ append-only growth over time.
 | `audit DIR RECEIPT_A RECEIPT_B` | Verify two receipts are from one append-only log (no rewrite/fork) |
 | `log DIR` | Show notary state |
 
+## Hosted notary (Notary-as-a-Service)
+
+The SaaS backend. Run a notary as an HTTP service; clients seal **locally** and
+submit only the public manifest (hashes + signatures, never plaintext or the
+sealed blob), so the service is **zero-knowledge of content** by construction.
+It meters submissions per API key — the billable unit is a *notarized capture*.
+
+```bash
+# operator runs the service
+etp-custody serve --operator op.key --port 8080 --api-key SECRET-KEY-123
+```
+
+```python
+# client SDK: seal locally, notarize remotely, verify the receipt offline
+from ltp.notary_server import NotaryClient
+c = NotaryClient("http://localhost:8080", api_key="SECRET-KEY-123")
+op_vk = c.operator_vk()                                   # pin the notary's key
+capture, receipt = c.notarize(data, bob_ek, originator_id="finance-app")
+assert receipt.verify(capture.sealed, expected_operator_vk=op_vk)
+print("captures billed:", c.usage())
+```
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /healthz` | – | liveness + total captures |
+| `GET /v1/operator` | – | the operator public key to pin |
+| `GET /v1/sth` | – | latest signed tree head |
+| `GET /v1/proof/<i>` | – | inclusion proof |
+| `POST /v1/captures` | API key | submit a manifest → receipt (metered) |
+| `GET /v1/usage` | API key | notarized-capture count for the key |
+
+Reference single-log service (stdlib only). The enterprise layer — multi-tenant
+log isolation, HSM-held operator keys, witness cosigning, durable storage, rate
+limits, billing export — sits on top of this same core.
+
 ## Inspecting and auditing
 
 `inspect` is a keyless, read-only diagnostic — it prints what a receipt claims and
