@@ -42,7 +42,7 @@ then the authenticated console.
 
 | # | Item | Effort | Owner | Notes |
 |---|---|---|---|---|
-| C1 | **`/verify` public page**: paste receipt/attestation + drop sealed file → PASS/FAIL in-browser; `isAnchored` via viem (read-only, **no wallet**) | M | [auto] | Needs a JS verifier for SHA3-256 Merkle path + ML-DSA verify — port the verify path or compile to WASM; the one real technical risk in this phase |
+| C1 | ✅ **`/verify` public page** (`website/verify.html` + `verify.js`): paste receipt/attestation + drop sealed file → hashing + RFC-6962 inclusion **in-browser** (hand-written SHA3/Keccak, cross-tested vs Python under node); ML-DSA checks delegated to the public `POST /v1/verify` endpoint, honestly labeled; `isAnchored` via raw `eth_call` (read-only, **no wallet, no viem dep**) | M | done | Full offline PQ verification remains the CLI's job — stated on the page |
 | C2 | Console shell: Next.js 14 + Auth.js (GitHub/Google OAuth), `users`/`memberships` tables | M | [auto] build; [you] OAuth app creds | |
 | C3 | Pages: dashboard, captures (+detail), keys, anchors timeline (tx → explorer) | M–L | [auto] | Consumes existing API only |
 | C4 | Deploy console (Vercel) + point `api.` at the service | S | [you] approve | |

@@ -159,6 +159,29 @@ class CloudNotaryService:
                   "block_number", "updated_at")}
                 for r in rows]
 
+    @staticmethod
+    def verify_receipt_signatures(receipt: ProvenanceReceipt) -> dict:
+        """
+        Server-assisted verification for the browser verifier: the ML-DSA
+        checks that can't reasonably run in hand-written JS. Receipts are
+        public data, so this endpoint needs no auth — and the caller is told
+        the operator vk so it can compare against its own pinned copy.
+        """
+        from ..primitives import MLDSA
+        m = receipt.manifest
+        sth_ok = receipt.sth.verify()
+        proof_ok = receipt.proof.verify(m.canonical_bytes(), receipt.sth.root_hash)
+        device_ok = None
+        if m.originator_vk:
+            device_ok = MLDSA.verify(
+                m.originator_vk, m.originator_signed_payload(), m.originator_sig)
+        return {
+            "sth_signature_valid": sth_ok,
+            "inclusion_proof_valid": proof_ok,
+            "originator_signature_valid": device_ok,   # null when not device-signed
+            "operator_vk": b64e(receipt.sth.operator_vk),
+        }
+
     def on_anchor_confirmed(self, tenant_id: str, anchor_row: dict) -> None:
         """Wire this as AnchorWorker(on_confirmed=service.on_anchor_confirmed)."""
         self.notify(tenant_id, {
@@ -250,6 +273,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path == "/v1/verify":
+            # Public: signature checks for the browser verifier (receipts are
+            # public; plaintext/sealed blobs are never sent here).
+            try:
+                receipt = ProvenanceReceipt.from_dict(self._body())
+            except (ValueError, KeyError, TypeError) as e:
+                return self._send(400, {"error": f"malformed receipt ({type(e).__name__})"})
+            return self._send(200, self.svc.verify_receipt_signatures(receipt))
         if path == "/v1/admin/tenants":
             if not self.svc.admin_authorized(self.headers.get("X-Admin-Token")):
                 return self._send(401, {"error": "invalid admin token"})
