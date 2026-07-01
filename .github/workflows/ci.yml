@@ -27,8 +27,8 @@ jobs:
       # Enables the PostgresStore tests (they skip when unset).
       POSTGRES_DSN: postgresql://custody:custody@localhost:5432/custody
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -41,6 +41,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build service image
         run: docker build -t etp-custody-cloud:ci .
