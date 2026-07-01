@@ -67,7 +67,39 @@ etp-custody log ./notary
 | `publish DIR` | Publish a signed tree head (attestation) over the current log |
 | `verify --sealed S --receipt R [--operator PUB]` | Verify a receipt against a sealed blob (offline). Exit 0=PASS, 1=FAIL. Pass `--operator` to require a specific trusted notary |
 | `open --key KEY --sealed S [--receipt R] -o OUT` | Recover plaintext (authorized recipient only) |
+| `bundle --in S --n N --k K [--prefix P]` | Erasure-code a sealed blob into N shards; any K reconstruct |
+| `reassemble --bundle B --out S SHARD...` | Reconstruct a sealed blob from any K surviving shards |
 | `log DIR` | Show notary state |
+
+## Delay-tolerant transport (erasure-coded bundles)
+
+A sealed capture is one opaque blob — on a lossy or disconnected link (a
+satellite pass, a tactical mesh, a data mule crossing a gap) a single dropped
+packet loses it. `bundle` splits the blob into *N* forward-error-corrected
+shards, **any *K* of which reconstruct it** — no ARQ round-trip. Spray the shards
+over the link (or across several passes / couriers); the receiver reassembles
+from whichever *K* arrive intact. Provenance is untouched: the reassembled blob
+is byte-identical, so the **same receipt still verifies**.
+
+```bash
+# sender: seal, then bundle into 6 shards (tolerates losing any 2)
+etp-custody seal ./notary --in report.pdf --to bob.pub --originator sensor-7 \
+    --out report.sealed --receipt report.receipt
+etp-custody bundle --in report.sealed --n 6 --k 4 --prefix report
+#   → report.bundle + report.shard000 … report.shard005
+
+# receiver: only 4 of 6 shards arrived → still reconstructs
+etp-custody reassemble --bundle report.bundle --out report.sealed \
+    report.shard000 report.shard002 report.shard004 report.shard005
+etp-custody verify --sealed report.sealed --receipt report.receipt   # PASS
+```
+
+Corrupt shards (hash-mismatched against the bundle manifest) are dropped
+automatically before decoding, and reconstruction is rejected if it doesn't
+match the notarized `sealed_hash`. Choose `--n`/`--k` for the link's loss rate
+(e.g. `--n 6 --k 4` tolerates ~33% loss). *Note:* the erasure coder is the
+repo's reference pure-Python Reed–Solomon — correct but not line-rate; a
+production build swaps in a native backend (e.g. `raptorq`) behind the same API.
 
 ## Security properties (all covered by tests)
 

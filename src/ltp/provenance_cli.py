@@ -38,11 +38,15 @@ import argparse
 import hmac
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 from .keypair import KeyPair
-from .provenance import ProvenanceLog, ProvenanceReceipt, CaptureManifest, SEAL_OVERHEAD
+from .provenance import (
+    ProvenanceLog, ProvenanceReceipt, CaptureManifest, SEAL_OVERHEAD,
+    BundleManifest, bundle_sealed, reassemble_sealed,
+)
 from .encoding import b64e, b64d
 from .primitives import real_backend_active
 from .merkle_log import SignedTreeHead
@@ -342,6 +346,52 @@ def cmd_open(args) -> int:
     return 0
 
 
+def cmd_bundle(args) -> int:
+    sealed = Path(args.inp).read_bytes()
+    try:
+        manifest, shards = bundle_sealed(sealed, args.n, args.k)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+    prefix = Path(args.prefix) if args.prefix else Path(args.inp)
+    bundle_path = prefix.with_suffix(prefix.suffix + ".bundle")
+    bundle_path.write_text(manifest.to_json())
+    shard_paths = []
+    for idx, shard in enumerate(shards):
+        p = prefix.with_suffix(prefix.suffix + f".shard{idx:03d}")
+        p.write_bytes(shard)
+        shard_paths.append(p)
+    lost_ok = args.n - args.k
+    print(f"✓ bundled '{args.inp}' into {args.n} shards (any {args.k} reconstruct)")
+    print(f"    tolerates losing any {lost_ok} of {args.n} shards "
+          f"(~{100 * lost_ok // args.n}% loss)")
+    print(f"    each shard : ~{len(shards[0])} B")
+    print(f"    manifest   : {bundle_path}")
+    print(f"    shards     : {shard_paths[0].name} … {shard_paths[-1].name}")
+    return 0
+
+
+def cmd_reassemble(args) -> int:
+    manifest = BundleManifest.from_json(Path(args.bundle).read_text())
+    shards: dict[int, bytes] = {}
+    for sp in args.shards:
+        p = Path(sp)
+        m = re.search(r"\.shard(\d+)$", p.name)
+        if not m:
+            print(f"    skipping {p.name} (no .shardNN index in name)")
+            continue
+        shards[int(m.group(1))] = p.read_bytes()
+    try:
+        sealed = reassemble_sealed(manifest, shards)
+    except ValueError as e:
+        print(f"FAIL — {e}")
+        return 1
+    Path(args.out).write_bytes(sealed)
+    print(f"✓ reassembled {len(sealed)} B → {args.out}  (from {len(shards)} shards, "
+          f"needed {manifest.k}/{manifest.n})")
+    print("    the reconstructed sealed blob verifies against its receipt as usual")
+    return 0
+
+
 def cmd_log(args) -> int:
     store = NotaryStore(Path(args.dir))
     plog = store.load_log()
@@ -413,6 +463,19 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--receipt", help="receipt file (re-checks content hash if given)")
     o.add_argument("-o", "--out", required=True, help="output plaintext file")
     o.set_defaults(func=cmd_open)
+
+    b = sub.add_parser("bundle", help="erasure-code a sealed blob into n shards (any k reconstruct)")
+    b.add_argument("--in", dest="inp", required=True, help="sealed blob to bundle")
+    b.add_argument("--n", type=int, required=True, help="total shards to produce")
+    b.add_argument("--k", type=int, required=True, help="shards needed to reconstruct (k < n)")
+    b.add_argument("--prefix", help="output path prefix (default: <in>)")
+    b.set_defaults(func=cmd_bundle)
+
+    r = sub.add_parser("reassemble", help="reconstruct a sealed blob from any k shards")
+    r.add_argument("--bundle", required=True, help="bundle manifest (.bundle)")
+    r.add_argument("--out", required=True, help="output sealed blob")
+    r.add_argument("shards", nargs="+", help="shard files (indices read from .shardNN names)")
+    r.set_defaults(func=cmd_reassemble)
 
     lg = sub.add_parser("log", help="show notary state")
     lg.add_argument("dir", help="notary directory")

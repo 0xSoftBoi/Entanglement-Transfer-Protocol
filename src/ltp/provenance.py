@@ -57,6 +57,7 @@ from .keypair import KeyPair, SealedBox
 from .primitives import H_bytes, MLDSA
 from .encoding import CanonicalEncoder, b64e, b64d
 from .domain import DOMAIN_PROVENANCE_CAPTURE, DOMAIN_PROVENANCE_ORIGINATOR
+from .erasure import ErasureCoder
 from .merkle_log import MerkleLog, SignedTreeHead, InclusionProof
 
 __all__ = [
@@ -64,6 +65,9 @@ __all__ = [
     "SealedCapture",
     "ProvenanceLog",
     "ProvenanceReceipt",
+    "BundleManifest",
+    "bundle_sealed",
+    "reassemble_sealed",
     "SEAL_OVERHEAD",
 ]
 
@@ -448,3 +452,106 @@ class ProvenanceReceipt:
     @classmethod
     def from_json(cls, s: str) -> "ProvenanceReceipt":
         return cls.from_dict(json.loads(s))
+
+
+# ---------------------------------------------------------------------------
+# Delay-tolerant transport: erasure-coded shard bundles
+# ---------------------------------------------------------------------------
+#
+# The other half of the provenance wedge. A sealed capture is a single opaque
+# blob; on a lossy or disconnected link (satellite pass, tactical mesh, a data
+# mule crossing a gap) a single dropped packet loses it. bundle_sealed() splits
+# the sealed blob into n erasure-coded shards, ANY k of which reconstruct it —
+# forward error correction, no ARQ round-trip. Spray n shards over the link (or
+# across several passes / several couriers); the receiver reassembles from any k
+# that arrive intact. Provenance is unaffected: reassemble → the exact same
+# sealed blob → the existing receipt still verifies.
+
+
+@dataclass(frozen=True)
+class BundleManifest:
+    """
+    Self-describing header for an erasure-coded shard bundle.
+
+    Carries the (n, k) scheme, the hash+length of the original sealed blob (to
+    verify reconstruction), and a per-shard hash so a receiver can drop corrupt
+    shards before decoding (one bad shard would otherwise poison RS decode).
+    Contains no secrets — safe to ship alongside the shards.
+    """
+
+    n: int
+    k: int
+    sealed_hash: bytes
+    sealed_len: int
+    shard_hashes: list  # list[bytes], index-aligned, length n
+
+    def to_dict(self) -> dict:
+        return {
+            "format": "etp-shard-bundle/1",
+            "n": self.n,
+            "k": self.k,
+            "sealed_hash": b64e(self.sealed_hash),
+            "sealed_len": self.sealed_len,
+            "shard_hashes": [b64e(h) for h in self.shard_hashes],
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BundleManifest":
+        return cls(
+            n=d["n"],
+            k=d["k"],
+            sealed_hash=b64d(d["sealed_hash"]),
+            sealed_len=d["sealed_len"],
+            shard_hashes=[b64d(h) for h in d["shard_hashes"]],
+        )
+
+    @classmethod
+    def from_json(cls, s: str) -> "BundleManifest":
+        return cls.from_dict(json.loads(s))
+
+
+def bundle_sealed(sealed: bytes, n: int, k: int) -> tuple[BundleManifest, list[bytes]]:
+    """
+    Erasure-code a sealed blob into n shards, any k of which reconstruct it.
+
+    Returns (manifest, shards) where shards[i] is the i-th shard. Choose n/k for
+    the link's loss rate: e.g. n=6,k=4 tolerates any 2 of 6 lost (~33% loss).
+    """
+    if not (n > k > 0):
+        raise ValueError("need n > k > 0")
+    shards = ErasureCoder.encode(sealed, n, k)
+    manifest = BundleManifest(
+        n=n, k=k,
+        sealed_hash=H_bytes(sealed),
+        sealed_len=len(sealed),
+        shard_hashes=[H_bytes(s) for s in shards],
+    )
+    return manifest, shards
+
+
+def reassemble_sealed(manifest: BundleManifest, shards: dict[int, bytes]) -> bytes:
+    """
+    Reconstruct the sealed blob from any k valid shards.
+
+    Corrupt shards (hash mismatch vs the manifest) are dropped before decoding.
+    Raises ValueError if fewer than k valid shards are available or if the
+    reconstructed blob does not match the manifest's sealed_hash.
+    """
+    good = {
+        idx: s for idx, s in shards.items()
+        if 0 <= idx < manifest.n
+        and idx < len(manifest.shard_hashes)
+        and hmac.compare_digest(H_bytes(s), manifest.shard_hashes[idx])
+    }
+    if len(good) < manifest.k:
+        raise ValueError(
+            f"need {manifest.k} valid shards to reconstruct, have {len(good)} "
+            f"(of {len(shards)} supplied)"
+        )
+    sealed = ErasureCoder.decode(good, manifest.n, manifest.k)
+    if not hmac.compare_digest(H_bytes(sealed), manifest.sealed_hash):
+        raise ValueError("reconstructed blob does not match bundle sealed_hash")
+    return sealed

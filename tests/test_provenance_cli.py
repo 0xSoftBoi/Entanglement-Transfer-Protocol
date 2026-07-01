@@ -163,6 +163,33 @@ class TestOriginatorSigning:
                      "--expect-originator", str(dev_pub)]) == 1
 
 
+class TestBundleReassemble:
+    def test_bundle_lose_shards_reassemble_and_verify(self, notary, tmp_path):
+        _, sealed, receipt = _seal(notary, content=b"delay-tolerant evidence" * 20, name="d")
+        # bundle into 6 shards, any 4 reconstruct
+        assert main(["bundle", "--in", str(sealed), "--n", "6", "--k", "4",
+                     "--prefix", str(tmp_path / "d")]) == 0
+        shard_files = sorted(str(p) for p in tmp_path.glob("d.shard*"))
+        assert len(shard_files) == 6
+        # Simulate a lossy link: only 4 of 6 shards arrive (drop two).
+        arrived = shard_files[:2] + shard_files[4:]
+        assert len(arrived) == 4
+        recon = tmp_path / "recon.sealed"
+        assert main(["reassemble", "--bundle", str(tmp_path / "d.bundle"),
+                     "--out", str(recon)] + arrived) == 0
+        # reconstructed blob == original sealed, and the original receipt verifies it
+        assert recon.read_bytes() == sealed.read_bytes()
+        assert main(["verify", "--sealed", str(recon), "--receipt", str(receipt)]) == 0
+
+    def test_reassemble_too_few_shards_fails(self, notary, tmp_path):
+        _, sealed, _ = _seal(notary, name="d")
+        assert main(["bundle", "--in", str(sealed), "--n", "6", "--k", "4",
+                     "--prefix", str(tmp_path / "d")]) == 0
+        shard_files = sorted(str(p) for p in tmp_path.glob("d.shard*"))[:2]  # only 2
+        assert main(["reassemble", "--bundle", str(tmp_path / "d.bundle"),
+                     "--out", str(tmp_path / "x.sealed")] + shard_files) == 1
+
+
 class TestReceiptSerialization:
     def test_receipt_json_roundtrip(self, notary, tmp_path):
         _, sealed, receipt = _seal(notary, content=b"payload", name="d")
