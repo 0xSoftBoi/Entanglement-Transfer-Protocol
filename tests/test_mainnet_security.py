@@ -388,8 +388,10 @@ class TestCorrelationPenalty:
         entity = Entity(content=b"slash test", shape="x-ltp/test")
         protocol.commit(entity, alice, n=8, k=4)
 
-        # Give the target node stake
-        target = network.nodes[0]
+        # Pick a node that actually holds shards (placement is hash-dependent;
+        # nodes[0] can legitimately receive none) and give it stake.
+        target = max(network.nodes, key=lambda n: n.shard_count)
+        assert target.shard_count > 0, "No node has shards after commit"
         target.deposit_stake(5_000)
 
         # Delete all shards to force audit failure
@@ -478,7 +480,9 @@ class TestDAAttackMitigation:
         entity = Entity(content=b"da-attack-test", shape="x-ltp/test")
         protocol.commit(entity, alice, n=8, k=4)
 
-        target = network.nodes[0]
+        # Placement is hash-dependent — target a node that holds shards.
+        target = max(network.nodes, key=lambda n: n.shard_count)
+        assert target.shard_count > 0, "No node has shards after commit"
         target.deposit_stake(10_000)
 
         # Simulate repeated audit failures (DA attack pattern)
