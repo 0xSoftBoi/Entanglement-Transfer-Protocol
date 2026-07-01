@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ETP Custody — post-quantum chain of custody</title>
+<meta name="description" content="Seal a file, notarize it in a tamper-evident log, and verify it offline. Post-quantum, delay-tolerant, no blockchain.">
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#111826; --panel2:#0d1420; --line:#1e293b;
+    --ink:#e6edf3; --dim:#8b98a9; --faint:#5b6675;
+    --teal:#2dd4bf; --violet:#a78bfa; --grn:#34d399; --amber:#fbbf24;
+    --mono:'SF Mono',ui-monospace,'JetBrains Mono',Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,#12203a 0%,transparent 60%),var(--bg);
+       color:var(--ink);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:var(--teal);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:1040px;margin:0 auto;padding:0 24px}
+  .mono{font-family:var(--mono)}
+
+  /* nav */
+  nav{position:sticky;top:0;z-index:10;backdrop-filter:blur(10px);
+      background:rgba(10,14,20,.72);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.2px}
+  .brand .glyph{width:26px;height:26px;border-radius:7px;
+    background:linear-gradient(135deg,var(--teal),var(--violet));display:grid;place-items:center;
+    color:#04121a;font-weight:800;font-size:15px}
+  .nav-links{display:flex;gap:22px;font-size:14px;color:var(--dim)}
+  .nav-links a{color:var(--dim)}
+  .nav-links a:hover{color:var(--ink);text-decoration:none}
+
+  /* hero */
+  header{padding:74px 0 44px}
+  .tag{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--teal);
+    border:1px solid #14352f;background:#0c1b18;border-radius:999px;padding:5px 12px;margin-bottom:22px}
+  .tag .dot{width:7px;height:7px;border-radius:50%;background:var(--teal);box-shadow:0 0 10px var(--teal)}
+  h1{font-size:clamp(34px,5.4vw,56px);line-height:1.06;margin:0 0 16px;letter-spacing:-1.2px;font-weight:800}
+  h1 .accent{background:linear-gradient(120deg,var(--teal),var(--violet));-webkit-background-clip:text;
+    background-clip:text;color:transparent}
+  .sub{font-size:clamp(16px,2vw,19px);color:var(--dim);max-width:620px;margin:0 0 28px}
+  .cta{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:10px;font-weight:600;
+    font-size:14.5px;border:1px solid var(--line)}
+  .btn.primary{background:linear-gradient(135deg,var(--teal),#22b8a6);color:#04121a;border:none}
+  .btn.primary:hover{filter:brightness(1.06);text-decoration:none}
+  .btn.ghost{color:var(--ink);background:var(--panel)}
+  .btn.ghost:hover{border-color:#2f4056;text-decoration:none}
+  .note{font-size:12.5px;color:var(--faint)}
+
+  /* terminal */
+  .term{margin-top:34px;border:1px solid var(--line);border-radius:14px;overflow:hidden;
+    background:linear-gradient(180deg,#0d1420,#0b111b);box-shadow:0 24px 60px -30px #000}
+  .term .bar{display:flex;align-items:center;gap:8px;padding:11px 14px;border-bottom:1px solid var(--line);
+    background:#0b1119}
+  .term .bar i{width:11px;height:11px;border-radius:50%;display:inline-block}
+  .term .bar .r{background:#ff5f56}.term .bar .y{background:#ffbd2e}.term .bar .g{background:#27c93f}
+  .term .bar span{margin-left:8px;color:var(--faint);font-size:12.5px;font-family:var(--mono)}
+  .term pre{margin:0;padding:20px;font-family:var(--mono);font-size:13.5px;line-height:1.72;overflow-x:auto}
+  .c-cmd{color:var(--ink)}.c-flag{color:var(--violet)}.c-str{color:var(--amber)}
+  .c-out{color:var(--dim)}.c-ok{color:var(--grn)}.c-cm{color:var(--faint)}.c-prompt{color:var(--teal)}
+
+  section{padding:46px 0;border-top:1px solid var(--line)}
+  .eyebrow{font-size:12.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--teal);margin:0 0 10px;font-weight:700}
+  h2{font-size:clamp(24px,3.4vw,32px);margin:0 0 12px;letter-spacing:-.6px}
+  .lead{color:var(--dim);max-width:680px;margin:0 0 26px}
+
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+  .card{transition:border-color .15s}
+  .card:hover{border-color:#33455e}
+  .card .ic{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;font-size:19px;margin-bottom:12px;
+    background:#0e1a20;border:1px solid #17323a}
+  .card h3{margin:0 0 6px;font-size:17px}
+  .card p{margin:0;color:var(--dim);font-size:14.5px}
+  .card .k{font-family:var(--mono);color:var(--teal);font-size:12.5px;margin-top:12px;display:block}
+
+  /* flow */
+  .flow{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:12px;align-items:stretch}
+  @media(max-width:720px){.flow{grid-template-columns:1fr;text-align:center}.flow .arw{transform:rotate(90deg)}}
+  .step{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .step b{display:block;font-size:15px;margin-bottom:4px}
+  .step span{color:var(--dim);font-size:13.5px}
+  .arw{align-self:center;color:var(--faint);font-size:22px}
+  .closed{margin-top:18px;border:1px solid #3a2f14;background:#1a1408;border-radius:12px;padding:14px 18px;
+    color:#f6d488;font-size:14px}
+
+  table{width:100%;border-collapse:collapse;font-size:14px;margin-top:6px}
+  th,td{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--faint);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.5px}
+  td.cmd{font-family:var(--mono);color:var(--teal);white-space:nowrap}
+  td.desc{color:var(--dim)}
+
+  .stats{display:flex;gap:14px;flex-wrap:wrap;margin-top:6px}
+  .stat{flex:1;min-width:150px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .stat b{display:block;font-size:24px;background:linear-gradient(120deg,var(--teal),var(--violet));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .stat span{color:var(--dim);font-size:13px}
+
+  footer{border-top:1px solid var(--line);padding:34px 0 60px;color:var(--faint);font-size:13.5px}
+  footer .row{display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap}
+  .pill{font-family:var(--mono);font-size:12px;color:var(--dim);border:1px solid var(--line);
+    border-radius:999px;padding:3px 10px}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <div class="brand"><span class="glyph">⛨</span> ETP&nbsp;Custody</div>
+  <div class="nav-links">
+    <a href="#pillars">Pillars</a>
+    <a href="#how">How it works</a>
+    <a href="#commands">Commands</a>
+    <a href="../docs/PROVENANCE_CLI.md">Docs</a>
+  </div>
+</div></nav>
+
+<header><div class="wrap">
+  <div class="tag"><span class="dot"></span> post-quantum · tamper-evident · no blockchain</div>
+  <h1>Prove where your data<br>came from. <span class="accent">Forever.</span></h1>
+  <p class="sub">Seal a file with post-quantum cryptography, notarize it in an append-only
+    tamper-evident log, and hand anyone a portable receipt they can verify offline —
+    even after it crossed a link that dropped half the packets.</p>
+  <div class="cta">
+    <a class="btn primary" href="#how">See how it works →</a>
+    <a class="btn ghost" href="../docs/PROVENANCE_CLI.md">Read the docs</a>
+    <a class="btn ghost" href="../examples/custody_demo.sh">Run the demo</a>
+  </div>
+  <p class="note">Reference implementation · real FIPS&nbsp;203 / 204 crypto · 1,500+ tests</p>
+
+  <div class="term">
+    <div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>etp-custody</span></div>
+<pre><span class="c-cm"># sender: seal + notarize + device-sign + erasure-bundle (any 4 of 6 shards reconstruct)</span>
+<span class="c-prompt">$</span> <span class="c-cmd">etp-custody send ./notary</span> <span class="c-flag">--in</span> <span class="c-str">report.pdf</span> <span class="c-flag">--to</span> <span class="c-str">bob.pub</span> \
+    <span class="c-flag">--originator</span> <span class="c-str">sensor-7</span> <span class="c-flag">--originator-key</span> <span class="c-str">sensor7.key</span> <span class="c-flag">--n</span> <span class="c-str">6</span> <span class="c-flag">--k</span> <span class="c-str">4</span>
+<span class="c-ok">✓ sent 'report.pdf' — sealed, notarized, and erasure-bundled</span>
+<span class="c-out">    originator : sensor-7  (device-signed ✓)</span>
+<span class="c-out">    shards     : 6 (any 4 reconstruct; tolerates losing 2)</span>
+
+<span class="c-cm"># ...transport over a lossy link — two shards never arrive...</span>
+
+<span class="c-cm"># receiver: reassemble + verify (both keys pinned) + open — fails closed</span>
+<span class="c-prompt">$</span> <span class="c-cmd">etp-custody receive</span> <span class="c-flag">--key</span> <span class="c-str">bob.key</span> <span class="c-flag">--operator</span> <span class="c-str">op.pub</span> <span class="c-flag">--expect-originator</span> <span class="c-str">sensor7.pub</span> …
+<span class="c-ok">✓ received → report.pdf  (from 4 shards, needed 4/6)</span>
+<span class="c-out">    provenance : VERIFIED · operator PINNED · device PINNED</span></pre>
+  </div>
+</div></header>
+
+<section id="pillars"><div class="wrap">
+  <p class="eyebrow">What it guarantees</p>
+  <h2>Four properties, one artifact</h2>
+  <p class="lead">Each is individually well-understood. The product is the fusion — no
+    open-source project or vendor ships all four as one verifiable custody workflow.</p>
+  <div class="grid">
+    <div class="card">
+      <div class="ic">🔒</div><h3>Post-quantum confidentiality</h3>
+      <p>Sealed with ML-KEM-768 + XChaCha20-Poly1305 at a <b>constant 1&nbsp;KB overhead</b>,
+         independent of payload size — the harvest-now-decrypt-later defense for data that
+         must stay secret for decades.</p>
+      <span class="k">seal · send</span>
+    </div>
+    <div class="card">
+      <div class="ic">📜</div><h3>Tamper-evident provenance</h3>
+      <p>Every capture is notarized into an RFC-6962 append-only Merkle log. Portable receipts
+         prove <b>inclusion</b>; <code>audit</code> proves <b>consistency</b> — the notary never
+         rewrote or forked history.</p>
+      <span class="k">verify · audit · inspect</span>
+    </div>
+    <div class="card">
+      <div class="ic">✍️</div><h3>Two-party authenticity</h3>
+      <p>The <b>notary</b> signs "it's in my log"; the <b>capturing device</b> signs "I captured
+         this content, at this time." Pin either or both — an attacker's own log is rejected.</p>
+      <span class="k">--operator · --expect-originator</span>
+    </div>
+    <div class="card">
+      <div class="ic">🛰️</div><h3>Delay-tolerant transport</h3>
+      <p>Erasure-coded into <i>n</i> shards, <b>any <i>k</i> reconstruct</b>. Spray them over a
+         satellite pass, tactical mesh, or data mule — no ARQ round-trip. Lose a third and still
+         recover, byte-identical.</p>
+      <span class="k">bundle · reassemble</span>
+    </div>
+  </div>
+</div></section>
+
+<section id="how"><div class="wrap">
+  <p class="eyebrow">The flow</p>
+  <h2>Send. Transport. Receive.</h2>
+  <p class="lead">Two commands wrap the whole pipeline. The reassembled blob is byte-identical,
+     so the same receipt verifies it — provenance is untouched by the lossy transport.</p>
+  <div class="flow">
+    <div class="step"><b>send</b><span>seal · notarize · device-sign · erasure-bundle</span></div>
+    <div class="arw">→</div>
+    <div class="step"><b>lossy link</b><span>satellite pass · mesh · data mule — shards drop</span></div>
+    <div class="arw">→</div>
+    <div class="step"><b>receive</b><span>reassemble · verify (pinned) · open</span></div>
+  </div>
+  <div class="closed">⚠ <b>Fails closed.</b> <code>receive</code> never writes plaintext if provenance
+     doesn't verify — a wrong key, a tampered shard, or a forged receipt yields no output, not bad output.</div>
+</div></section>
+
+<section id="commands"><div class="wrap">
+  <p class="eyebrow">Command surface</p>
+  <h2>A complete CLI</h2>
+  <table>
+    <tr><th>Command</th><th>Purpose</th></tr>
+    <tr><td class="cmd">keygen · pub</td><td class="desc">Generate post-quantum keypairs; export shareable public keys</td></tr>
+    <tr><td class="cmd">init · log</td><td class="desc">Stand up and inspect an append-only notary</td></tr>
+    <tr><td class="cmd">send · receive</td><td class="desc">One-shot sealed + bundled custody, fail-closed on receive</td></tr>
+    <tr><td class="cmd">batch-send · batch-receive</td><td class="desc">Ship a whole directory under one append-only log</td></tr>
+    <tr><td class="cmd">bundle · reassemble</td><td class="desc">Erasure-code / reconstruct across a lossy link</td></tr>
+    <tr><td class="cmd">verify · inspect · audit</td><td class="desc">Inclusion + structural triage + append-only consistency</td></tr>
+  </table>
+</div></section>
+
+<section><div class="wrap">
+  <p class="eyebrow">Grounded, not vaporware</p>
+  <h2>Real crypto, real coverage</h2>
+  <div class="stats">
+    <div class="stat"><b>~1&nbsp;KB</b><span>constant PQC seal overhead, any payload size</span></div>
+    <div class="stat"><b>k&nbsp;of&nbsp;n</b><span>erasure coding — survive lossy, disconnected links</span></div>
+    <div class="stat"><b>1,500+</b><span>tests passing, real FIPS 203/204 backends</span></div>
+    <div class="stat"><b>0</b><span>blockchains required — RFC-6962 transparency log</span></div>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <div class="row">
+    <div>
+      <div class="brand" style="margin-bottom:8px"><span class="glyph">⛨</span> ETP&nbsp;Custody</div>
+      Built on the Entanglement Transfer Protocol. Reference implementation —
+      production builds swap in liboqs / raptorq / a hosted transparency log.
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end">
+      <span class="pill">post-quantum</span>
+      <span class="pill">tamper-evident</span>
+      <span class="pill">delay-tolerant</span>
+      <span class="pill">no-blockchain</span>
+    </div>
+  </div>
+</div></footer>
+
+</body>
+</html>

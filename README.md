@@ -16,6 +16,38 @@
 
 ---
 
+## 🛡️ `etp-custody` — post-quantum chain of custody (product)
+
+Built on ETP's core: a working CLI that **seals a file, notarizes it in a
+tamper-evident log, and hands you a portable receipt anyone can verify
+offline** — post-quantum, no blockchain, and delay-tolerant over lossy links.
+
+```bash
+pip install -e ".[crypto]"                    # real ML-KEM-768 / ML-DSA-65 / XChaCha20
+bash examples/custody_demo.sh                  # watch the whole story run end to end
+```
+
+```bash
+# seal + notarize + device-sign + erasure-bundle, then verify offline
+etp-custody send ./notary --in report.pdf --to bob.pub \
+    --originator sensor-7 --originator-key sensor7.key --n 6 --k 4 --prefix parcel
+etp-custody receive --key bob.key --bundle parcel.bundle --receipt parcel.receipt \
+    --out report.pdf --operator op.pub --expect-originator sensor7.pub  parcel.shard*
+```
+
+**Confidentiality** (constant-overhead PQC seal) · **Provenance** (RFC-6962
+inclusion + consistency) · **Authenticity** (operator + device signatures) ·
+**Delay-tolerance** (erasure-coded shards, any *k* of *n* reconstruct).
+
+→ Full guide: [`docs/PROVENANCE_CLI.md`](docs/PROVENANCE_CLI.md) ·
+Landing page: [`website/index.html`](website/index.html)
+
+<div align="center"><a href="website/index.html">
+<img src="website/preview.png" alt="ETP Custody landing page" width="760">
+</a></div>
+
+---
+
 ## The Problem
 
 Every existing protocol -- TCP/IP, HTTP, FTP, QUIC -- operates on the same
