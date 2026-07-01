@@ -15,6 +15,10 @@ requires-python = ">=3.10"
 #   pynacl   → XChaCha20-Poly1305 (libsodium)
 dependencies = []
 
+[project.scripts]
+# The etp-custody product CLI. Requires the [crypto] extra for real PQC.
+etp-custody = "ltp.provenance_cli:main"
+
 [project.optional-dependencies]
 performance = [
     "blake3>=0.3.0",

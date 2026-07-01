@@ -48,6 +48,7 @@ Typical flow:
 
 from __future__ import annotations
 
+import base64
 import json
 import struct
 import time
@@ -57,7 +58,21 @@ from .keypair import KeyPair, SealedBox
 from .primitives import H_bytes, AEAD, MLKEM
 from .merkle_log import MerkleLog, SignedTreeHead, InclusionProof
 
-__all__ = ["CaptureManifest", "SealedCapture", "ProvenanceLog", "SEAL_OVERHEAD"]
+__all__ = [
+    "CaptureManifest",
+    "SealedCapture",
+    "ProvenanceLog",
+    "ProvenanceReceipt",
+    "SEAL_OVERHEAD",
+]
+
+
+def _b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
+
+
+def _b64d(s: str) -> bytes:
+    return base64.b64decode(s.encode("ascii"))
 
 # Constant byte overhead of a SealedBox seal, independent of plaintext size:
 #   ML-KEM ciphertext (1088) + AEAD nonce (16) + AEAD tag (32) = 1136 bytes.
@@ -114,6 +129,27 @@ class CaptureManifest:
             + _lp(meta_json)
         )
 
+    def to_dict(self) -> dict:
+        return {
+            "capture_id": self.capture_id,
+            "originator_id": self.originator_id,
+            "captured_at": self.captured_at,
+            "content_hash": _b64e(self.content_hash),
+            "sealed_hash": _b64e(self.sealed_hash),
+            "meta": self.meta,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CaptureManifest":
+        return cls(
+            capture_id=d["capture_id"],
+            originator_id=d["originator_id"],
+            captured_at=d["captured_at"],
+            content_hash=_b64d(d["content_hash"]),
+            sealed_hash=_b64d(d["sealed_hash"]),
+            meta=d.get("meta", {}),
+        )
+
 
 @dataclass(frozen=True)
 class SealedCapture:
@@ -141,6 +177,27 @@ class ProvenanceLog:
     def __init__(self, operator: KeyPair) -> None:
         self._operator = operator
         self._log = MerkleLog(operator.vk, operator.sk)
+
+    # ------------------------------------------------------------------
+    # Persistence support (rebuild a notary log from stored manifests)
+    # ------------------------------------------------------------------
+
+    def append_manifest(self, manifest: CaptureManifest) -> int:
+        """
+        Re-append a previously recorded manifest during log reconstruction.
+
+        Used when loading a persisted notary: replaying the stored manifests in
+        order rebuilds the exact same Merkle tree (append is deterministic),
+        without needing the original plaintext or re-sealing anything.
+        """
+        return self._log.append(manifest.canonical_bytes())
+
+    def restore_sequence(self, next_sequence: int) -> None:
+        """
+        Restore the STH sequence counter after reload so newly published STHs
+        continue monotonically from where the persisted log left off.
+        """
+        self._log._sequence = next_sequence
 
     # ------------------------------------------------------------------
     # Recording
@@ -251,6 +308,136 @@ class ProvenanceLog:
                 "artifact and provenance record disagree"
             )
         return plaintext
+
+
+@dataclass(frozen=True)
+class ProvenanceReceipt:
+    """
+    A self-contained, portable proof of custody for one capture.
+
+    A receipt bundles everything a third party needs to verify a capture —
+    the manifest, the O(log N) inclusion proof, and the operator's signed tree
+    head — into one JSON-serializable object. Given a receipt plus the sealed
+    blob it refers to, ANYONE can confirm authenticity and non-tampering with
+    no access to the log, the plaintext, or any secret key:
+
+        receipt = ProvenanceReceipt.from_json(open("capture.receipt").read())
+        assert receipt.verify(open("capture.sealed", "rb").read())
+
+    This is the product's deliverable artifact: hand a customer a `.sealed` file
+    and a `.receipt`, and they can prove provenance offline, forever.
+    """
+
+    manifest: CaptureManifest
+    # inclusion proof
+    leaf_index: int
+    tree_size: int
+    audit_path: list  # list[bytes]
+    proof_root: bytes
+    # signed tree head
+    sth_sequence: int
+    sth_tree_size: int
+    sth_timestamp: float
+    sth_root: bytes
+    operator_vk: bytes
+    sth_signature: bytes
+
+    @classmethod
+    def build(
+        cls,
+        manifest: CaptureManifest,
+        proof: InclusionProof,
+        sth: SignedTreeHead,
+    ) -> "ProvenanceReceipt":
+        return cls(
+            manifest=manifest,
+            leaf_index=proof.leaf_index,
+            tree_size=proof.tree_size,
+            audit_path=list(proof.audit_path),
+            proof_root=proof.root_hash,
+            sth_sequence=sth.sequence,
+            sth_tree_size=sth.tree_size,
+            sth_timestamp=sth.timestamp,
+            sth_root=sth.root_hash,
+            operator_vk=sth.operator_vk,
+            sth_signature=sth.signature,
+        )
+
+    def inclusion_proof(self) -> InclusionProof:
+        return InclusionProof(
+            leaf_index=self.leaf_index,
+            tree_size=self.tree_size,
+            audit_path=list(self.audit_path),
+            root_hash=self.proof_root,
+        )
+
+    def signed_tree_head(self) -> SignedTreeHead:
+        return SignedTreeHead(
+            sequence=self.sth_sequence,
+            tree_size=self.sth_tree_size,
+            timestamp=self.sth_timestamp,
+            root_hash=self.sth_root,
+            operator_vk=self.operator_vk,
+            signature=self.sth_signature,
+        )
+
+    def verify(self, sealed: bytes) -> bool:
+        """
+        Verify this receipt against the sealed blob it refers to.
+
+        True iff the operator's STH signature is valid, the sealed blob matches
+        the manifest, and the manifest is included under the attested root.
+        """
+        return ProvenanceLog.verify_capture(
+            self.manifest, sealed, self.inclusion_proof(), self.signed_tree_head()
+        )
+
+    # -- serialization ------------------------------------------------
+
+    def to_dict(self) -> dict:
+        return {
+            "format": "etp-provenance-receipt/1",
+            "manifest": self.manifest.to_dict(),
+            "inclusion_proof": {
+                "leaf_index": self.leaf_index,
+                "tree_size": self.tree_size,
+                "audit_path": [_b64e(h) for h in self.audit_path],
+                "root": _b64e(self.proof_root),
+            },
+            "signed_tree_head": {
+                "sequence": self.sth_sequence,
+                "tree_size": self.sth_tree_size,
+                "timestamp": self.sth_timestamp,
+                "root": _b64e(self.sth_root),
+                "operator_vk": _b64e(self.operator_vk),
+                "signature": _b64e(self.sth_signature),
+            },
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ProvenanceReceipt":
+        ip = d["inclusion_proof"]
+        sth = d["signed_tree_head"]
+        return cls(
+            manifest=CaptureManifest.from_dict(d["manifest"]),
+            leaf_index=ip["leaf_index"],
+            tree_size=ip["tree_size"],
+            audit_path=[_b64d(h) for h in ip["audit_path"]],
+            proof_root=_b64d(ip["root"]),
+            sth_sequence=sth["sequence"],
+            sth_tree_size=sth["tree_size"],
+            sth_timestamp=sth["timestamp"],
+            sth_root=_b64d(sth["root"]),
+            operator_vk=_b64d(sth["operator_vk"]),
+            sth_signature=_b64d(sth["signature"]),
+        )
+
+    @classmethod
+    def from_json(cls, s: str) -> "ProvenanceReceipt":
+        return cls.from_dict(json.loads(s))
 
 
 def _consteq(a: bytes, b: bytes) -> bool:
