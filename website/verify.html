@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verify a receipt — ETP Custody</title>
+<meta name="description" content="Verify an etp-custody receipt in your browser. The file never leaves your machine.">
+<script src="verify.js"></script>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#111826; --line:#1e293b; --ink:#e6edf3; --dim:#8b98a9;
+    --faint:#5b6675; --teal:#2dd4bf; --violet:#a78bfa; --grn:#34d399; --red:#f87171;
+    --amber:#fbbf24;
+    --mono:'SF Mono',ui-monospace,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,#12203a 0%,transparent 60%),var(--bg);
+       color:var(--ink);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:var(--teal);text-decoration:none}
+  .wrap{max-width:860px;margin:0 auto;padding:0 24px}
+  nav{position:sticky;top:0;z-index:10;backdrop-filter:blur(10px);
+      background:rgba(10,14,20,.72);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700}
+  .brand .glyph{width:26px;height:26px;border-radius:7px;
+    background:linear-gradient(135deg,var(--teal),var(--violet));display:grid;place-items:center;
+    color:#04121a;font-weight:800;font-size:15px}
+  header{padding:52px 0 8px}
+  h1{font-size:clamp(28px,4.5vw,40px);margin:0 0 10px;letter-spacing:-.8px}
+  .sub{color:var(--dim);max-width:640px;margin:0 0 8px}
+  .privacy{display:inline-flex;gap:8px;align-items:center;font-size:12.5px;color:var(--teal);
+    border:1px solid #14352f;background:#0c1b18;border-radius:999px;padding:5px 12px;margin:8px 0 24px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;margin-bottom:18px}
+  .card h2{margin:0 0 6px;font-size:16px}
+  .card p.hint{margin:0 0 14px;color:var(--faint);font-size:13px}
+  textarea{width:100%;min-height:140px;background:#0b111b;border:1px solid var(--line);
+    border-radius:10px;color:var(--ink);font-family:var(--mono);font-size:12.5px;padding:12px;resize:vertical}
+  .drop{border:1.5px dashed #2b3a52;border-radius:10px;padding:26px;text-align:center;color:var(--dim);
+    cursor:pointer;transition:border-color .15s, background .15s}
+  .drop.armed{border-color:var(--teal);background:#0c1b18;color:var(--ink)}
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:11px 20px;border-radius:10px;font-weight:600;
+    font-size:14.5px;border:none;cursor:pointer;background:linear-gradient(135deg,var(--teal),#22b8a6);color:#04121a}
+  .btn:disabled{opacity:.4;cursor:not-allowed}
+  .checks{list-style:none;margin:14px 0 0;padding:0;font-size:14.5px}
+  .checks li{display:flex;gap:10px;align-items:baseline;padding:7px 0;border-bottom:1px solid #16202f}
+  .checks li:last-child{border-bottom:none}
+  .ok{color:var(--grn);font-weight:700}
+  .bad{color:var(--red);font-weight:700}
+  .skip{color:var(--amber);font-weight:700}
+  .why{color:var(--faint);font-size:12.5px;margin-left:auto;text-align:right;max-width:46%}
+  .verdict{margin-top:16px;padding:14px 18px;border-radius:10px;font-weight:700;display:none}
+  .verdict.pass{display:block;background:#0c1f18;border:1px solid #1a4d3c;color:var(--grn)}
+  .verdict.fail{display:block;background:#231012;border:1px solid #5b2a2e;color:var(--red)}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .row input{flex:1;min-width:200px;background:#0b111b;border:1px solid var(--line);border-radius:10px;
+    color:var(--ink);font-family:var(--mono);font-size:12.5px;padding:10px 12px}
+  details{margin-top:8px;color:var(--dim);font-size:13.5px}
+  summary{cursor:pointer;color:var(--teal)}
+  footer{color:var(--faint);font-size:13px;padding:24px 0 48px}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <div class="brand"><span class="glyph">⛨</span> ETP&nbsp;Custody</div>
+  <a href="index.html">← home</a>
+</div></nav>
+
+<header><div class="wrap">
+  <h1>Verify a receipt</h1>
+  <p class="sub">Drop a sealed blob and its receipt (or in-toto attestation). Hashing and the
+     Merkle inclusion proof run <b>in your browser</b>; post-quantum signature checks are
+     delegated to a notary endpoint or the CLI.</p>
+  <div class="privacy">🔒 your file never leaves this page — only hashes are computed locally</div>
+</div></header>
+
+<div class="wrap">
+  <div class="card">
+    <h2>1 · Receipt or attestation</h2>
+    <p class="hint">Paste the contents of <span style="font-family:var(--mono)">*.receipt</span> or
+       <span style="font-family:var(--mono)">*.intoto.json</span>, or drop the file below.</p>
+    <textarea id="receipt" placeholder='{"format": "etp-provenance-receipt/1", …}' spellcheck="false"></textarea>
+  </div>
+
+  <div class="card">
+    <h2>2 · Sealed blob</h2>
+    <p class="hint">The <span style="font-family:var(--mono)">*.sealed</span> file the receipt refers to.</p>
+    <div class="drop" id="drop">drop the sealed file here, or click to choose</div>
+    <input type="file" id="file" hidden>
+  </div>
+
+  <div class="card">
+    <h2>3 · Verify</h2>
+    <p class="hint">Optional: a notary URL enables the post-quantum signature checks
+       (only the public receipt is sent — never your file).</p>
+    <div class="row" style="margin-bottom:14px">
+      <input id="notary" placeholder="https://notary.example.com  (optional — for signature checks)">
+    </div>
+    <button class="btn" id="go" disabled>Verify</button>
+    <ul class="checks" id="checks" style="display:none"></ul>
+    <div class="verdict" id="verdict"></div>
+    <details>
+      <summary>What do these checks mean?</summary>
+      In-browser: the sealed file's SHA3-256 must match the notarized manifest, and the
+      manifest must reconstruct the log root via its RFC-6962 inclusion proof. Via notary
+      (or the CLI): the operator's ML-DSA-65 signature over that root, and the capturing
+      device's signature if present. For a fully offline, fully post-quantum verification —
+      including operator/device key pinning — use
+      <span style="font-family:var(--mono)">etp-custody verify</span>.
+    </details>
+  </div>
+
+  <div class="card">
+    <h2>On-chain anchor (optional)</h2>
+    <p class="hint">If this capture's tree head was anchored, check the registry directly
+       from your browser via any RPC endpoint — read-only, no wallet needed.</p>
+    <div class="row">
+      <input id="rpc" placeholder="RPC URL (e.g. GSX testnet endpoint)">
+      <input id="contract" value="0xB29d8BFF4973D1D7bcB10E32112EBB8fdd530bF4" title="LTPAnchorRegistry proxy">
+      <input id="digest" placeholder="anchor digest (hex or base64, from /v1/anchors)">
+    </div>
+    <button class="btn" id="chain" style="margin-top:12px">Check isAnchored</button>
+    <div class="verdict" id="chainverdict"></div>
+  </div>
+
+  <footer>Full offline verification: <span style="font-family:var(--mono)">pip install "ltp[crypto]" && etp-custody verify FILE</span></footer>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let sealedBytes = null;
+
+  // ---- inputs
+  const arm = () => { $("go").disabled = !(sealedBytes && $("receipt").value.trim()); };
+  $("receipt").addEventListener("input", arm);
+  $("drop").addEventListener("click", () => $("file").click());
+  $("file").addEventListener("change", (e) => loadFile(e.target.files[0]));
+  ["dragover", "dragleave", "drop"].forEach((ev) =>
+    $("drop").addEventListener(ev, (e) => { e.preventDefault();
+      $("drop").classList.toggle("armed", ev !== "dragleave"); }));
+  $("drop").addEventListener("drop", (e) => loadFile(e.dataTransfer.files[0]));
+
+  async function loadFile(f) {
+    if (!f) return;
+    sealedBytes = new Uint8Array(await f.arrayBuffer());
+    $("drop").textContent = `${f.name} — ${sealedBytes.length.toLocaleString()} bytes ✓`;
+    $("drop").classList.add("armed");
+    arm();
+  }
+
+  function parseReceipt(text) {
+    const obj = JSON.parse(text);
+    if (obj._type && obj.predicate && obj.predicate.receipt) return obj.predicate.receipt; // in-toto
+    return obj;
+  }
+
+  const row = (label, state, why) => {
+    const mark = state === true ? '<span class="ok">✓</span>'
+               : state === false ? '<span class="bad">✗</span>'
+               : '<span class="skip">◌</span>';
+    return `<li>${mark} ${label} <span class="why">${why || ""}</span></li>`;
+  };
+
+  // ---- verify
+  $("go").addEventListener("click", async () => {
+    const checks = $("checks"), verdict = $("verdict");
+    checks.style.display = "block";
+    let receipt;
+    try { receipt = parseReceipt($("receipt").value); }
+    catch { checks.innerHTML = row("receipt parses", false, "not valid JSON");
+            verdict.className = "verdict fail"; verdict.textContent = "FAIL — malformed receipt"; return; }
+
+    let r;
+    try { r = verifyReceipt(receipt, sealedBytes); }
+    catch (e) { checks.innerHTML = row("receipt structure", false, e.message);
+                verdict.className = "verdict fail"; verdict.textContent = "FAIL — malformed receipt"; return; }
+
+    let html =
+      row("sealed file matches the notarized manifest", r.sealedHashOk, "SHA3-256, computed locally") +
+      row("manifest is in the log (inclusion proof → root)", r.proofOk, "RFC 6962, computed locally") +
+      row("proof root matches the signed tree head", r.rootMatchesSth, "");
+
+    // signature checks via notary, if provided
+    let sigOk = null, devOk = null, sigWhy = "provide a notary URL, or use the CLI";
+    const notary = $("notary").value.trim();
+    if (notary) {
+      try {
+        const resp = await fetch(notary.replace(/\/$/, "") + "/v1/verify", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(receipt),
+        });
+        const body = await resp.json();
+        sigOk = body.sth_signature_valid;
+        devOk = body.originator_signature_valid;
+        sigWhy = "ML-DSA-65, checked by the notary";
+      } catch { sigOk = null; sigWhy = "notary unreachable — use the CLI"; }
+    }
+    html += row("operator signature over the tree head", sigOk, sigWhy);
+    html += row("capturing-device signature", r.deviceSigned ? devOk : null,
+                r.deviceSigned ? sigWhy : "capture is operator-vouched only");
+    checks.innerHTML = html;
+
+    const pass = r.structuralOk && sigOk !== false && devOk !== false;
+    verdict.className = "verdict " + (pass ? "pass" : "fail");
+    verdict.textContent = pass
+      ? (sigOk === true ? "PASS — provenance verified"
+                        : "PASS (structural) — signatures unchecked; run the CLI for full verification")
+      : "FAIL — this file does not match its custody record";
+  });
+
+  // ---- on-chain
+  $("chain").addEventListener("click", async () => {
+    const out = $("chainverdict");
+    try {
+      let d = $("digest").value.trim();
+      const bytes = /^(0x)?[0-9a-fA-F]{64}$/.test(d)
+        ? Uint8Array.from(d.replace(/^0x/, "").match(/../g).map((h) => parseInt(h, 16)))
+        : b64d(d);
+      const anchored = await isAnchoredOnChain($("rpc").value.trim(), $("contract").value.trim(), bytes);
+      out.className = "verdict " + (anchored ? "pass" : "fail");
+      out.textContent = anchored ? "ANCHORED — digest found in LTPAnchorRegistry"
+                                 : "not anchored (yet) — digest not found on-chain";
+    } catch (e) {
+      out.className = "verdict fail";
+      out.textContent = "RPC error: " + e.message;
+    }
+  });
+})();
+</script>
+</body>
+</html>

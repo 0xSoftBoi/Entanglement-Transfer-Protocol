@@ -1,0 +1,49 @@
+# ETP Custody Cloud — production-shaped local stack.
+#
+#   ETP_CLOUD_ADMIN_TOKEN=… docker compose up --build
+#
+# Three services: Postgres, the FastAPI notary (uvicorn), and the background
+# worker (anchoring + webhook outbox). Anchoring stays off until the GSX env
+# vars are provided (see .env.example / worker docstring).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: custody
+      POSTGRES_PASSWORD: custody
+      POSTGRES_DB: custody
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U custody"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    command: uvicorn ltp.cloud.api:app --host 0.0.0.0 --port 8080
+    environment:
+      ETP_CLOUD_DB: postgresql://custody:custody@postgres/custody
+      ETP_CLOUD_ADMIN_TOKEN: ${ETP_CLOUD_ADMIN_TOKEN:?set ETP_CLOUD_ADMIN_TOKEN}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python -m ltp.cloud.worker
+    environment:
+      ETP_CLOUD_DB: postgresql://custody:custody@postgres/custody
+      ETP_CLOUD_WORKER_INTERVAL: "600"
+      # Enable on-chain anchoring by providing:
+      #   GSX_RPC_URL, GSX_DEPLOYER_KEY, ANCHOR_CONTRACT (registry proxy)
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

@@ -15,8 +15,9 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
 
-# Real post-quantum crypto is required for the service (keys must be portable).
-RUN pip install --no-cache-dir ".[crypto]"
+# Real post-quantum crypto is required for the service (keys must be portable);
+# the cloud extra adds the FastAPI/uvicorn/psycopg production stack.
+RUN pip install --no-cache-dir ".[crypto,cloud]"
 
 ENV ETP_CLOUD_HOST=0.0.0.0 \
     ETP_CLOUD_PORT=8080 \

@@ -35,13 +35,14 @@ import hmac
 import json
 import os
 import threading
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from ..keypair import KeyPair
 from ..encoding import b64e
 from ..provenance import ProvenanceLog, ProvenanceReceipt, CaptureManifest
+from ..anchor.client import TokenBucketRateLimiter
 from .store import CloudStore
+from .webhooks import WebhookDispatcher
 
 __all__ = ["CloudNotaryService", "make_cloud_server", "main"]
 
@@ -54,11 +55,20 @@ class CloudNotaryService:
         admin_token: str,
         operator: KeyPair | None = None,
         sync_webhooks: bool = False,
+        rate_per_minute: float | None = 300.0,
+        witness: KeyPair | None = None,
     ) -> None:
         self._store = store
         self._operator = operator or store.get_or_create_operator()
         self._admin_token = admin_token
         self._sync_webhooks = sync_webhooks
+        self._dispatcher = WebhookDispatcher(store)
+        self._witness = None
+        if witness is not None:
+            from .witness import Witness
+            self._witness = Witness(witness)
+        self._rate_per_minute = rate_per_minute
+        self._limiters: dict[str, TokenBucketRateLimiter] = {}
         self._logs: dict[str, ProvenanceLog] = {}
         self._lock = threading.Lock()
 
@@ -95,10 +105,33 @@ class CloudNotaryService:
     def admin_authorized(self, token: str | None) -> bool:
         return bool(token) and hmac.compare_digest(token, self._admin_token)
 
-    def submit(self, tenant_id: str, manifest: CaptureManifest) -> ProvenanceReceipt:
-        """Append to the tenant's log, publish an STH, persist both, notify."""
+    def rate_ok(self, api_key: str) -> bool:
+        """Per-key token bucket (burst = 1 minute's allowance)."""
+        if self._rate_per_minute is None:
+            return True
+        limiter = self._limiters.get(api_key)
+        if limiter is None:
+            limiter = self._limiters.setdefault(api_key, TokenBucketRateLimiter(
+                max_tps=self._rate_per_minute / 60.0,
+                burst=max(1, int(self._rate_per_minute))))
+        return limiter.acquire(timeout=0)
+
+    def submit(self, tenant_id: str, manifest: CaptureManifest) -> tuple[ProvenanceReceipt, bool]:
+        """
+        Notarize a manifest. Idempotent on capture_id: resubmitting an
+        already-notarized capture returns a fresh receipt for the existing
+        leaf (proof + STH against the current tree) without re-appending or
+        re-metering. Returns (receipt, created).
+        """
         with self._lock:
             log = self._log(tenant_id)
+            existing = self._store.leaf_for_capture_id(tenant_id, manifest.capture_id)
+            if existing is not None:
+                # Persisted STH matches the current tree (every append publishes
+                # one), and survives restarts where the in-memory list doesn't.
+                sth = self._store.latest_sth(tenant_id)
+                return ProvenanceReceipt.build(
+                    manifest, log.inclusion_proof(existing), sth), False
             idx = log.append_manifest(manifest)
             sth = log.publish_sth()
             proof = log.inclusion_proof(idx)
@@ -112,7 +145,7 @@ class CloudNotaryService:
             "leaf_index": idx,
             "sth_sequence": sth.sequence,
         })
-        return receipt
+        return receipt, True
 
     def inclusion_proof(self, tenant_id: str, index: int):
         with self._lock:
@@ -121,14 +154,65 @@ class CloudNotaryService:
     def latest_sth(self, tenant_id: str):
         return self._store.latest_sth(tenant_id)
 
+    def sth_response(self, tenant_id: str) -> dict | None:
+        """The /v1/sth payload: STH dict + witness cosignature when configured."""
+        sth = self._store.latest_sth(tenant_id)
+        if sth is None:
+            return None
+        out = sth.to_dict()
+        if self._witness is not None:
+            out["cosignature"] = self._witness.cosign(sth).to_dict()
+        return out
+
+    def captures(self, tenant_id: str, limit: int = 50) -> list[dict]:
+        """Recent captures (public manifest metadata) for the console."""
+        manifests = self._store.manifests(tenant_id)
+        out = [{
+            "leaf_index": i,
+            "capture_id": m.capture_id,
+            "originator_id": m.originator_id,
+            "captured_at": m.captured_at,
+            "device_signed": bool(m.originator_vk),
+        } for i, m in enumerate(manifests)]
+        return out[-limit:][::-1]   # newest first
+
+    def set_plan(self, tenant_id: str, plan: str) -> bool:
+        if plan not in ("free", "pro", "verified"):
+            raise ValueError(f"unknown plan: {plan!r}")
+        return self._store.set_plan(tenant_id, plan)
+
     def usage(self, tenant_id: str) -> int:
         return self._store.usage(tenant_id)
 
     def anchors(self, tenant_id: str) -> list[dict]:
         rows = self._store.anchors(tenant_id=tenant_id)
         return [{k: r[k] for k in
-                 ("sth_sequence", "root", "digest", "status", "tx_ref", "updated_at")}
+                 ("sth_sequence", "root", "digest", "status", "tx_ref",
+                  "block_number", "updated_at")}
                 for r in rows]
+
+    @staticmethod
+    def verify_receipt_signatures(receipt: ProvenanceReceipt) -> dict:
+        """
+        Server-assisted verification for the browser verifier: the ML-DSA
+        checks that can't reasonably run in hand-written JS. Receipts are
+        public data, so this endpoint needs no auth — and the caller is told
+        the operator vk so it can compare against its own pinned copy.
+        """
+        from ..primitives import MLDSA
+        m = receipt.manifest
+        sth_ok = receipt.sth.verify()
+        proof_ok = receipt.proof.verify(m.canonical_bytes(), receipt.sth.root_hash)
+        device_ok = None
+        if m.originator_vk:
+            device_ok = MLDSA.verify(
+                m.originator_vk, m.originator_signed_payload(), m.originator_sig)
+        return {
+            "sth_signature_valid": sth_ok,
+            "inclusion_proof_valid": proof_ok,
+            "originator_signature_valid": device_ok,   # null when not device-signed
+            "operator_vk": b64e(receipt.sth.operator_vk),
+        }
 
     def on_anchor_confirmed(self, tenant_id: str, anchor_row: dict) -> None:
         """Wire this as AnchorWorker(on_confirmed=service.on_anchor_confirmed)."""
@@ -142,28 +226,20 @@ class CloudNotaryService:
         })
 
     # ------------------------------------------------------------------
-    # Webhooks (best-effort; production uses a persistent outbox + retries)
+    # Webhooks — persistent outbox (crash-safe, retried, HMAC-signed).
+    # Events are enqueued transactionally at emit time; a WebhookDispatcher
+    # drains them (inline in sync mode, on a scheduler in production).
     # ------------------------------------------------------------------
 
     def notify(self, tenant_id: str, payload: dict) -> None:
         tenant = self._store.tenant(tenant_id)
-        url = tenant and tenant.get("webhook_url")
-        if not url:
+        if not (tenant and tenant.get("webhook_url")):
             return
+        self._store.enqueue_event(tenant_id, payload)
         if self._sync_webhooks:
-            self._deliver(url, payload)
+            self._dispatcher.run_once()
         else:
-            threading.Thread(target=self._deliver, args=(url, payload), daemon=True).start()
-
-    @staticmethod
-    def _deliver(url: str, payload: dict) -> None:
-        try:
-            req = urllib.request.Request(
-                url, data=json.dumps(payload).encode("utf-8"), method="POST")
-            req.add_header("Content-Type", "application/json")
-            urllib.request.urlopen(req, timeout=3).read()
-        except Exception:
-            pass  # best-effort delivery; the outbox pattern replaces this in prod
+            threading.Thread(target=self._dispatcher.run_once, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +261,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        # The console/verifier are static pages on any origin; receipts and
+        # manifests are public data and auth is bearer-per-request, so a
+        # permissive CORS policy is safe and required.
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:  # CORS preflight (Authorization header)
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Authorization, Content-Type, X-Admin-Token")
+        self.end_headers()
 
     def _api_key(self) -> str | None:
         auth = self.headers.get("Authorization", "")
@@ -204,6 +292,15 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             return self._send(200, {"status": "ok",
                                     "captures": self.svc._store.total_captures()})
+        if path == "/metrics":
+            from .metrics import render_metrics
+            body = render_metrics(self.svc._store).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/v1/operator":
             return self._send(200, {"operator_vk": b64e(self.svc.operator_vk)})
 
@@ -213,10 +310,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/v1/usage":
             return self._send(200, {"captures": self.svc.usage(tenant)})
         if path == "/v1/sth":
-            sth = self.svc.latest_sth(tenant)
-            if sth is None:
+            payload = self.svc.sth_response(tenant)
+            if payload is None:
                 return self._send(404, {"error": "no captures yet"})
-            return self._send(200, sth.to_dict())
+            return self._send(200, payload)
+        if path == "/v1/captures":
+            return self._send(200, self.svc.captures(tenant))
         if path == "/v1/anchors":
             return self._send(200, self.svc.anchors(tenant))
         if path.startswith("/v1/proof/"):
@@ -229,6 +328,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path == "/v1/verify":
+            # Public: signature checks for the browser verifier (receipts are
+            # public; plaintext/sealed blobs are never sent here).
+            try:
+                receipt = ProvenanceReceipt.from_dict(self._body())
+            except (ValueError, KeyError, TypeError) as e:
+                return self._send(400, {"error": f"malformed receipt ({type(e).__name__})"})
+            return self._send(200, self.svc.verify_receipt_signatures(receipt))
         if path == "/v1/admin/tenants":
             if not self.svc.admin_authorized(self.headers.get("X-Admin-Token")):
                 return self._send(401, {"error": "invalid admin token"})
@@ -239,16 +346,39 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": f"malformed request ({type(e).__name__})"})
             return self._send(201, created)
 
+        if path.startswith("/v1/admin/tenants/") and path.endswith("/plan"):
+            if not self.svc.admin_authorized(self.headers.get("X-Admin-Token")):
+                return self._send(401, {"error": "invalid admin token"})
+            tenant_id = path.split("/")[4]
+            try:
+                ok = self.svc.set_plan(tenant_id, self._body().get("plan", ""))
+            except (ValueError, KeyError, TypeError) as e:
+                return self._send(400, {"error": str(e)})
+            if not ok:
+                return self._send(404, {"error": "unknown tenant"})
+            return self._send(200, {"tenant_id": tenant_id, "plan_updated": True})
+
         if path == "/v1/captures":
-            tenant = self._tenant()
+            key = self._api_key()
+            tenant = self.svc.authorize(key)
             if tenant is None:
                 return self._send(401, {"error": "invalid or missing API key"})
+            if not self.svc.rate_ok(key):
+                self.send_response(429)
+                self.send_header("Retry-After", "1")
+                body = json.dumps({"error": "rate limit exceeded"}).encode()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             try:
                 manifest = CaptureManifest.from_dict(self._body())
             except (ValueError, KeyError, TypeError) as e:
                 return self._send(400, {"error": f"malformed manifest ({type(e).__name__})"})
-            receipt = self.svc.submit(tenant, manifest)
-            return self._send(201, receipt.to_dict())
+            receipt, created = self.svc.submit(tenant, manifest)
+            # 201 on first notarization; 200 on an idempotent replay.
+            return self._send(201 if created else 200, receipt.to_dict())
 
         return self._send(404, {"error": "not found"})
 
@@ -261,13 +391,14 @@ def make_cloud_server(service: CloudNotaryService,
 
 
 def main() -> int:
+    from .store import open_store
     db = os.environ.get("ETP_CLOUD_DB", "custody-cloud.db")
     admin_token = os.environ.get("ETP_CLOUD_ADMIN_TOKEN")
     if not admin_token:
         raise SystemExit("error: set ETP_CLOUD_ADMIN_TOKEN")
     host = os.environ.get("ETP_CLOUD_HOST", "127.0.0.1")
     port = int(os.environ.get("ETP_CLOUD_PORT", "8080"))
-    service = CloudNotaryService(CloudStore(db), admin_token=admin_token)
+    service = CloudNotaryService(open_store(db), admin_token=admin_token)
     httpd = make_cloud_server(service, host, port)
     print(f"etp-custody-cloud listening on http://{host}:{port}  "
           f"(operator {b64e(service.operator_vk)[:16]}…, db {db})")
