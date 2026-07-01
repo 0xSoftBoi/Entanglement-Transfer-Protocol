@@ -130,6 +130,19 @@ def _read_lines(path: Path) -> list[str]:
         return []
     return [line for line in path.read_text().splitlines() if line.strip()]
 
+
+def _collect_shards(paths: list[str]) -> dict[int, bytes]:
+    """Load shard files into {index: bytes}, reading the index from .shardNN names."""
+    shards: dict[int, bytes] = {}
+    for sp in paths:
+        p = Path(sp)
+        m = re.search(r"\.shard(\d+)$", p.name)
+        if not m:
+            print(f"    skipping {p.name} (no .shardNN index in name)")
+            continue
+        shards[int(m.group(1))] = p.read_bytes()
+    return shards
+
 class NotaryStore:
     """A persisted provenance notary: operator key + append-only manifest log."""
 
@@ -346,13 +359,8 @@ def cmd_open(args) -> int:
     return 0
 
 
-def cmd_bundle(args) -> int:
-    sealed = Path(args.inp).read_bytes()
-    try:
-        manifest, shards = bundle_sealed(sealed, args.n, args.k)
-    except ValueError as e:
-        raise SystemExit(f"error: {e}")
-    prefix = Path(args.prefix) if args.prefix else Path(args.inp)
+def _write_bundle(prefix: Path, manifest: BundleManifest, shards: list) -> tuple:
+    """Write the bundle manifest + shard files under `prefix`; return their paths."""
     bundle_path = prefix.with_suffix(prefix.suffix + ".bundle")
     bundle_path.write_text(manifest.to_json())
     shard_paths = []
@@ -360,6 +368,17 @@ def cmd_bundle(args) -> int:
         p = prefix.with_suffix(prefix.suffix + f".shard{idx:03d}")
         p.write_bytes(shard)
         shard_paths.append(p)
+    return bundle_path, shard_paths
+
+
+def cmd_bundle(args) -> int:
+    sealed = Path(args.inp).read_bytes()
+    try:
+        manifest, shards = bundle_sealed(sealed, args.n, args.k)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+    prefix = Path(args.prefix) if args.prefix else Path(args.inp)
+    bundle_path, shard_paths = _write_bundle(prefix, manifest, shards)
     lost_ok = args.n - args.k
     print(f"✓ bundled '{args.inp}' into {args.n} shards (any {args.k} reconstruct)")
     print(f"    tolerates losing any {lost_ok} of {args.n} shards "
@@ -372,14 +391,7 @@ def cmd_bundle(args) -> int:
 
 def cmd_reassemble(args) -> int:
     manifest = BundleManifest.from_json(Path(args.bundle).read_text())
-    shards: dict[int, bytes] = {}
-    for sp in args.shards:
-        p = Path(sp)
-        m = re.search(r"\.shard(\d+)$", p.name)
-        if not m:
-            print(f"    skipping {p.name} (no .shardNN index in name)")
-            continue
-        shards[int(m.group(1))] = p.read_bytes()
+    shards = _collect_shards(args.shards)
     try:
         sealed = reassemble_sealed(manifest, shards)
     except ValueError as e:
@@ -389,6 +401,99 @@ def cmd_reassemble(args) -> int:
     print(f"✓ reassembled {len(sealed)} B → {args.out}  (from {len(shards)} shards, "
           f"needed {manifest.k}/{manifest.n})")
     print("    the reconstructed sealed blob verifies against its receipt as usual")
+    return 0
+
+
+def cmd_send(args) -> int:
+    """One shot: seal + notarize + erasure-bundle, ready to spray over a lossy link."""
+    store = NotaryStore(Path(args.dir))
+    recipient = _read_key(Path(args.to))
+    if not recipient.ek:
+        raise SystemExit("error: recipient key has no encapsulation key")
+    artifact = Path(args.inp).read_bytes()
+
+    originator = None
+    if args.originator_key:
+        originator = _read_key(Path(args.originator_key))
+        if not originator.sk:
+            raise SystemExit("error: --originator-key must be a full (secret) key")
+
+    plog = store.load_log()
+    capture, idx = plog.record_capture(
+        artifact, recipient_ek=recipient.ek, originator_id=args.originator,
+        originator=originator, meta=_parse_meta(args.meta),
+    )
+    sth = plog.publish_sth()
+    receipt = ProvenanceReceipt.build(capture.manifest, plog.inclusion_proof(idx), sth)
+    store.append_record(capture.manifest)
+    store.append_sth(sth)
+
+    try:
+        bundle, shards = bundle_sealed(capture.sealed, args.n, args.k)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+
+    prefix = Path(args.prefix) if args.prefix else Path(args.inp)
+    receipt_path = prefix.with_suffix(prefix.suffix + ".receipt")
+    receipt_path.write_text(receipt.to_json())
+    bundle_path, shard_paths = _write_bundle(prefix, bundle, shards)
+
+    lost_ok = args.n - args.k
+    print(f"✓ sent '{args.inp}' — sealed, notarized, and erasure-bundled")
+    print(f"    capture id : {capture.manifest.capture_id}")
+    print(f"    originator : {args.originator}"
+          + ("  (device-signed ✓)" if originator is not None else "  (operator-vouched only)"))
+    print(f"    shards     : {args.n} (any {args.k} reconstruct; tolerates losing {lost_ok})")
+    print(f"    parcel     : {receipt_path.name}, {bundle_path.name}, "
+          f"{shard_paths[0].name}…{shard_paths[-1].name}")
+    print(f"    → transport the parcel; receiver runs `etp-custody receive`")
+    return 0
+
+
+def cmd_receive(args) -> int:
+    """One shot: reassemble from surviving shards, verify provenance, then open."""
+    recipient = _read_key(Path(args.key))
+    if not recipient.dk:
+        raise SystemExit("error: receiving requires a full (secret) recipient key")
+
+    bundle = BundleManifest.from_json(Path(args.bundle).read_text())
+    shards = _collect_shards(args.shards)
+    try:
+        sealed = reassemble_sealed(bundle, shards)
+    except ValueError as e:
+        print(f"FAIL — reassembly: {e}")
+        return 1
+
+    try:
+        receipt = ProvenanceReceipt.from_json(Path(args.receipt).read_text())
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"FAIL — malformed receipt ({type(e).__name__})")
+        return 1
+
+    expected_vk = _read_key(Path(args.operator)).vk if args.operator else None
+    expected_origin_vk = _read_key(Path(args.expect_originator)).vk if args.expect_originator else None
+
+    # Fail closed: never open a payload whose provenance does not verify.
+    if not receipt.verify(sealed, expected_operator_vk=expected_vk,
+                          expected_originator_vk=expected_origin_vk):
+        print("FAIL — provenance did NOT verify; refusing to open the payload")
+        return 1
+
+    try:
+        plaintext = ProvenanceLog.open_capture(sealed, recipient, receipt.manifest)
+    except ValueError as e:
+        print(f"FAIL — cannot open: {e}")
+        return 1
+
+    Path(args.out).write_bytes(plaintext)
+    m = receipt.manifest
+    print(f"✓ received → {args.out}  ({len(plaintext)} B)")
+    print(f"    reassembled  : from {len(shards)} shards (needed {bundle.k}/{bundle.n})")
+    print(f"    provenance   : VERIFIED"
+          + (f" · operator PINNED" if expected_vk is not None else "")
+          + (f" · device PINNED" if expected_origin_vk is not None else ""))
+    print(f"    originator   : {m.originator_id}"
+          + ("  (device-signed)" if m.originator_vk else "  (operator-vouched)"))
     return 0
 
 
@@ -476,6 +581,28 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--out", required=True, help="output sealed blob")
     r.add_argument("shards", nargs="+", help="shard files (indices read from .shardNN names)")
     r.set_defaults(func=cmd_reassemble)
+
+    sd = sub.add_parser("send", help="one shot: seal + notarize + erasure-bundle a file")
+    sd.add_argument("dir", help="notary directory")
+    sd.add_argument("--in", dest="inp", required=True, help="input file to protect")
+    sd.add_argument("--to", required=True, help="recipient public-key file")
+    sd.add_argument("--originator", required=True, help="originator identifier (e.g. sensor-7)")
+    sd.add_argument("--originator-key", help="capturing device's secret key (sign the capture)")
+    sd.add_argument("--n", type=int, required=True, help="total shards to produce")
+    sd.add_argument("--k", type=int, required=True, help="shards needed to reconstruct (k < n)")
+    sd.add_argument("--prefix", help="output parcel prefix (default: <in>)")
+    sd.add_argument("--meta", action="append", help="key=value metadata (repeatable)")
+    sd.set_defaults(func=cmd_send)
+
+    rc = sub.add_parser("receive", help="one shot: reassemble + verify + open a parcel")
+    rc.add_argument("--key", required=True, help="recipient secret key file")
+    rc.add_argument("--bundle", required=True, help="bundle manifest (.bundle)")
+    rc.add_argument("--receipt", required=True, help="receipt file")
+    rc.add_argument("--out", required=True, help="output plaintext file")
+    rc.add_argument("--operator", help="pin the trusted notary's public key file")
+    rc.add_argument("--expect-originator", help="pin the capturing device's public key file")
+    rc.add_argument("shards", nargs="+", help="shard files (indices from .shardNN names)")
+    rc.set_defaults(func=cmd_receive)
 
     lg = sub.add_parser("log", help="show notary state")
     lg.add_argument("dir", help="notary directory")

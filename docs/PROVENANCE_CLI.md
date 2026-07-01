@@ -56,10 +56,35 @@ etp-custody open --key bob.key --sealed report.sealed --receipt report.receipt -
 etp-custody log ./notary
 ```
 
+## The two-command flow (`send` / `receive`)
+
+For the common case, `send` and `receive` fold the whole pipeline into one
+command each — seal + notarize + bundle on one side, reassemble + verify + open
+on the other. `receive` **fails closed**: it never writes plaintext if
+provenance doesn't verify.
+
+```bash
+# sender: seal + notarize + device-sign + erasure-bundle, all at once
+etp-custody send ./notary --in report.pdf --to bob.pub \
+    --originator sensor-7 --originator-key sensor7.key --n 6 --k 4 --prefix parcel
+#   → parcel.receipt, parcel.bundle, parcel.shard000 … parcel.shard005
+
+# transport the parcel over a lossy/disconnected link (some shards may be lost)
+
+# receiver: reassemble from survivors, verify (pinning both keys), then open
+etp-custody receive --key bob.key --bundle parcel.bundle --receipt parcel.receipt \
+    --out report.pdf --operator op.pub --expect-originator sensor7.pub \
+    parcel.shard000 parcel.shard002 parcel.shard003 parcel.shard005
+```
+
+The step-by-step commands below still exist for finer control.
+
 ## Commands
 
 | Command | Purpose |
 |---|---|
+| `send DIR --in F --to PUB --originator ID [--originator-key K] --n N --k K [--prefix P]` | One shot: seal + notarize + bundle |
+| `receive --key KEY --bundle B --receipt R --out OUT [--operator PUB] [--expect-originator PUB] SHARD...` | One shot: reassemble + verify + open (fails closed) |
 | `keygen -o KEY [--label L] [--pub PUB]` | Generate a PQ keypair; optionally write a shareable public key |
 | `pub -i KEY -o PUB` | Extract the public key from a secret key file |
 | `init DIR --operator KEY` | Initialize a notary store |

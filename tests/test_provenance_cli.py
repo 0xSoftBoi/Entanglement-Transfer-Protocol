@@ -190,6 +190,60 @@ class TestBundleReassemble:
                      "--out", str(tmp_path / "x.sealed")] + shard_files) == 1
 
 
+class TestSendReceive:
+    def _send(self, notary, tmp_path, content, *, sign=False):
+        src = tmp_path / "msg.txt"; src.write_bytes(content)
+        argv = ["send", str(notary["dir"]), "--in", str(src), "--to", str(notary["bob_pub"]),
+                "--originator", "sensor-7", "--n", "6", "--k", "4", "--prefix", str(tmp_path / "parcel")]
+        if sign:
+            dev_key, dev_pub = _keygen(tmp_path, "sensor7", with_pub=True)
+            argv += ["--originator-key", str(dev_key)]
+            self._dev_pub = dev_pub
+        assert main(argv) == 0
+        return src
+
+    def test_send_receive_roundtrip_with_loss(self, notary, tmp_path):
+        content = b"the whole delay-tolerant custody flow" * 30
+        src = self._send(notary, tmp_path, content)
+        shards = sorted(str(p) for p in tmp_path.glob("parcel.shard*"))
+        arrived = shards[:2] + shards[4:]   # lose 2 of 6
+        out = tmp_path / "out.txt"
+        bob_key = tmp_path / "bob.key"
+        assert main([
+            "receive", "--key", str(bob_key),
+            "--bundle", str(tmp_path / "parcel.bundle"),
+            "--receipt", str(tmp_path / "parcel.receipt"),
+            "--out", str(out),
+        ] + arrived) == 0
+        assert out.read_bytes() == content
+
+    def test_receive_fails_closed_on_tampered_shard_set(self, notary, tmp_path):
+        # If too many shards are lost, receive must fail (and not write output).
+        self._send(notary, tmp_path, b"payload")
+        shards = sorted(str(p) for p in tmp_path.glob("parcel.shard*"))[:2]  # only 2 < k
+        out = tmp_path / "out.txt"
+        assert main([
+            "receive", "--key", str(tmp_path / "bob.key"),
+            "--bundle", str(tmp_path / "parcel.bundle"),
+            "--receipt", str(tmp_path / "parcel.receipt"),
+            "--out", str(out),
+        ] + shards) == 1
+        assert not out.exists()
+
+    def test_receive_with_device_pin(self, notary, tmp_path):
+        content = b"signed payload"
+        self._send(notary, tmp_path, content, sign=True)
+        shards = sorted(str(p) for p in tmp_path.glob("parcel.shard*"))
+        out = tmp_path / "out.txt"
+        assert main([
+            "receive", "--key", str(tmp_path / "bob.key"),
+            "--bundle", str(tmp_path / "parcel.bundle"),
+            "--receipt", str(tmp_path / "parcel.receipt"),
+            "--out", str(out), "--expect-originator", str(self._dev_pub),
+        ] + shards) == 0
+        assert out.read_bytes() == content
+
+
 class TestReceiptSerialization:
     def test_receipt_json_roundtrip(self, notary, tmp_path):
         _, sealed, receipt = _seal(notary, content=b"payload", name="d")
