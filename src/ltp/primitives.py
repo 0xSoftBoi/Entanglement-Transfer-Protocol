@@ -103,7 +103,25 @@ __all__ = [
     "set_crypto_provider", "get_crypto_provider",
     "set_compliance_strict", "get_compliance_strict",
     "_pqcrypto_kem_available", "_pqcrypto_sign_available", "_pynacl_available",
+    "real_backend_active",
 ]
+
+
+def real_backend_active() -> bool:
+    """
+    True iff real post-quantum crypto is active for the current SecurityProfile.
+
+    Unlike a raw ``import pqcrypto`` check, this consults MLKEM/MLDSA._use_real_backend()
+    (which verify the installed backend matches the active profile's key sizes) and
+    the pynacl AEAD backend — so it correctly reports False when, e.g., a Level-5
+    profile would silently fall back to the PoC simulation. This is the single
+    source of truth for "are we running real crypto".
+    """
+    return (
+        MLKEM._use_real_backend()
+        and MLDSA._use_real_backend()
+        and _pynacl_available
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -32,6 +32,7 @@ __all__ = [
     "DOMAIN_SIGNER_POLICY",
     "DOMAIN_LATTICE_KEY",
     "DOMAIN_BRIDGE_MSG",
+    "DOMAIN_PROVENANCE_CAPTURE",
     # Legacy tags
     "LEGACY_COMMIT_V1",
     "LEGACY_RECORD_V1",
@@ -58,6 +59,7 @@ DOMAIN_SIGNED_ENVELOPE  = b"GSX-LTP:signed-envelope:v1\x00"
 DOMAIN_SIGNER_POLICY    = b"GSX-LTP:signer-policy:v1\x00"
 DOMAIN_LATTICE_KEY      = b"GSX-LTP:lattice-key:v1\x00"
 DOMAIN_BRIDGE_MSG       = b"GSX-LTP:bridge-msg:v1\x00"
+DOMAIN_PROVENANCE_CAPTURE = b"GSX-LTP:provenance-capture:v1\x00"
 
 # Legacy tags (kept for backward compatibility with existing signable_payload())
 LEGACY_COMMIT_V1 = b"LTP-COMMIT-v1\x00"
@@ -80,6 +82,7 @@ _ALL_TAGS: dict[str, bytes] = {
     "DOMAIN_SIGNER_POLICY": DOMAIN_SIGNER_POLICY,
     "DOMAIN_LATTICE_KEY": DOMAIN_LATTICE_KEY,
     "DOMAIN_BRIDGE_MSG": DOMAIN_BRIDGE_MSG,
+    "DOMAIN_PROVENANCE_CAPTURE": DOMAIN_PROVENANCE_CAPTURE,
     "LEGACY_COMMIT_V1": LEGACY_COMMIT_V1,
     "LEGACY_RECORD_V1": LEGACY_RECORD_V1,
 }
