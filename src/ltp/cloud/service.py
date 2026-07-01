@@ -35,13 +35,14 @@ import hmac
 import json
 import os
 import threading
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from ..keypair import KeyPair
 from ..encoding import b64e
 from ..provenance import ProvenanceLog, ProvenanceReceipt, CaptureManifest
+from ..anchor.client import TokenBucketRateLimiter
 from .store import CloudStore
+from .webhooks import WebhookDispatcher
 
 __all__ = ["CloudNotaryService", "make_cloud_server", "main"]
 
@@ -54,11 +55,15 @@ class CloudNotaryService:
         admin_token: str,
         operator: KeyPair | None = None,
         sync_webhooks: bool = False,
+        rate_per_minute: float | None = 300.0,
     ) -> None:
         self._store = store
         self._operator = operator or store.get_or_create_operator()
         self._admin_token = admin_token
         self._sync_webhooks = sync_webhooks
+        self._dispatcher = WebhookDispatcher(store)
+        self._rate_per_minute = rate_per_minute
+        self._limiters: dict[str, TokenBucketRateLimiter] = {}
         self._logs: dict[str, ProvenanceLog] = {}
         self._lock = threading.Lock()
 
@@ -95,10 +100,33 @@ class CloudNotaryService:
     def admin_authorized(self, token: str | None) -> bool:
         return bool(token) and hmac.compare_digest(token, self._admin_token)
 
-    def submit(self, tenant_id: str, manifest: CaptureManifest) -> ProvenanceReceipt:
-        """Append to the tenant's log, publish an STH, persist both, notify."""
+    def rate_ok(self, api_key: str) -> bool:
+        """Per-key token bucket (burst = 1 minute's allowance)."""
+        if self._rate_per_minute is None:
+            return True
+        limiter = self._limiters.get(api_key)
+        if limiter is None:
+            limiter = self._limiters.setdefault(api_key, TokenBucketRateLimiter(
+                max_tps=self._rate_per_minute / 60.0,
+                burst=max(1, int(self._rate_per_minute))))
+        return limiter.acquire(timeout=0)
+
+    def submit(self, tenant_id: str, manifest: CaptureManifest) -> tuple[ProvenanceReceipt, bool]:
+        """
+        Notarize a manifest. Idempotent on capture_id: resubmitting an
+        already-notarized capture returns a fresh receipt for the existing
+        leaf (proof + STH against the current tree) without re-appending or
+        re-metering. Returns (receipt, created).
+        """
         with self._lock:
             log = self._log(tenant_id)
+            existing = self._store.leaf_for_capture_id(tenant_id, manifest.capture_id)
+            if existing is not None:
+                # Persisted STH matches the current tree (every append publishes
+                # one), and survives restarts where the in-memory list doesn't.
+                sth = self._store.latest_sth(tenant_id)
+                return ProvenanceReceipt.build(
+                    manifest, log.inclusion_proof(existing), sth), False
             idx = log.append_manifest(manifest)
             sth = log.publish_sth()
             proof = log.inclusion_proof(idx)
@@ -112,7 +140,7 @@ class CloudNotaryService:
             "leaf_index": idx,
             "sth_sequence": sth.sequence,
         })
-        return receipt
+        return receipt, True
 
     def inclusion_proof(self, tenant_id: str, index: int):
         with self._lock:
@@ -127,7 +155,8 @@ class CloudNotaryService:
     def anchors(self, tenant_id: str) -> list[dict]:
         rows = self._store.anchors(tenant_id=tenant_id)
         return [{k: r[k] for k in
-                 ("sth_sequence", "root", "digest", "status", "tx_ref", "updated_at")}
+                 ("sth_sequence", "root", "digest", "status", "tx_ref",
+                  "block_number", "updated_at")}
                 for r in rows]
 
     def on_anchor_confirmed(self, tenant_id: str, anchor_row: dict) -> None:
@@ -142,28 +171,20 @@ class CloudNotaryService:
         })
 
     # ------------------------------------------------------------------
-    # Webhooks (best-effort; production uses a persistent outbox + retries)
+    # Webhooks — persistent outbox (crash-safe, retried, HMAC-signed).
+    # Events are enqueued transactionally at emit time; a WebhookDispatcher
+    # drains them (inline in sync mode, on a scheduler in production).
     # ------------------------------------------------------------------
 
     def notify(self, tenant_id: str, payload: dict) -> None:
         tenant = self._store.tenant(tenant_id)
-        url = tenant and tenant.get("webhook_url")
-        if not url:
+        if not (tenant and tenant.get("webhook_url")):
             return
+        self._store.enqueue_event(tenant_id, payload)
         if self._sync_webhooks:
-            self._deliver(url, payload)
+            self._dispatcher.run_once()
         else:
-            threading.Thread(target=self._deliver, args=(url, payload), daemon=True).start()
-
-    @staticmethod
-    def _deliver(url: str, payload: dict) -> None:
-        try:
-            req = urllib.request.Request(
-                url, data=json.dumps(payload).encode("utf-8"), method="POST")
-            req.add_header("Content-Type", "application/json")
-            urllib.request.urlopen(req, timeout=3).read()
-        except Exception:
-            pass  # best-effort delivery; the outbox pattern replaces this in prod
+            threading.Thread(target=self._dispatcher.run_once, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -240,15 +261,26 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(201, created)
 
         if path == "/v1/captures":
-            tenant = self._tenant()
+            key = self._api_key()
+            tenant = self.svc.authorize(key)
             if tenant is None:
                 return self._send(401, {"error": "invalid or missing API key"})
+            if not self.svc.rate_ok(key):
+                self.send_response(429)
+                self.send_header("Retry-After", "1")
+                body = json.dumps({"error": "rate limit exceeded"}).encode()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             try:
                 manifest = CaptureManifest.from_dict(self._body())
             except (ValueError, KeyError, TypeError) as e:
                 return self._send(400, {"error": f"malformed manifest ({type(e).__name__})"})
-            receipt = self.svc.submit(tenant, manifest)
-            return self._send(201, receipt.to_dict())
+            receipt, created = self.svc.submit(tenant, manifest)
+            # 201 on first notarization; 200 on an idempotent replay.
+            return self._send(201 if created else 200, receipt.to_dict())
 
         return self._send(404, {"error": "not found"})
 

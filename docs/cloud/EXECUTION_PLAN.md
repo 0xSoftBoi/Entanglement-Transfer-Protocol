@@ -26,9 +26,9 @@ custody STH, CI badge truthful.
 
 | # | Item | Effort | Owner | Notes |
 |---|---|---|---|---|
-| B1 | **Event indexer**: consume `Anchored` logs w/ confirmation depth + `indexer_cursor`, reorg → revert row to `submitted`; keep `reconcile()` as safety net | M | [auto] | Testable now against a log-emitting fake; real test needs A4's RPC |
-| B2 | **Webhook outbox**: persistent rows, exponential backoff, `X-ETP-Signature` HMAC; replaces best-effort threads | M | [auto] | Schema already in design §4 |
-| B3 | **Idempotent `POST /v1/captures`** (dedupe on `capture_id`) + per-key rate limits | S | [auto] | Closes the double-submit gap |
+| B1 | ✅ **Event indexer** (`cloud/indexer.py`): `Anchored` logs behind a narrow LogSource interface, confirmation-depth finality, persisted cursor, crashed-worker recovery; `reconcile()` kept as safety net | M | done | Real-chain test still needs A4's RPC |
+| B2 | ✅ **Webhook outbox** (`cloud/webhooks.py`): persistent rows, exponential backoff, `X-ETP-Signature` sha3-256 HMAC per-tenant secret | M | done | |
+| B3 | ✅ **Idempotent `POST /v1/captures`** (dedupe on `capture_id`, 200 vs 201, replay-safe across restarts, not double-metered) + per-key token-bucket rate limits (429 + Retry-After; reuses anchor client's `TokenBucketRateLimiter`) | S | done | |
 | B4 | **Postgres + FastAPI port** behind the same OpenAPI; docker-compose (api + worker + postgres); keep stdlib/SQLite as the reference | L | [auto] | Adds the repo's first service deps — isolated in an optional extra `[cloud]` |
 | B5 | Observability: structured logs, `/metrics` (Prometheus), anchor-stuck + signer-balance alerts | M | [auto] | Design §12 |
 

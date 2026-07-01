@@ -11,6 +11,9 @@ Turns the reference notary (ltp.notary_server) into a deployable product:
                   heads and anchors them to LTPAnchorRegistry with a full
                   transaction lifecycle (pending → submitted → confirmed /
                   failed) and idempotent reconciliation
+  indexer.py    — event indexing: confirms anchors from on-chain `Anchored`
+                  logs with confirmation-depth reorg safety
+  webhooks.py   — persistent outbox delivery with retries + HMAC signatures
 
 Design doc: docs/cloud/CUSTODY_CLOUD_DESIGN.md
 API spec:   docs/cloud/openapi.yaml
@@ -19,5 +22,11 @@ API spec:   docs/cloud/openapi.yaml
 from .store import CloudStore
 from .service import CloudNotaryService, make_cloud_server
 from .anchoring import AnchorWorker
+from .indexer import EventIndexer, AnchoredEvent
+from .webhooks import WebhookDispatcher, sign_payload
 
-__all__ = ["CloudStore", "CloudNotaryService", "make_cloud_server", "AnchorWorker"]
+__all__ = [
+    "CloudStore", "CloudNotaryService", "make_cloud_server",
+    "AnchorWorker", "EventIndexer", "AnchoredEvent",
+    "WebhookDispatcher", "sign_payload",
+]
