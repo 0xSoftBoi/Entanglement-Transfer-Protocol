@@ -121,11 +121,12 @@
 </div></nav>
 
 <header><div class="wrap">
-  <div class="tag"><span class="dot"></span> post-quantum · tamper-evident · no blockchain</div>
+  <div class="tag"><span class="dot"></span> provenance · supply-chain · post-quantum · no blockchain</div>
   <h1>Prove where your data<br>came from. <span class="accent">Forever.</span></h1>
-  <p class="sub">Seal a file with post-quantum cryptography, notarize it in an append-only
-    tamper-evident log, and hand anyone a portable receipt they can verify offline —
-    even after it crossed a link that dropped half the packets.</p>
+  <p class="sub">A tamper-evident chain of custody for any file — signing plus a
+    transparency log, <b>without the key ceremony</b>. One command notarizes it and emits a
+    standard in-toto attestation anyone can verify offline. Post-quantum, so what you attest
+    today stays provable for decades.</p>
   <div class="cta">
     <a class="btn primary" href="#how">See how it works →</a>
     <a class="btn ghost" href="../docs/PROVENANCE_CLI.md">Read the docs</a>
@@ -135,19 +136,18 @@
 
   <div class="term">
     <div class="bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>etp-custody</span></div>
-<pre><span class="c-cm"># sender: seal + notarize + device-sign + erasure-bundle (any 4 of 6 shards reconstruct)</span>
-<span class="c-prompt">$</span> <span class="c-cmd">etp-custody send ./notary</span> <span class="c-flag">--in</span> <span class="c-str">report.pdf</span> <span class="c-flag">--to</span> <span class="c-str">bob.pub</span> \
-    <span class="c-flag">--originator</span> <span class="c-str">sensor-7</span> <span class="c-flag">--originator-key</span> <span class="c-str">sensor7.key</span> <span class="c-flag">--n</span> <span class="c-str">6</span> <span class="c-flag">--k</span> <span class="c-str">4</span>
-<span class="c-ok">✓ sent 'report.pdf' — sealed, notarized, and erasure-bundled</span>
-<span class="c-out">    originator : sensor-7  (device-signed ✓)</span>
-<span class="c-out">    shards     : 6 (any 4 reconstruct; tolerates losing 2)</span>
+<pre><span class="c-cm"># notarize a file — no keygen, no init, no keys to manage</span>
+<span class="c-prompt">$</span> <span class="c-cmd">etp-custody notarize</span> <span class="c-str">report.pdf</span> <span class="c-flag">--attest</span>
+<span class="c-ok">✓ notarized report.pdf  (device-signed)</span>  <span class="c-out">→ report.pdf.receipt, report.pdf.intoto.json</span>
 
-<span class="c-cm"># ...transport over a lossy link — two shards never arrive...</span>
+<span class="c-cm"># anyone verifies it offline — no keys, no server, no blockchain</span>
+<span class="c-prompt">$</span> <span class="c-cmd">etp-custody verify</span> <span class="c-str">report.pdf</span>
+<span class="c-ok">✓ PASS — provenance verified</span>
+<span class="c-out">    originator   : identity:rLT9GiBGupD6  (device-signed ✓)</span>
+<span class="c-out">    attested root: 1e8ee102052ff0f9…  (inclusion proof, O(log N))</span>
 
-<span class="c-cm"># receiver: reassemble + verify (both keys pinned) + open — fails closed</span>
-<span class="c-prompt">$</span> <span class="c-cmd">etp-custody receive</span> <span class="c-flag">--key</span> <span class="c-str">bob.key</span> <span class="c-flag">--operator</span> <span class="c-str">op.pub</span> <span class="c-flag">--expect-originator</span> <span class="c-str">sensor7.pub</span> …
-<span class="c-ok">✓ received → report.pdf  (from 4 shards, needed 4/6)</span>
-<span class="c-out">    provenance : VERIFIED · operator PINNED · device PINNED</span></pre>
+<span class="c-cm"># emits a standard in-toto attestation — existing supply-chain verifiers read it</span>
+<span class="c-out">  "_type": "https://in-toto.io/Statement/v1", "subject": [{ "name": "report.pdf" … }]</span></pre>
   </div>
 </div></header>
 

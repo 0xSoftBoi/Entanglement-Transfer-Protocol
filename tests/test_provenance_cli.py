@@ -244,6 +244,59 @@ class TestSendReceive:
         assert out.read_bytes() == content
 
 
+class TestKeyless:
+    """The zero-ceremony flow: no keygen, no init, no key files."""
+
+    def test_notarize_then_verify_by_filename(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ETP_CUSTODY_HOME", str(tmp_path / "home"))
+        f = tmp_path / "deck.pdf"
+        f.write_bytes(b"confidential board deck")
+        # one command, no prior setup
+        assert main(["notarize", str(f), "--attest"]) == 0
+        assert (tmp_path / "deck.pdf.sealed").exists()
+        assert (tmp_path / "deck.pdf.receipt").exists()
+        assert (tmp_path / "deck.pdf.intoto.json").exists()
+        # verify by filename, zero flags
+        assert main(["verify", str(f)]) == 0
+
+    def test_verify_from_attestation(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ETP_CUSTODY_HOME", str(tmp_path / "home"))
+        f = tmp_path / "doc.txt"; f.write_bytes(b"data")
+        assert main(["notarize", str(f), "--attest"]) == 0
+        assert main(["verify", str(f), "--attestation", str(tmp_path / "doc.txt.intoto.json")]) == 0
+
+    def test_notarize_builds_one_append_only_log(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ETP_CUSTODY_HOME", str(tmp_path / "home"))
+        a = tmp_path / "a.txt"; a.write_bytes(b"a")
+        b = tmp_path / "b.txt"; b.write_bytes(b"b")
+        assert main(["notarize", str(a)]) == 0
+        assert main(["notarize", str(b)]) == 0
+        # the two receipts are from one append-only default notary
+        assert main(["audit", str(tmp_path / "home" / "notary"),
+                     str(tmp_path / "a.txt.receipt"), str(tmp_path / "b.txt.receipt")]) == 0
+
+    def test_id_is_stable_across_calls(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setenv("ETP_CUSTODY_HOME", str(tmp_path / "home"))
+        assert main(["id"]) == 0
+        first = capsys.readouterr().out
+        assert main(["id"]) == 0
+        second = capsys.readouterr().out
+        assert first == second  # identity is created once, then stable
+
+
+class TestAttestation:
+    def test_attest_command_and_intoto_shape(self, notary, tmp_path):
+        _, _, receipt = _seal(notary, name="d")
+        out = tmp_path / "a.intoto.json"
+        assert main(["attest", "--receipt", str(receipt), "--subject", "d.txt",
+                     "--out", str(out)]) == 0
+        import json as _j
+        stmt = _j.loads(out.read_text())
+        assert stmt["_type"] == "https://in-toto.io/Statement/v1"
+        assert stmt["subject"][0]["name"] == "d.txt"
+        assert "sha3_256" in stmt["subject"][0]["digest"]
+
+
 class TestBatch:
     def _make_src(self, tmp_path, n=3):
         src = tmp_path / "src"; src.mkdir()

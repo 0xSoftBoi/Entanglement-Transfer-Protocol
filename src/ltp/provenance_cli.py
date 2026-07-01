@@ -121,6 +121,34 @@ def _read_key(path: Path) -> KeyPair:
 
 
 # ---------------------------------------------------------------------------
+# Zero-ceremony defaults: a home dir with an identity + a default notary, so the
+# common "just notarize this file" case needs no keygen/init/flags at all.
+# ---------------------------------------------------------------------------
+
+def _home() -> Path:
+    return Path(os.environ.get("ETP_CUSTODY_HOME", str(Path.home() / ".etp-custody")))
+
+
+def _ensure_identity() -> KeyPair:
+    """Return the user's default identity keypair, creating it on first use."""
+    p = _home() / "identity.key"
+    if p.exists():
+        return _read_key(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    kp = KeyPair.generate("identity")
+    _write_key(p, kp, public_only=False)
+    return kp
+
+
+def _ensure_default_notary(operator: KeyPair) -> "NotaryStore":
+    d = _home() / "notary"
+    store = NotaryStore(d)
+    if not store.operator_key.exists():
+        NotaryStore.init(d, operator)
+    return NotaryStore(d)
+
+
+# ---------------------------------------------------------------------------
 # Notary store (file-backed, reconstructable)
 # ---------------------------------------------------------------------------
 
@@ -237,6 +265,66 @@ def _parse_meta(pairs: list[str] | None) -> dict:
     return meta
 
 
+def cmd_id(args) -> int:
+    """Show (creating on first use) the default identity — no key files to manage."""
+    identity = _ensure_identity()
+    print(f"identity: {_home() / 'identity.key'}")
+    print(f"    public key: {b64e(identity.vk)}")
+    if args.pub:
+        _write_key(Path(args.pub), identity, public_only=True)
+        print(f"    exported shareable public key → {args.pub}")
+    return 0
+
+
+def cmd_notarize(args) -> int:
+    """
+    Zero-ceremony notarization: seal + notarize a file with your default
+    identity and default notary. No keygen, no init, no flags required.
+    Writes <file>.sealed + <file>.receipt (and <file>.intoto.json with --attest).
+    """
+    identity = _ensure_identity()
+    store = _ensure_default_notary(identity)
+    plog = store.load_log()
+    origin_id = args.originator or f"identity:{b64e(identity.vk)[:12]}"
+
+    for f in args.files:
+        artifact = Path(f).read_bytes()
+        # Seal to self and device-sign with the identity (we hold the key anyway).
+        cap, idx = plog.record_capture(
+            artifact, recipient_ek=identity.ek, originator_id=origin_id,
+            originator=identity, meta={**_parse_meta(args.meta), "filename": Path(f).name},
+        )
+        sth = plog.publish_sth()
+        receipt = ProvenanceReceipt.build(cap.manifest, plog.inclusion_proof(idx), sth)
+        store.append_record(cap.manifest)
+        store.append_sth(sth)
+
+        Path(f + ".sealed").write_bytes(cap.sealed)
+        Path(f + ".receipt").write_text(receipt.to_json())
+        outs = f"{Path(f).name}.sealed, {Path(f).name}.receipt"
+        if args.attest:
+            from .attestation import in_toto_statement
+            Path(f + ".intoto.json").write_text(
+                json.dumps(in_toto_statement(Path(f).name, receipt), indent=2))
+            outs += f", {Path(f).name}.intoto.json"
+        print(f"✓ notarized {f}  (device-signed)  →  {outs}")
+
+    print(f"    notary: {_home() / 'notary'}  ·  verify with `etp-custody verify {args.files[0]}`")
+    return 0
+
+
+def cmd_attest(args) -> int:
+    """Convert a receipt into a standard in-toto attestation statement."""
+    from .attestation import in_toto_statement
+    receipt = ProvenanceReceipt.from_json(Path(args.receipt).read_text())
+    subject = args.subject or "artifact"
+    stmt = in_toto_statement(subject, receipt)
+    out = Path(args.out) if args.out else Path(args.receipt).with_suffix(".intoto.json")
+    out.write_text(json.dumps(stmt, indent=2))
+    print(f"✓ wrote in-toto attestation → {out}  (subject: {subject})")
+    return 0
+
+
 def cmd_seal(args) -> int:
     store = NotaryStore(Path(args.dir))
     recipient = _read_key(Path(args.to))
@@ -296,13 +384,29 @@ def cmd_publish(args) -> int:
 
 
 def cmd_verify(args) -> int:
-    # Receipts are untrusted input; parse defensively.
+    # Resolve inputs. A positional FILE derives FILE.sealed / FILE.receipt, so
+    # `verify report.pdf` just works after `notarize report.pdf`.
+    sealed_path = args.sealed
+    receipt_path = args.receipt
+    if args.file:
+        sealed_path = sealed_path or (args.file + ".sealed")
+        receipt_path = receipt_path or (args.file + ".receipt")
+
+    # Receipts (and attestations) are untrusted input; parse defensively.
     try:
-        receipt = ProvenanceReceipt.from_json(Path(args.receipt).read_text())
+        if args.attestation:
+            from .attestation import receipt_from_statement
+            receipt = receipt_from_statement(json.loads(Path(args.attestation).read_text()))
+        elif receipt_path:
+            receipt = ProvenanceReceipt.from_json(Path(receipt_path).read_text())
+        else:
+            raise SystemExit("error: provide a FILE, --receipt, or --attestation")
     except (ValueError, KeyError, TypeError) as e:
         print(f"FAIL — malformed receipt ({type(e).__name__})")
         return 1
-    sealed = Path(args.sealed).read_bytes()
+    if not sealed_path:
+        raise SystemExit("error: provide the sealed blob (a FILE or --sealed)")
+    sealed = Path(sealed_path).read_bytes()
 
     expected_vk = _read_key(Path(args.operator)).vk if args.operator else None
     expected_origin_vk = _read_key(Path(args.expect_originator)).vk if args.expect_originator else None
@@ -723,6 +827,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    idp = sub.add_parser("id", help="show/create your default identity (zero-ceremony)")
+    idp.add_argument("--pub", help="export a shareable public-key file")
+    idp.set_defaults(func=cmd_id)
+
+    nz = sub.add_parser("notarize", help="one command: seal + notarize a file with your identity")
+    nz.add_argument("files", nargs="+", help="file(s) to notarize")
+    nz.add_argument("--originator", help="originator id (default: your identity)")
+    nz.add_argument("--attest", action="store_true", help="also emit an in-toto attestation")
+    nz.add_argument("--meta", action="append", help="key=value metadata (repeatable)")
+    nz.set_defaults(func=cmd_notarize)
+
+    at = sub.add_parser("attest", help="convert a receipt into an in-toto attestation")
+    at.add_argument("--receipt", required=True, help="receipt file")
+    at.add_argument("--subject", help="subject name (e.g. the filename)")
+    at.add_argument("--out", help="output path (default: <receipt>.intoto.json)")
+    at.set_defaults(func=cmd_attest)
+
     g = sub.add_parser("keygen", help="generate a post-quantum keypair")
     g.add_argument("-o", "--out", required=True, help="output secret key file")
     g.add_argument("--label", help="human-readable label")
@@ -756,8 +877,10 @@ def build_parser() -> argparse.ArgumentParser:
     pubh.set_defaults(func=cmd_publish)
 
     v = sub.add_parser("verify", help="verify a receipt against a sealed blob (offline)")
-    v.add_argument("--sealed", required=True, help="sealed blob")
-    v.add_argument("--receipt", required=True, help="receipt file")
+    v.add_argument("file", nargs="?", help="a FILE → derives FILE.sealed and FILE.receipt")
+    v.add_argument("--sealed", help="sealed blob (overrides FILE.sealed)")
+    v.add_argument("--receipt", help="receipt file (overrides FILE.receipt)")
+    v.add_argument("--attestation", help="verify from an in-toto attestation instead of a receipt")
     v.add_argument("--operator", help="pin the trusted notary's public key file "
                                       "(without it, any operator's receipt passes)")
     v.add_argument("--expect-originator", help="pin the capturing device's public key file "

@@ -99,6 +99,10 @@ append-only growth over time.
 
 | Command | Purpose |
 |---|---|
+| `id [--pub PUB]` | Show/create your default identity (zero-ceremony) |
+| `notarize FILE… [--attest]` | **One command, no keys:** seal + notarize with your identity; `--attest` also emits an in-toto attestation |
+| `attest --receipt R [--subject S] [--out O]` | Convert a receipt into a standard in-toto attestation |
+| `serve --operator KEY --api-key KEY [--port P]` | Run the hosted notary HTTP service |
 | `send DIR --in F --to PUB --originator ID [--originator-key K] --n N --k K [--prefix P]` | One shot: seal + notarize + bundle |
 | `receive --key KEY --bundle B --receipt R --out OUT [--operator PUB] [--expect-originator PUB] SHARD...` | One shot: reassemble + verify + open (fails closed) |
 | `batch-send DIR --in-dir SRC --to PUB --originator ID [--originator-key K] --n N --k K --out-dir OUT` | Seal + notarize + bundle every file in a directory (one append-only log) |

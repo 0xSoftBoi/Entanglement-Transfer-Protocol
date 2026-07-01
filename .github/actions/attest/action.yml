@@ -1,0 +1,44 @@
+name: "ETP Custody — Attest"
+description: "Post-quantum, tamper-evident provenance for build artifacts (emits an in-toto attestation)."
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  files:
+    description: "Space-separated files (or globs) to notarize."
+    required: true
+  mode:
+    description: "notarize (produce receipt + in-toto attestation) or verify (check them)."
+    required: false
+    default: "notarize"
+  install:
+    description: "How to install the CLI: 'pypi' (etp-custody), 'local' (pip install -e . from checkout), or 'skip'."
+    required: false
+    default: "local"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install etp-custody
+      if: inputs.install != 'skip'
+      shell: bash
+      run: |
+        if [ "${{ inputs.install }}" = "local" ]; then
+          pip install -e ".[crypto]"
+        else
+          pip install "ltp[crypto]" || pipx install "ltp[crypto]"
+        fi
+
+    - name: Attest / verify
+      shell: bash
+      run: |
+        set -euo pipefail
+        for f in ${{ inputs.files }}; do
+          if [ "${{ inputs.mode }}" = "verify" ]; then
+            etp-custody verify "$f"
+          else
+            etp-custody notarize "$f" --attest
+            echo "attested $f -> $f.receipt, $f.intoto.json"
+          fi
+        done

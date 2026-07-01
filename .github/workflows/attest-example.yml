@@ -1,0 +1,45 @@
+name: Attest a build artifact (example)
+
+# Demonstrates post-quantum, tamper-evident provenance in CI: build an artifact,
+# notarize it with etp-custody (emitting an in-toto attestation), and upload the
+# attestation + receipt so downstream consumers can verify it offline.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  attest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build an artifact (stand-in)
+        run: echo "release build $(git rev-parse HEAD)" > dist-artifact.txt
+
+      - name: Notarize + attest
+        uses: ./.github/actions/attest
+        with:
+          files: dist-artifact.txt
+          mode: notarize
+          install: local
+
+      - name: Verify it back (fails closed)
+        uses: ./.github/actions/attest
+        with:
+          files: dist-artifact.txt
+          mode: verify
+          install: skip
+
+      - name: Upload provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: provenance
+          path: |
+            dist-artifact.txt.receipt
+            dist-artifact.txt.intoto.json
