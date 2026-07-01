@@ -50,8 +50,8 @@ class TestTagRegistry:
         assert LEGACY_RECORD_V1 == b"LTP-RECORD-v1\x00"
 
     def test_tag_count(self):
-        # 12 new + 2 legacy = 14 total
-        assert len(_ALL_TAGS) == 14
+        # 13 new + 2 legacy = 15 total
+        assert len(_ALL_TAGS) == 15
 
 
 class TestDomainHash:

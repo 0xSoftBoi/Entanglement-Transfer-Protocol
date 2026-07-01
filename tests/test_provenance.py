@@ -182,6 +182,64 @@ class TestOperatorPinning:
         assert not receipt.verify(cap.sealed, expected_operator_vk=b"\x00" * len(sth.operator_vk))
 
 
+class TestOriginatorSignature:
+    """The capturing device can cryptographically attest, not just be named."""
+
+    def test_signed_capture_verifies_and_pins(self, plog, recipient):
+        device = KeyPair.generate("sensor-7")
+        cap, idx = plog.record_capture(
+            b"sensor reading", recipient.ek, originator_id="sensor-7", originator=device
+        )
+        sth = plog.publish_sth()
+        proof = plog.inclusion_proof(idx)
+        # signature present and valid
+        assert cap.manifest.originator_vk == device.vk
+        assert ProvenanceLog.verify_capture(cap.manifest, cap.sealed, proof, sth)
+        # pin to the right device passes, wrong device fails
+        assert ProvenanceLog.verify_capture(
+            cap.manifest, cap.sealed, proof, sth, expected_originator_vk=device.vk
+        )
+        assert not ProvenanceLog.verify_capture(
+            cap.manifest, cap.sealed, proof, sth,
+            expected_originator_vk=KeyPair.generate("other").vk,
+        )
+
+    def test_unsigned_capture_fails_when_originator_pin_required(self, plog, recipient):
+        cap, idx = plog.record_capture(b"x", recipient.ek, originator_id="sensor-7")
+        sth = plog.publish_sth()
+        proof = plog.inclusion_proof(idx)
+        assert cap.manifest.originator_vk == b""
+        # unsigned still verifies unpinned (operator-vouched)...
+        assert ProvenanceLog.verify_capture(cap.manifest, cap.sealed, proof, sth)
+        # ...but not when a specific device is required
+        assert not ProvenanceLog.verify_capture(
+            cap.manifest, cap.sealed, proof, sth,
+            expected_originator_vk=KeyPair.generate("sensor-7").vk,
+        )
+
+    def test_forged_originator_signature_rejected(self, plog, recipient):
+        device = KeyPair.generate("sensor-7")
+        cap, idx = plog.record_capture(
+            b"reading", recipient.ek, originator_id="sensor-7", originator=device
+        )
+        # Tamper the device signature; capture must fail even before notarization checks.
+        from dataclasses import replace
+        forged = replace(cap.manifest, originator_sig=b"\x00" * len(cap.manifest.originator_sig))
+        sth = plog.publish_sth()
+        proof = plog.inclusion_proof(idx)
+        assert not ProvenanceLog.verify_capture(forged, cap.sealed, proof, sth)
+
+    def test_originator_signature_survives_receipt_roundtrip(self, plog, recipient):
+        device = KeyPair.generate("sensor-7")
+        cap, idx = plog.record_capture(
+            b"reading", recipient.ek, originator_id="sensor-7", originator=device
+        )
+        sth = plog.publish_sth()
+        receipt = ProvenanceReceipt.build(cap.manifest, plog.inclusion_proof(idx), sth)
+        r2 = ProvenanceReceipt.from_json(receipt.to_json())
+        assert r2.verify(cap.sealed, expected_originator_vk=device.vk)
+
+
 class TestForkAndAppendOnly:
     def test_equivocation_detected(self, operator, recipient):
         """Two signed roots at the same sequence over different histories = fork."""

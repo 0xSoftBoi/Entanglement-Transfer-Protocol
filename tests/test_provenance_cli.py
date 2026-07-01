@@ -138,6 +138,31 @@ class TestOperatorPin:
                      "--operator", str(tmp_path / "wrong.pub")]) == 1
 
 
+class TestOriginatorSigning:
+    def test_device_signed_capture_pins_to_device(self, notary, tmp_path):
+        dev_key, dev_pub = _keygen(tmp_path, "sensor7", with_pub=True)
+        src = tmp_path / "d.txt"; src.write_bytes(b"reading")
+        sealed = tmp_path / "d.sealed"; receipt = tmp_path / "d.receipt"
+        assert main([
+            "seal", str(notary["dir"]), "--in", str(src), "--to", str(notary["bob_pub"]),
+            "--originator", "sensor-7", "--originator-key", str(dev_key),
+            "--out", str(sealed), "--receipt", str(receipt),
+        ]) == 0
+        # pinning to the real device passes
+        assert main(["verify", "--sealed", str(sealed), "--receipt", str(receipt),
+                     "--expect-originator", str(dev_pub)]) == 0
+        # pinning to a different device fails
+        _, other_pub = _keygen(tmp_path, "other", with_pub=True)
+        assert main(["verify", "--sealed", str(sealed), "--receipt", str(receipt),
+                     "--expect-originator", str(other_pub)]) == 1
+
+    def test_unsigned_capture_fails_originator_pin(self, notary, tmp_path):
+        _, sealed, receipt = _seal(notary, name="u")   # no --originator-key
+        _, dev_pub = _keygen(tmp_path, "sensor7", with_pub=True)
+        assert main(["verify", "--sealed", str(sealed), "--receipt", str(receipt),
+                     "--expect-originator", str(dev_pub)]) == 1
+
+
 class TestReceiptSerialization:
     def test_receipt_json_roundtrip(self, notary, tmp_path):
         _, sealed, receipt = _seal(notary, content=b"payload", name="d")

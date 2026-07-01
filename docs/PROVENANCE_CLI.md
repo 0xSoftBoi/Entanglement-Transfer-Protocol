@@ -63,7 +63,7 @@ etp-custody log ./notary
 | `keygen -o KEY [--label L] [--pub PUB]` | Generate a PQ keypair; optionally write a shareable public key |
 | `pub -i KEY -o PUB` | Extract the public key from a secret key file |
 | `init DIR --operator KEY` | Initialize a notary store |
-| `seal DIR --in F --to PUB --originator ID [--out S] [--receipt R] [--meta k=v]` | Seal + notarize a file |
+| `seal DIR --in F --to PUB --originator ID [--originator-key K] [--out S] [--receipt R] [--meta k=v]` | Seal + notarize a file; `--originator-key` makes the capturing device cryptographically sign it |
 | `publish DIR` | Publish a signed tree head (attestation) over the current log |
 | `verify --sealed S --receipt R [--operator PUB]` | Verify a receipt against a sealed blob (offline). Exit 0=PASS, 1=FAIL. Pass `--operator` to require a specific trusted notary |
 | `open --key KEY --sealed S [--receipt R] -o OUT` | Recover plaintext (authorized recipient only) |
@@ -82,12 +82,22 @@ etp-custody log ./notary
 - **Offline & portable:** a `.sealed` file + a `.receipt` are sufficient to prove
   custody forever, with no server and no chain.
 
-> ⚠ **Operator trust — pin the notary key.** A valid receipt proves that *some*
-> operator key attested the capture, not that *your trusted* notary did. An
-> attacker can run their own notary and produce a receipt that verifies with a
-> self-asserted `originator_id`. To prove a specific, trusted notary signed it,
-> pass `--operator <notary.pub>` to `verify` (or `expected_operator_vk=` to the
-> library). Without pinning, `verify` proves internal consistency, not authenticity.
+> ⚠ **Trust anchors — pin the keys you rely on.** A valid receipt proves that
+> *some* operator key attested the capture, not that *your trusted* notary did,
+> and a bare `--originator ID` is just a string the operator recorded. To prove
+> a specific, trusted **notary**, pass `--operator <notary.pub>`. To prove the
+> **capturing device itself** attested (not just the operator's word), have the
+> device sign at seal time with `--originator-key <device.key>`, and require it
+> at verify time with `--expect-originator <device.pub>`. Without pins, `verify`
+> proves internal consistency, not authenticity.
+
+### Two-party attestation
+
+- **Operator (notary)** signs the tree head → "this capture is in my append-only log."
+- **Originator (device)** signs `(originator_id, content_hash, captured_at)` →
+  "*I*, sensor-7, captured this exact content at this time." Notarized in the log
+  alongside the manifest. Pin both (`--operator` + `--expect-originator`) for a
+  full, forgery-resistant chain of custody.
 
 ## On-disk artifacts
 

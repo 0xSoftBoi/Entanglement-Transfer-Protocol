@@ -51,12 +51,12 @@ from __future__ import annotations
 import hmac
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .keypair import KeyPair, SealedBox
-from .primitives import H_bytes
+from .primitives import H_bytes, MLDSA
 from .encoding import CanonicalEncoder, b64e, b64d
-from .domain import DOMAIN_PROVENANCE_CAPTURE
+from .domain import DOMAIN_PROVENANCE_CAPTURE, DOMAIN_PROVENANCE_ORIGINATOR
 from .merkle_log import MerkleLog, SignedTreeHead, InclusionProof
 
 __all__ = [
@@ -86,6 +86,12 @@ class CaptureManifest:
     Both are needed: content_hash lets the authorized recipient confirm they
     recovered the original bytes; sealed_hash lets an auditor confirm the sealed
     blob in front of them is the one that was notarized.
+
+    `originator_vk` / `originator_sig` are optional: when the capturing device
+    signs, the originator's ML-DSA-65 signature over (originator_id, content_hash,
+    captured_at) cryptographically binds the artifact to that device — so
+    "captured by sensor-7" is the device's own attestation, not just a string the
+    operator recorded. Empty when the capture is only operator-vouched.
     """
 
     capture_id: str
@@ -93,7 +99,24 @@ class CaptureManifest:
     captured_at: float
     content_hash: bytes   # SHA3-256 of the plaintext artifact (canonical lane)
     sealed_hash: bytes    # SHA3-256 of the sealed ciphertext blob
+    originator_vk: bytes = b""   # ML-DSA-65 verification key of the capturing device
+    originator_sig: bytes = b""  # originator signature over originator_signed_payload()
     meta: dict = field(default_factory=dict)
+
+    def originator_signed_payload(self) -> bytes:
+        """
+        The bytes the originating device signs: a domain-tagged binding of its
+        identity to the captured content and time. Excludes the signature and
+        vk themselves (no circularity) and the seal (the originator attests to
+        the content it captured, independent of who it is later sealed to).
+        """
+        return (
+            CanonicalEncoder(DOMAIN_PROVENANCE_ORIGINATOR)
+            .string(self.originator_id)
+            .raw_bytes(self.content_hash)
+            .float64(self.captured_at)
+            .finalize()
+        )
 
     def canonical_bytes(self) -> bytes:
         """
@@ -102,6 +125,8 @@ class CaptureManifest:
         Uses the project's domain-tagged CanonicalEncoder (same lane as STHs and
         commitment records), so metadata is sorted, floats reject NaN/Inf, and
         the wire format is CBOR-translatable. Reproducible → so are all proofs.
+        The originator vk/sig are included, so the log commits to the device's
+        attestation too.
         """
         return (
             CanonicalEncoder(DOMAIN_PROVENANCE_CAPTURE)
@@ -110,6 +135,8 @@ class CaptureManifest:
             .float64(self.captured_at)
             .raw_bytes(self.content_hash)
             .raw_bytes(self.sealed_hash)
+            .length_prefixed_bytes(self.originator_vk)
+            .length_prefixed_bytes(self.originator_sig)
             .sorted_map(self.meta)
             .finalize()
         )
@@ -121,6 +148,8 @@ class CaptureManifest:
             "captured_at": self.captured_at,
             "content_hash": b64e(self.content_hash),
             "sealed_hash": b64e(self.sealed_hash),
+            "originator_vk": b64e(self.originator_vk),
+            "originator_sig": b64e(self.originator_sig),
             "meta": self.meta,
         }
 
@@ -132,6 +161,8 @@ class CaptureManifest:
             captured_at=d["captured_at"],
             content_hash=b64d(d["content_hash"]),
             sealed_hash=b64d(d["sealed_hash"]),
+            originator_vk=b64d(d.get("originator_vk", "")),
+            originator_sig=b64d(d.get("originator_sig", "")),
             meta=d.get("meta", {}),
         )
 
@@ -194,12 +225,19 @@ class ProvenanceLog:
         recipient_ek: bytes,
         *,
         originator_id: str,
+        originator: KeyPair | None = None,
         capture_id: str | None = None,
         captured_at: float | None = None,
         meta: dict | None = None,
     ) -> tuple[SealedCapture, int]:
         """
         Seal `artifact` to `recipient_ek` and notarize a manifest of it.
+
+        If `originator` (the capturing device's keypair) is given, the manifest
+        carries the device's ML-DSA-65 signature over (originator_id,
+        content_hash, captured_at) — so provenance is the device's own
+        cryptographic attestation, not just an operator-recorded string. Omit it
+        for operator-vouched-only captures.
 
         Returns the transportable SealedCapture and the log leaf index used to
         generate inclusion proofs. Call publish_sth() afterward (optionally
@@ -213,8 +251,14 @@ class ProvenanceLog:
             captured_at=captured_at if captured_at is not None else time.time(),
             content_hash=H_bytes(artifact),
             sealed_hash=sealed_hash,
+            originator_vk=originator.vk if originator is not None else b"",
             meta=meta or {},
         )
+        if originator is not None:
+            manifest = replace(
+                manifest,
+                originator_sig=MLDSA.sign(originator.sk, manifest.originator_signed_payload()),
+            )
         idx = self._log.append(manifest.canonical_bytes())
         return SealedCapture(manifest=manifest, sealed=sealed), idx
 
@@ -251,6 +295,7 @@ class ProvenanceLog:
         proof: InclusionProof,
         sth: SignedTreeHead,
         expected_operator_vk: bytes | None = None,
+        expected_originator_vk: bytes | None = None,
     ) -> bool:
         """
         Independently verify a capture's provenance. Returns True iff ALL hold:
@@ -264,20 +309,36 @@ class ProvenanceLog:
              so this is the exact artifact that was notarized (not a swap).
           3. The manifest is in the log under the attested root  — the inclusion
              proof reconstructs sth.root_hash from the manifest bytes.
+          4. If the manifest carries an originator signature, it is valid over
+             (originator_id, content_hash, captured_at) — so the capturing
+             DEVICE, not just the operator, attests to the content. If
+             `expected_originator_vk` is given, the signer must be that device.
 
         Needs neither the plaintext nor any operator secret. Any tamper —
-        altered artifact, swapped sealed blob, edited log record, forged STH —
-        flips at least one check to False.
+        altered artifact, swapped sealed blob, edited log record, forged STH,
+        or a forged/mismatched originator signature — flips a check to False.
 
-        SECURITY — operator trust: a valid signature only proves *some* operator
-        key attested this capture. An attacker can run their own notary and
-        produce a receipt that passes checks 1–3 with a self-asserted
-        `originator_id`. To prove a *specific, trusted* notary attested it, the
-        verifier MUST pin the operator's public key via `expected_operator_vk`.
-        Without it, this proves internal consistency, not authenticity.
+        SECURITY — trust anchors: a valid STH signature only proves *some*
+        operator key attested this capture; a self-asserted `originator_id` with
+        no originator signature is just the operator's word. To prove a
+        *specific, trusted* notary and/or capturing device, pin the relevant
+        public key via `expected_operator_vk` / `expected_originator_vk`. Without
+        pins, this proves internal consistency, not authenticity.
         """
         if expected_operator_vk is not None and not hmac.compare_digest(
             sth.operator_vk, expected_operator_vk
+        ):
+            return False
+        if expected_originator_vk is not None and not hmac.compare_digest(
+            manifest.originator_vk, expected_originator_vk
+        ):
+            return False
+        # A present originator signature must always verify (a tampered/invalid
+        # device signature is a hard failure, pinned or not).
+        if manifest.originator_vk and not MLDSA.verify(
+            manifest.originator_vk,
+            manifest.originator_signed_payload(),
+            manifest.originator_sig,
         ):
             return False
         if not sth.verify():
@@ -342,18 +403,25 @@ class ProvenanceReceipt:
     ) -> "ProvenanceReceipt":
         return cls(manifest=manifest, proof=proof, sth=sth)
 
-    def verify(self, sealed: bytes, expected_operator_vk: bytes | None = None) -> bool:
+    def verify(
+        self,
+        sealed: bytes,
+        expected_operator_vk: bytes | None = None,
+        expected_originator_vk: bytes | None = None,
+    ) -> bool:
         """
         Verify this receipt against the sealed blob it refers to.
 
         True iff the operator's STH signature is valid, the sealed blob matches
-        the manifest, and the manifest is included under the attested root. Pass
-        `expected_operator_vk` to also require a specific, trusted notary —
-        without it, a receipt from any operator key passes (see
+        the manifest, the manifest is included under the attested root, and any
+        originator signature is valid. Pass `expected_operator_vk` /
+        `expected_originator_vk` to require a specific trusted notary / device —
+        without them, a self-consistent receipt from any key passes (see
         ProvenanceLog.verify_capture's security note).
         """
         return ProvenanceLog.verify_capture(
-            self.manifest, sealed, self.proof, self.sth, expected_operator_vk
+            self.manifest, sealed, self.proof, self.sth,
+            expected_operator_vk, expected_originator_vk,
         )
 
     # -- serialization (each component owns its own to_dict/from_dict) --

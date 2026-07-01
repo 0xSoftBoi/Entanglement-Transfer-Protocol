@@ -227,11 +227,18 @@ def cmd_seal(args) -> int:
         raise SystemExit("error: recipient key has no encapsulation key")
     artifact = Path(args.inp).read_bytes()
 
+    originator = None
+    if args.originator_key:
+        originator = _read_key(Path(args.originator_key))
+        if not originator.sk:
+            raise SystemExit("error: --originator-key must be a full (secret) key")
+
     plog = store.load_log()
     capture, idx = plog.record_capture(
         artifact,
         recipient_ek=recipient.ek,
         originator_id=args.originator,
+        originator=originator,
         meta=_parse_meta(args.meta),
     )
     sth = plog.publish_sth()
@@ -254,6 +261,8 @@ def cmd_seal(args) -> int:
     print(f"    log index  : {idx}   tree size: {sth.tree_size}   STH seq: {sth.sequence}")
     print(f"    payload    : {len(artifact)} B  →  sealed {capture.size} B "
           f"(+{SEAL_OVERHEAD} B constant PQC overhead)")
+    print(f"    originator : {args.originator}"
+          + ("  (device-signed ✓)" if originator is not None else "  (operator-vouched only)"))
     print(f"    sealed blob: {sealed_path}")
     print(f"    receipt    : {receipt_path}")
     return 0
@@ -278,17 +287,22 @@ def cmd_verify(args) -> int:
         return 1
     sealed = Path(args.sealed).read_bytes()
 
-    expected_vk = None
-    if args.operator:
-        op = _read_key(Path(args.operator))
-        expected_vk = op.vk
+    expected_vk = _read_key(Path(args.operator)).vk if args.operator else None
+    expected_origin_vk = _read_key(Path(args.expect_originator)).vk if args.expect_originator else None
 
-    ok = receipt.verify(sealed, expected_operator_vk=expected_vk)
+    ok = receipt.verify(sealed, expected_operator_vk=expected_vk,
+                        expected_originator_vk=expected_origin_vk)
     m = receipt.manifest
     if ok:
         print("PASS — provenance verified")
         print(f"    capture id   : {m.capture_id}")
-        print(f"    originator   : {m.originator_id}")
+        print(f"    originator   : {m.originator_id}", end="")
+        if expected_origin_vk is not None:
+            print(f"  (device-signed, PINNED to {args.expect_originator} ✓)")
+        elif m.originator_vk:
+            print("  (device-signed ✓ — pass --expect-originator to pin the device)")
+        else:
+            print("  (operator-vouched only — no device signature)")
         print(f"    captured_at  : {m.captured_at}")
         if expected_vk is not None:
             print(f"    operator     : PINNED to {args.operator} ✓")
@@ -300,6 +314,9 @@ def cmd_verify(args) -> int:
         return 0
     if expected_vk is not None and not hmac.compare_digest(receipt.sth.operator_vk, expected_vk):
         print("FAIL — receipt was signed by a DIFFERENT operator than --operator")
+    elif expected_origin_vk is not None and not hmac.compare_digest(m.originator_vk, expected_origin_vk):
+        print("FAIL — capture was signed by a DIFFERENT originator than --expect-originator "
+              "(or is unsigned)")
     else:
         print("FAIL — provenance could NOT be verified (tampered, mismatched, or forged)")
     return 1
@@ -370,6 +387,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--in", dest="inp", required=True, help="input file to protect")
     s.add_argument("--to", required=True, help="recipient public-key file")
     s.add_argument("--originator", required=True, help="originator identifier (e.g. sensor-7)")
+    s.add_argument("--originator-key", help="capturing device's secret key — cryptographically "
+                                            "sign the capture (default: operator-vouched only)")
     s.add_argument("--out", help="output sealed blob (default: <in>.sealed)")
     s.add_argument("--receipt", help="output receipt file (default: <out>.receipt)")
     s.add_argument("--meta", action="append", help="key=value metadata (repeatable)")
@@ -384,6 +403,8 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--receipt", required=True, help="receipt file")
     v.add_argument("--operator", help="pin the trusted notary's public key file "
                                       "(without it, any operator's receipt passes)")
+    v.add_argument("--expect-originator", help="pin the capturing device's public key file "
+                                               "(require this device's signature on the capture)")
     v.set_defaults(func=cmd_verify)
 
     o = sub.add_parser("open", help="recover the plaintext (authorized recipient only)")
