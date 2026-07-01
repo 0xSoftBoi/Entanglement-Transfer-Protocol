@@ -250,10 +250,14 @@ class ProvenanceLog:
         sealed: bytes,
         proof: InclusionProof,
         sth: SignedTreeHead,
+        expected_operator_vk: bytes | None = None,
     ) -> bool:
         """
         Independently verify a capture's provenance. Returns True iff ALL hold:
 
+          0. If `expected_operator_vk` is given, the STH was signed by THAT
+             operator — otherwise any self-consistent receipt from any key would
+             pass (see the security note below).
           1. The STH signature is valid  — the operator really attested this
              log state (root_hash) at this sequence.
           2. The sealed blob matches the manifest  — sealed_hash == H(sealed),
@@ -264,7 +268,18 @@ class ProvenanceLog:
         Needs neither the plaintext nor any operator secret. Any tamper —
         altered artifact, swapped sealed blob, edited log record, forged STH —
         flips at least one check to False.
+
+        SECURITY — operator trust: a valid signature only proves *some* operator
+        key attested this capture. An attacker can run their own notary and
+        produce a receipt that passes checks 1–3 with a self-asserted
+        `originator_id`. To prove a *specific, trusted* notary attested it, the
+        verifier MUST pin the operator's public key via `expected_operator_vk`.
+        Without it, this proves internal consistency, not authenticity.
         """
+        if expected_operator_vk is not None and not hmac.compare_digest(
+            sth.operator_vk, expected_operator_vk
+        ):
+            return False
         if not sth.verify():
             return False
         if not hmac.compare_digest(manifest.sealed_hash, H_bytes(sealed)):
@@ -327,14 +342,19 @@ class ProvenanceReceipt:
     ) -> "ProvenanceReceipt":
         return cls(manifest=manifest, proof=proof, sth=sth)
 
-    def verify(self, sealed: bytes) -> bool:
+    def verify(self, sealed: bytes, expected_operator_vk: bytes | None = None) -> bool:
         """
         Verify this receipt against the sealed blob it refers to.
 
         True iff the operator's STH signature is valid, the sealed blob matches
-        the manifest, and the manifest is included under the attested root.
+        the manifest, and the manifest is included under the attested root. Pass
+        `expected_operator_vk` to also require a specific, trusted notary —
+        without it, a receipt from any operator key passes (see
+        ProvenanceLog.verify_capture's security note).
         """
-        return ProvenanceLog.verify_capture(self.manifest, sealed, self.proof, self.sth)
+        return ProvenanceLog.verify_capture(
+            self.manifest, sealed, self.proof, self.sth, expected_operator_vk
+        )
 
     # -- serialization (each component owns its own to_dict/from_dict) --
 

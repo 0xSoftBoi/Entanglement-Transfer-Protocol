@@ -35,6 +35,7 @@ backend, and refuses to run if only the PoC fallback is active.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import sys
@@ -98,12 +99,17 @@ def _keypair_from_dict(d: dict) -> KeyPair:
 
 
 def _write_key(path: Path, kp: KeyPair, *, public_only: bool) -> None:
-    path.write_text(json.dumps(_keypair_to_dict(kp, public_only=public_only), indent=2))
-    if not public_only:
-        try:
-            os.chmod(path, 0o600)  # secret material — owner-only
-        except OSError:
-            pass
+    data = json.dumps(_keypair_to_dict(kp, public_only=public_only), indent=2)
+    if public_only:
+        path.write_text(data)
+        return
+    # Secret material: create owner-only (0600) from the start so there is no
+    # window where the private key is world-readable under the default umask.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data.encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 def _read_key(path: Path) -> KeyPair:
@@ -264,20 +270,38 @@ def cmd_publish(args) -> int:
 
 
 def cmd_verify(args) -> int:
-    receipt = ProvenanceReceipt.from_json(Path(args.receipt).read_text())
+    # Receipts are untrusted input; parse defensively.
+    try:
+        receipt = ProvenanceReceipt.from_json(Path(args.receipt).read_text())
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"FAIL — malformed receipt ({type(e).__name__})")
+        return 1
     sealed = Path(args.sealed).read_bytes()
-    ok = receipt.verify(sealed)
+
+    expected_vk = None
+    if args.operator:
+        op = _read_key(Path(args.operator))
+        expected_vk = op.vk
+
+    ok = receipt.verify(sealed, expected_operator_vk=expected_vk)
     m = receipt.manifest
     if ok:
         print("PASS — provenance verified")
         print(f"    capture id   : {m.capture_id}")
         print(f"    originator   : {m.originator_id}")
         print(f"    captured_at  : {m.captured_at}")
-        print(f"    operator vk  : {b64e(receipt.sth.operator_vk)[:24]}…")
+        if expected_vk is not None:
+            print(f"    operator     : PINNED to {args.operator} ✓")
+        else:
+            print(f"    operator vk  : {b64e(receipt.sth.operator_vk)[:24]}…  "
+                  f"(UNPINNED — pass --operator to prove a trusted notary)")
         print(f"    attested root: {receipt.sth.root_hash.hex()[:24]}…  (STH seq {receipt.sth.sequence})")
         print(f"    proof path   : {receipt.proof.path_length} hashes (O(log N))")
         return 0
-    print("FAIL — provenance could NOT be verified (tampered, mismatched, or forged)")
+    if expected_vk is not None and not hmac.compare_digest(receipt.sth.operator_vk, expected_vk):
+        print("FAIL — receipt was signed by a DIFFERENT operator than --operator")
+    else:
+        print("FAIL — provenance could NOT be verified (tampered, mismatched, or forged)")
     return 1
 
 
@@ -358,6 +382,8 @@ def build_parser() -> argparse.ArgumentParser:
     v = sub.add_parser("verify", help="verify a receipt against a sealed blob (offline)")
     v.add_argument("--sealed", required=True, help="sealed blob")
     v.add_argument("--receipt", required=True, help="receipt file")
+    v.add_argument("--operator", help="pin the trusted notary's public key file "
+                                      "(without it, any operator's receipt passes)")
     v.set_defaults(func=cmd_verify)
 
     o = sub.add_parser("open", help="recover the plaintext (authorized recipient only)")

@@ -111,6 +111,32 @@ class TestTamperAndMisuse:
         with pytest.raises(SystemExit):
             main(["init", str(tmp_path / "n2"), "--operator", str(pub)])
 
+    def test_malformed_receipt_fails_gracefully(self, tmp_path):
+        bad = tmp_path / "bad.receipt"
+        bad.write_text('{"manifest": {"content_hash": "!!notbase64!!"}}')
+        sealed = tmp_path / "x.sealed"
+        sealed.write_bytes(b"blob")
+        # Must return 1 (clean FAIL), not raise an uncaught exception.
+        assert main(["verify", "--sealed", str(sealed), "--receipt", str(bad)]) == 1
+
+
+class TestOperatorPin:
+    def test_verify_with_matching_operator_pin_passes(self, notary, tmp_path):
+        # The notary's operator public key (extract from the store's secret key).
+        op_pub = tmp_path / "op.pub"
+        assert main(["pub", "-i", str(notary["dir"] / "operator.key"), "-o", str(op_pub)]) == 0
+        _, sealed, receipt = _seal(notary, name="d")
+        assert main(["verify", "--sealed", str(sealed), "--receipt", str(receipt),
+                     "--operator", str(op_pub)]) == 0
+
+    def test_verify_rejects_wrong_operator_pin(self, notary, tmp_path):
+        _, sealed, receipt = _seal(notary, name="d")
+        wrong_pub = tmp_path / "wrong.pub"
+        _keygen(tmp_path, "wrong", with_pub=True)
+        # a different notary's public key must not verify this receipt
+        assert main(["verify", "--sealed", str(sealed), "--receipt", str(receipt),
+                     "--operator", str(tmp_path / "wrong.pub")]) == 1
+
 
 class TestReceiptSerialization:
     def test_receipt_json_roundtrip(self, notary, tmp_path):

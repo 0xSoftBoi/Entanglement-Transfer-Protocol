@@ -18,7 +18,7 @@ import pytest
 from src.ltp import KeyPair
 from src.ltp.merkle_log import MerkleLog
 from src.ltp.primitives import H_bytes
-from src.ltp.provenance import ProvenanceLog, CaptureManifest, SEAL_OVERHEAD
+from src.ltp.provenance import ProvenanceLog, ProvenanceReceipt, CaptureManifest, SEAL_OVERHEAD
 
 
 @pytest.fixture
@@ -148,6 +148,39 @@ class TestTamperEvidence:
 # ---------------------------------------------------------------------------
 # Fork detection + append-only
 # ---------------------------------------------------------------------------
+
+class TestOperatorPinning:
+    """A receipt only proves authenticity when the operator key is pinned."""
+
+    def test_attacker_receipt_passes_without_pin_but_fails_with_pin(self, recipient):
+        honest = KeyPair.generate("honest-notary")
+        attacker = KeyPair.generate("attacker")
+        artifact = b"authentic evidence"
+
+        # Attacker runs their OWN notary, seals the same artifact, lies in metadata.
+        alog = ProvenanceLog(attacker)
+        cap, idx = alog.record_capture(artifact, recipient.ek, originator_id="sensor-7")
+        sth = alog.publish_sth()
+        proof = alog.inclusion_proof(idx)
+
+        # Unpinned: self-consistent, so it verifies (this is the documented gap).
+        assert ProvenanceLog.verify_capture(cap.manifest, cap.sealed, proof, sth)
+        # Pinned to the honest notary: the forgery is rejected.
+        assert not ProvenanceLog.verify_capture(
+            cap.manifest, cap.sealed, proof, sth, expected_operator_vk=honest.vk
+        )
+        # Pinned to the actual signer: passes.
+        assert ProvenanceLog.verify_capture(
+            cap.manifest, cap.sealed, proof, sth, expected_operator_vk=attacker.vk
+        )
+
+    def test_receipt_verify_honors_pin(self, plog, recipient):
+        cap, idx = plog.record_capture(b"x", recipient.ek, originator_id="s")
+        sth = plog.publish_sth()
+        receipt = ProvenanceReceipt.build(cap.manifest, plog.inclusion_proof(idx), sth)
+        assert receipt.verify(cap.sealed, expected_operator_vk=sth.operator_vk)
+        assert not receipt.verify(cap.sealed, expected_operator_vk=b"\x00" * len(sth.operator_vk))
+
 
 class TestForkAndAppendOnly:
     def test_equivocation_detected(self, operator, recipient):
