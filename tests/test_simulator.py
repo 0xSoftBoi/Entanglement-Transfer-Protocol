@@ -320,7 +320,11 @@ class TestSimNode:
         nonce = os.urandom(16)
         response = node.respond_to_audit("eid-1", 0, nonce)
         assert response is not None
-        assert response.startswith("blake2b:")
+        # The audit hash uses the backend-dispatching H() (blake2b in pure-PoC
+        # mode, SHA3-256 when real crypto is installed) — assert against the
+        # actual protocol value instead of hardcoding one backend's prefix.
+        from src.ltp.primitives import H
+        assert response == H(b"encrypted" + nonce)
 
     def test_audit_missing_shard_returns_none(self):
         node = SimNode("n1", "us-east")
