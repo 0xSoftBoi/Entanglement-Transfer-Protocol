@@ -52,9 +52,11 @@ etp-custody receive --key bob.key --bundle parcel.bundle --receipt parcel.receip
 device signatures) · **Confidentiality** (constant-overhead PQC seal) ·
 **Delay-tolerance** (erasure-coded shards, any *k* of *n* reconstruct).
 
-→ [`bash examples/custody_demo.sh`](examples/custody_demo.sh) runs the whole story ·
+→ [`bash examples/custody_demo.sh`](examples/custody_demo.sh) runs the whole story
+([recorded cast](website/demo.cast) — play with `asciinema play website/demo.cast`) ·
 Full guide: [`docs/PROVENANCE_CLI.md`](docs/PROVENANCE_CLI.md) ·
-Landing page: [`website/index.html`](website/index.html)
+[Landing page](website/index.html) · [Verify a receipt](website/verify.html) ·
+[Tenant console](website/console.html) · Cloud service: [`docs/cloud/`](docs/cloud/CUSTODY_CLOUD_DESIGN.md)
 
 <div align="center"><a href="website/index.html">
 <img src="website/preview.png" alt="ETP Custody landing page" width="760">

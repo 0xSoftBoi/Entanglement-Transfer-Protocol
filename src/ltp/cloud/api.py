@@ -38,6 +38,11 @@ def create_app(service: CloudNotaryService) -> FastAPI:
                     "locally and submit only public manifests; receipts verify "
                     "offline. See docs/cloud/openapi.yaml.",
     )
+    # Static console/verifier pages run on any origin; data is public manifests
+    # and auth is bearer-per-request, so permissive CORS is safe and required.
+    from fastapi.middleware.cors import CORSMiddleware
+    api.add_middleware(CORSMiddleware, allow_origins=["*"],
+                       allow_methods=["*"], allow_headers=["*"])
 
     # -- auth dependencies ------------------------------------------------
 

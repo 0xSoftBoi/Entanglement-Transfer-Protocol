@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Console — ETP Custody</title>
+<meta name="description" content="Tenant console for the ETP Custody notary: usage, captures, tree heads, and on-chain anchors.">
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#111826; --panel2:#0d1420; --line:#1e293b;
+    --ink:#e6edf3; --dim:#8b98a9; --faint:#5b6675;
+    --teal:#2dd4bf; --violet:#a78bfa; --grn:#34d399; --amber:#fbbf24; --red:#f87171;
+    --mono:'SF Mono',ui-monospace,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Inter,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,#12203a 0%,transparent 60%),var(--bg);
+       color:var(--ink);font-family:var(--sans);line-height:1.55;-webkit-font-smoothing:antialiased}
+  a{color:var(--teal);text-decoration:none}
+  .wrap{max-width:1040px;margin:0 auto;padding:0 24px}
+  nav{position:sticky;top:0;z-index:10;backdrop-filter:blur(10px);
+      background:rgba(10,14,20,.72);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700}
+  .brand .glyph{width:26px;height:26px;border-radius:7px;
+    background:linear-gradient(135deg,var(--teal),var(--violet));display:grid;place-items:center;
+    color:#04121a;font-weight:800;font-size:15px}
+  header{padding:40px 0 6px}
+  h1{font-size:clamp(24px,3.6vw,32px);margin:0 0 6px;letter-spacing:-.6px}
+  .sub{color:var(--dim);margin:0 0 22px;font-size:14.5px}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:16px}
+  .card h2{margin:0 0 12px;font-size:15px;color:var(--dim);font-weight:600;
+           text-transform:uppercase;letter-spacing:.6px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .row input{flex:1;min-width:220px;background:#0b111b;border:1px solid var(--line);border-radius:10px;
+    color:var(--ink);font-family:var(--mono);font-size:12.5px;padding:10px 12px}
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:10px 18px;border-radius:10px;font-weight:600;
+    font-size:14px;border:none;cursor:pointer;background:linear-gradient(135deg,var(--teal),#22b8a6);color:#04121a}
+  .btn.ghost{background:var(--panel2);color:var(--ink);border:1px solid var(--line)}
+  .conn{font-size:13px;color:var(--faint);margin-top:10px}
+  .conn.ok{color:var(--grn)}
+  .conn.err{color:var(--red)}
+
+  /* stat tiles — hero number + small label, no chart junk */
+  .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px;margin-bottom:16px}
+  .tile{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+  .tile b{display:block;font-size:30px;line-height:1.15;letter-spacing:-.5px;
+    background:linear-gradient(120deg,var(--teal),var(--violet));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .tile span{color:var(--dim);font-size:13px}
+  .tile .fine{display:block;color:var(--faint);font-size:11.5px;font-family:var(--mono);
+    margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  table{width:100%;border-collapse:collapse;font-size:13.5px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #16202f;vertical-align:top}
+  th{color:var(--faint);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.5px}
+  td.mono{font-family:var(--mono);font-size:12px;color:var(--dim)}
+  tr:last-child td{border-bottom:none}
+  .empty{color:var(--faint);font-size:13.5px;padding:8px 2px}
+
+  /* status chips — icon + label always; color is reinforcement, never the sole cue */
+  .chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;
+    border-radius:999px;padding:3px 10px;border:1px solid}
+  .chip.confirmed{color:var(--grn);border-color:#1a4d3c;background:#0c1f18}
+  .chip.submitted{color:var(--teal);border-color:#14352f;background:#0c1b18}
+  .chip.pending{color:var(--amber);border-color:#3a2f14;background:#1a1408}
+  .chip.failed{color:var(--red);border-color:#5b2a2e;background:#231012}
+  .badge{font-size:11px;color:var(--faint)}
+  footer{color:var(--faint);font-size:13px;padding:18px 0 48px}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <div class="brand"><span class="glyph">⛨</span> ETP&nbsp;Custody <span class="badge">console</span></div>
+  <div style="display:flex;gap:18px;font-size:14px">
+    <a href="verify.html">Verify</a><a href="index.html">Home</a>
+  </div>
+</div></nav>
+
+<header><div class="wrap">
+  <h1>Tenant console</h1>
+  <p class="sub">Usage, captures, tree heads, and on-chain anchors for your workspace.
+     Your API key stays in this browser (localStorage) and is sent only to the notary you configure.</p>
+</div></header>
+
+<div class="wrap">
+  <div class="card">
+    <h2>Connection</h2>
+    <div class="row">
+      <input id="url" placeholder="notary URL, e.g. http://localhost:8080">
+      <input id="key" placeholder="API key (etpk_…)" type="password">
+      <button class="btn" id="connect">Connect</button>
+      <button class="btn ghost" id="refresh" style="display:none">Refresh</button>
+    </div>
+    <div class="conn" id="conn">not connected</div>
+  </div>
+
+  <div id="dash" style="display:none">
+    <div class="tiles">
+      <div class="tile"><b id="t-captures">—</b><span>notarized captures</span>
+        <span class="fine">the billable unit</span></div>
+      <div class="tile"><b id="t-sth">—</b><span>latest tree head</span>
+        <span class="fine" id="t-root">—</span></div>
+      <div class="tile"><b id="t-anchored">—</b><span>anchors confirmed on-chain</span>
+        <span class="fine" id="t-anchor-note">—</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Recent captures</h2>
+      <div id="captures"></div>
+    </div>
+
+    <div class="card">
+      <h2>On-chain anchors</h2>
+      <div id="anchors"></div>
+    </div>
+  </div>
+
+  <footer>Receipts verify offline — this console is a window, not the trust root.
+    <a href="verify.html">Verify a receipt →</a></footer>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+    ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+  // status chips: icon + label always (color is never the only cue)
+  const CHIP = {
+    confirmed: "✓ confirmed", submitted: "↗ submitted",
+    pending: "○ pending", failed: "✗ failed",
+  };
+  const chip = (s) =>
+    `<span class="chip ${esc(s)}">${CHIP[s] || esc(s)}</span>`;
+
+  const fmtTime = (t) => new Date(t * 1000).toISOString().replace("T", " ").slice(0, 19) + "Z";
+
+  async function api(path) {
+    const resp = await fetch($("url").value.replace(/\/$/, "") + path, {
+      headers: { Authorization: "Bearer " + $("key").value.trim() },
+    });
+    if (resp.status === 404) return null;
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return resp.json();
+  }
+
+  async function load() {
+    const conn = $("conn");
+    try {
+      const [usage, sth, captures, anchors] = await Promise.all([
+        api("/v1/usage"), api("/v1/sth"), api("/v1/captures"), api("/v1/anchors"),
+      ]);
+      localStorage.setItem("etp.url", $("url").value);
+      localStorage.setItem("etp.key", $("key").value);
+      conn.textContent = "connected ✓";
+      conn.className = "conn ok";
+      $("dash").style.display = "block";
+      $("refresh").style.display = "inline-flex";
+
+      $("t-captures").textContent = usage.captures.toLocaleString();
+      $("t-sth").textContent = sth ? `#${sth.sequence}` : "—";
+      $("t-root").textContent = sth ? `root ${sth.root.slice(0, 22)}…`
+                                    + (sth.cosignature ? " · witness-cosigned" : "") : "no captures yet";
+
+      const confirmed = (anchors || []).filter((a) => a.status === "confirmed").length;
+      $("t-anchored").textContent = confirmed;
+      $("t-anchor-note").textContent = (anchors || []).length
+        ? `${anchors.length} total anchor${anchors.length > 1 ? "s" : ""}`
+        : "anchoring is the Verified tier";
+
+      $("captures").innerHTML = (captures && captures.length)
+        ? "<table><tr><th>leaf</th><th>capture id</th><th>originator</th>" +
+          "<th>attestation</th><th>captured</th></tr>" +
+          captures.map((c) =>
+            `<tr><td class="mono">${c.leaf_index}</td>` +
+            `<td class="mono">${esc(c.capture_id.slice(0, 20))}…</td>` +
+            `<td>${esc(c.originator_id)}</td>` +
+            `<td>${c.device_signed ? "🔏 device-signed" : "operator-vouched"}</td>` +
+            `<td class="mono">${fmtTime(c.captured_at)}</td></tr>`).join("") +
+          "</table>"
+        : '<div class="empty">no captures yet — notarize something: ' +
+          '<span style="font-family:var(--mono)">etp-custody notarize file.pdf</span></div>';
+
+      $("anchors").innerHTML = (anchors && anchors.length)
+        ? "<table><tr><th>STH seq</th><th>status</th><th>tx</th><th>block</th><th>root</th></tr>" +
+          anchors.map((a) =>
+            `<tr><td class="mono">${a.sth_sequence}</td>` +
+            `<td>${chip(a.status)}</td>` +
+            `<td class="mono">${a.tx_ref ? esc(a.tx_ref.slice(0, 18)) + "…" : "—"}</td>` +
+            `<td class="mono">${a.block_number ?? "—"}</td>` +
+            `<td class="mono">${esc(a.root.slice(0, 18))}…</td></tr>`).join("") +
+          "</table>"
+        : '<div class="empty">no anchors — upgrade to the Verified plan to timestamp ' +
+          "tree heads on LTPAnchorRegistry</div>";
+    } catch (e) {
+      conn.textContent = `connection failed: ${e.message}`;
+      conn.className = "conn err";
+    }
+  }
+
+  $("connect").addEventListener("click", load);
+  $("refresh").addEventListener("click", load);
+  // Query params (demo/deep-link) take precedence over saved credentials.
+  const q = new URLSearchParams(location.search);
+  $("url").value = q.get("url") || localStorage.getItem("etp.url") || "";
+  $("key").value = q.get("key") || localStorage.getItem("etp.key") || "";
+  if ($("url").value && $("key").value) load();
+})();
+</script>
+</body>
+</html>

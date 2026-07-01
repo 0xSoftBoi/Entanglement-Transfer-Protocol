@@ -261,8 +261,20 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        # The console/verifier are static pages on any origin; receipts and
+        # manifests are public data and auth is bearer-per-request, so a
+        # permissive CORS policy is safe and required.
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    def do_OPTIONS(self) -> None:  # CORS preflight (Authorization header)
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Authorization, Content-Type, X-Admin-Token")
+        self.end_headers()
 
     def _api_key(self) -> str | None:
         auth = self.headers.get("Authorization", "")
