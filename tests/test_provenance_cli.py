@@ -244,6 +244,57 @@ class TestSendReceive:
         assert out.read_bytes() == content
 
 
+class TestInspect:
+    def test_inspect_valid_receipt(self, notary, tmp_path):
+        _, _, receipt = _seal(notary, name="d")
+        assert main(["inspect", "--receipt", str(receipt)]) == 0
+
+    def test_inspect_with_bundle_reports_shard_sufficiency(self, notary, tmp_path):
+        _, sealed, receipt = _seal(notary, content=b"payload" * 20, name="d")
+        assert main(["bundle", "--in", str(sealed), "--n", "6", "--k", "4",
+                     "--prefix", str(tmp_path / "d")]) == 0
+        shards = sorted(str(p) for p in tmp_path.glob("d.shard*"))
+        # enough shards → inspect passes
+        assert main(["inspect", "--receipt", str(receipt),
+                     "--bundle", str(tmp_path / "d.bundle")] + shards[:4]) == 0
+        # too few shards → inspect fails the sufficiency check
+        assert main(["inspect", "--receipt", str(receipt),
+                     "--bundle", str(tmp_path / "d.bundle")] + shards[:2]) == 1
+
+    def test_inspect_tampered_receipt_fails(self, notary, tmp_path):
+        _, _, receipt = _seal(notary, name="d")
+        d = json.loads(receipt.read_text())
+        d["signed_tree_head"]["root"] = "AAAA" + d["signed_tree_head"]["root"][4:]
+        receipt.write_text(json.dumps(d))
+        assert main(["inspect", "--receipt", str(receipt)]) == 1
+
+
+class TestAudit:
+    def test_two_receipts_same_notary_are_consistent(self, notary, tmp_path):
+        _, _, ra = _seal(notary, name="a")   # STH seq 0
+        _, _, rb = _seal(notary, name="b")   # STH seq 1
+        assert main(["audit", str(notary["dir"]), str(ra), str(rb)]) == 0
+
+    def test_receipt_from_other_notary_is_not_consistent(self, notary, tmp_path):
+        _, _, ra = _seal(notary, name="a")   # notary A, seq 0
+
+        # A second, unrelated notary B with its own operator.
+        op2, _ = _keygen(tmp_path, "op2")
+        ndir2 = tmp_path / "notary2"
+        assert main(["init", str(ndir2), "--operator", str(op2)]) == 0
+        src = tmp_path / "z.txt"; src.write_bytes(b"z")
+        sealed2 = tmp_path / "z.sealed"; rb = tmp_path / "z.receipt"
+        assert main(["seal", str(ndir2), "--in", str(src), "--to", str(notary["bob_pub"]),
+                     "--originator", "x", "--out", str(sealed2), "--receipt", str(rb)]) == 0
+        assert main(["seal", str(ndir2), "--in", str(src), "--to", str(notary["bob_pub"]),
+                     "--originator", "x", "--out", str(tmp_path / "z2.sealed"),
+                     "--receipt", str(tmp_path / "z2.receipt")]) == 0
+
+        # A's receipt (seq 0) vs B's second receipt (seq 1) → not one append-only log.
+        assert main(["audit", str(notary["dir"]), str(ra),
+                     str(tmp_path / "z2.receipt")]) == 1
+
+
 class TestReceiptSerialization:
     def test_receipt_json_roundtrip(self, notary, tmp_path):
         _, sealed, receipt = _seal(notary, content=b"payload", name="d")

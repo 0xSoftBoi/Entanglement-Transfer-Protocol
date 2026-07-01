@@ -94,7 +94,25 @@ The step-by-step commands below still exist for finer control.
 | `open --key KEY --sealed S [--receipt R] -o OUT` | Recover plaintext (authorized recipient only) |
 | `bundle --in S --n N --k K [--prefix P]` | Erasure-code a sealed blob into N shards; any K reconstruct |
 | `reassemble --bundle B --out S SHARD...` | Reconstruct a sealed blob from any K surviving shards |
+| `inspect --receipt R [--bundle B] [SHARD...]` | Describe a receipt/parcel and check internal validity (no keys) |
+| `audit DIR RECEIPT_A RECEIPT_B` | Verify two receipts are from one append-only log (no rewrite/fork) |
 | `log DIR` | Show notary state |
+
+## Inspecting and auditing
+
+`inspect` is a keyless, read-only diagnostic — it prints what a receipt claims and
+runs the structural checks that don't need secrets: the operator's STH signature,
+that the inclusion proof reconstructs the attested root, the originator (device)
+signature if present, and — given `--bundle` + shards — whether enough valid
+shards are present to reconstruct. Use it to triage a parcel before `receive`.
+It reports facts and internal soundness, not authenticity (that needs pinning via
+`verify`/`receive`).
+
+`audit` is the *consistency* half of the transparency log (inclusion proofs are
+the other). Given two receipts from a notary, it proves via an RFC-6962
+consistency proof that the later log state is an append-only extension of the
+earlier — i.e. the notary did not rewrite or fork history between them. Collect
+receipts over time and audit any pair to hold the notary honest.
 
 ## Delay-tolerant transport (erasure-coded bundles)
 

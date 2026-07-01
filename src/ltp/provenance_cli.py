@@ -48,7 +48,7 @@ from .provenance import (
     BundleManifest, bundle_sealed, reassemble_sealed,
 )
 from .encoding import b64e, b64d
-from .primitives import real_backend_active
+from .primitives import real_backend_active, H_bytes, MLDSA
 from .merkle_log import SignedTreeHead
 
 _KEY_FORMAT = "etp-custody-key/1"
@@ -497,6 +497,86 @@ def cmd_receive(args) -> int:
     return 0
 
 
+def cmd_inspect(args) -> int:
+    """Read-only: describe a receipt/parcel and check its internal validity (no keys)."""
+    try:
+        receipt = ProvenanceReceipt.from_json(Path(args.receipt).read_text())
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"error — malformed receipt ({type(e).__name__})")
+        return 1
+    m = receipt.manifest
+
+    print(f"receipt: {args.receipt}")
+    print(f"    capture id : {m.capture_id}")
+    print(f"    originator : {m.originator_id}"
+          + ("  (device-signed)" if m.originator_vk else "  (operator-vouched only)"))
+    print(f"    captured_at: {m.captured_at}")
+    print(f"    operator vk: {b64e(receipt.sth.operator_vk)[:24]}…")
+    print(f"    log state  : tree_size={receipt.sth.tree_size}  STH seq={receipt.sth.sequence}  "
+          f"leaf={receipt.proof.leaf_index}")
+    if m.meta:
+        print(f"    meta       : {m.meta}")
+
+    checks = [
+        ("operator STH signature valid", receipt.sth.verify()),
+        ("inclusion proof reconstructs the attested root",
+         receipt.proof.verify(m.canonical_bytes(), receipt.sth.root_hash)),
+    ]
+    if m.originator_vk:
+        checks.append((
+            "originator (device) signature valid",
+            MLDSA.verify(m.originator_vk, m.originator_signed_payload(), m.originator_sig),
+        ))
+    if args.bundle:
+        bundle = BundleManifest.from_json(Path(args.bundle).read_text())
+        shards = _collect_shards(args.shards)
+        valid = sum(
+            1 for i, s in shards.items()
+            if 0 <= i < len(bundle.shard_hashes)
+            and hmac.compare_digest(H_bytes(s), bundle.shard_hashes[i])
+        )
+        checks.append((f"shards present: {valid}/{bundle.n} valid, need {bundle.k}",
+                       valid >= bundle.k))
+        if valid >= bundle.k:
+            try:
+                recon = reassemble_sealed(bundle, shards)
+                checks.append(("reassembled blob matches manifest sealed_hash",
+                               hmac.compare_digest(H_bytes(recon), m.sealed_hash)))
+            except ValueError:
+                checks.append(("reassembly", False))
+
+    print("    checks:")
+    for name, ok in checks:
+        print(f"      [{'✓' if ok else '✗'}] {name}")
+    all_ok = all(ok for _, ok in checks)
+    print("    → structurally valid" if all_ok else "    → STRUCTURAL CHECK FAILED")
+    print("    (authenticity requires pinning: use `verify --operator/--expect-originator`)")
+    return 0 if all_ok else 1
+
+
+def cmd_audit(args) -> int:
+    """Verify two receipts came from one append-only log (RFC 6962 consistency)."""
+    store = NotaryStore(Path(args.dir))
+    plog = store.load_log()
+    try:
+        ra = ProvenanceReceipt.from_json(Path(args.receipt_a).read_text())
+        rb = ProvenanceReceipt.from_json(Path(args.receipt_b).read_text())
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"error — malformed receipt ({type(e).__name__})")
+        return 1
+    a, b = ra.sth, rb.sth
+    older, newer = (a, b) if a.sequence <= b.sequence else (b, a)
+
+    if plog.verify_append_only(older, newer):
+        print(f"CONSISTENT — STH seq {newer.sequence} (size {newer.tree_size}) is an "
+              f"append-only extension of seq {older.sequence} (size {older.tree_size})")
+        print("    the notary did not rewrite or fork history between these two receipts")
+        return 0
+    print("NOT CONSISTENT — the two receipts are not linked by an append-only extension")
+    print("    (possible history rewrite / fork, or receipts from a different notary)")
+    return 1
+
+
 def cmd_log(args) -> int:
     store = NotaryStore(Path(args.dir))
     plog = store.load_log()
@@ -603,6 +683,18 @@ def build_parser() -> argparse.ArgumentParser:
     rc.add_argument("--expect-originator", help="pin the capturing device's public key file")
     rc.add_argument("shards", nargs="+", help="shard files (indices from .shardNN names)")
     rc.set_defaults(func=cmd_receive)
+
+    ins = sub.add_parser("inspect", help="describe a receipt/parcel and check internal validity (no keys)")
+    ins.add_argument("--receipt", required=True, help="receipt file")
+    ins.add_argument("--bundle", help="bundle manifest (.bundle) — also checks shard sufficiency")
+    ins.add_argument("shards", nargs="*", help="shard files to check (with --bundle)")
+    ins.set_defaults(func=cmd_inspect)
+
+    au = sub.add_parser("audit", help="verify two receipts are from one append-only log")
+    au.add_argument("dir", help="notary directory")
+    au.add_argument("receipt_a", help="first receipt")
+    au.add_argument("receipt_b", help="second receipt")
+    au.set_defaults(func=cmd_audit)
 
     lg = sub.add_parser("log", help="show notary state")
     lg.add_argument("dir", help="notary directory")
