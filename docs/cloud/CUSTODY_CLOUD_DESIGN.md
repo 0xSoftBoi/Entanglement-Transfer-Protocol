@@ -98,8 +98,11 @@ digests/roots. Verification never *requires* the service or the chain.
 | Anchor worker | `cloud/anchoring.py` | Scheduled (10 min default) or long-lived; KMS-held EOA signer |
 | Event indexer | `cloud/indexer.py` — depth-final `Anchored` logs, persisted cursor; `reconcile()` safety net | Production LogSource wraps the web3 contract handle |
 | Webhook dispatcher | `cloud/webhooks.py` — outbox + backoff + `X-ETP-Signature` HMAC | Same, on a scheduler |
-| Metering | `usage()` counts captures | Nightly export → Stripe metered billing item |
-| Console | designed (§6) | Next.js 14, deployed on the existing `website/` domain |
+| Metering / billing | `cloud/billing.py` — idempotent usage snapshots + Stripe-metered-shaped JSONL export | Nightly export → Stripe metered billing item (push is one authorized call away) |
+| Metrics | `cloud/metrics.py` — Prometheus text exposition at `GET /metrics` (both HTTP layers) | Scraped; alert rules (anchor-stuck, signer balance) in the Prometheus config |
+| Witness | `cloud/witness.py` — independent keypair cosigns STHs; cosignature served in `/v1/sth` | Second operator on separate infrastructure |
+| Audit report | `cloud/report.py` — evidence bundle (JSON+MD), STH chain verified at generation time | Vertical framing (21 CFR 11 / NERC-CIP) layers on per design partner |
+| Console | `website/console.html` — static, API-key auth (v1) | Next.js 14 + OAuth upgrade on the existing `website/` domain |
 | Contracts | **already deployed** (v5) | Proxy `0xB29d…0bF4`, MultiSig→Timelock governance — unchanged |
 
 ## 4. Database schema

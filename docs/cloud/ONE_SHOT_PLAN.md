@@ -1,5 +1,10 @@
 # One-Shot Plan — Finishing Everything Autonomous in a Single Pass
 
+> **Status: EXECUTED.** All ten items shipped in three commits on
+> `claude/satellite-cubesat-scope-7w6o7t` (backend batch → console/cast →
+> launch drafts + docs sync), suite green throughout. The parked list at the
+> bottom is still the live blocked-on-you inventory.
+
 Scope: every remaining item from `EXECUTION_PLAN.md` that needs nothing from
 the user, executed in one continuous run, ending with a green suite and 2–3
 clean commits on the working branch. Items blocked on the user stay parked
