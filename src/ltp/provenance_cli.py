@@ -40,15 +40,10 @@ import os
 import sys
 from pathlib import Path
 
-from .keypair import KeyPair, SealedBox
-from .provenance import (
-    ProvenanceLog,
-    ProvenanceReceipt,
-    CaptureManifest,
-    SEAL_OVERHEAD,
-    _b64e,
-    _b64d,
-)
+from .keypair import KeyPair
+from .provenance import ProvenanceLog, ProvenanceReceipt, CaptureManifest, SEAL_OVERHEAD
+from .encoding import b64e, b64d
+from .primitives import real_backend_active
 from .merkle_log import SignedTreeHead
 
 _KEY_FORMAT = "etp-custody-key/1"
@@ -63,11 +58,10 @@ def _require_real_crypto() -> None:
     """
     Refuse to run on PoC simulations: their keys live in per-process lookup
     tables and cannot be persisted/shared, which would silently break the CLI.
+    Delegates to primitives.real_backend_active(), which also catches the case
+    where an active profile would silently fall back despite the libs installed.
     """
-    try:
-        import pqcrypto  # noqa: F401
-        import nacl  # noqa: F401
-    except Exception:
+    if not real_backend_active():
         sys.stderr.write(
             "error: etp-custody requires real post-quantum crypto.\n"
             "       install it with:  pip install pqcrypto pynacl\n"
@@ -85,19 +79,20 @@ def _keypair_to_dict(kp: KeyPair, *, public_only: bool) -> dict:
         "format": _KEY_FORMAT,
         "label": kp.label,
         "public_only": public_only,
-        "ek": _b64e(kp.ek),
-        "vk": _b64e(kp.vk),
-        "dk": "" if public_only else _b64e(kp.dk),
-        "sk": "" if public_only else _b64e(kp.sk),
+        "ek": b64e(kp.ek),
+        "vk": b64e(kp.vk),
+        "dk": "" if public_only else b64e(kp.dk),
+        "sk": "" if public_only else b64e(kp.sk),
     }
 
 
 def _keypair_from_dict(d: dict) -> KeyPair:
+    # ek/vk are always present and non-empty; dk/sk are "" for public-only keys.
     return KeyPair(
-        ek=_b64d(d["ek"]) if d["ek"] else b"",
-        dk=_b64d(d["dk"]) if d.get("dk") else b"",
-        vk=_b64d(d["vk"]) if d["vk"] else b"",
-        sk=_b64d(d["sk"]) if d.get("sk") else b"",
+        ek=b64d(d["ek"]),
+        dk=b64d(d["dk"]) if d.get("dk") else b"",
+        vk=b64d(d["vk"]),
+        sk=b64d(d["sk"]) if d.get("sk") else b"",
         label=d.get("label", ""),
     )
 
@@ -116,23 +111,14 @@ def _read_key(path: Path) -> KeyPair:
 
 
 # ---------------------------------------------------------------------------
-# STH (de)serialization for the notary's sths.jsonl
-# ---------------------------------------------------------------------------
-
-def _sth_to_dict(sth: SignedTreeHead) -> dict:
-    return {
-        "sequence": sth.sequence,
-        "tree_size": sth.tree_size,
-        "timestamp": sth.timestamp,
-        "root": _b64e(sth.root_hash),
-        "operator_vk": _b64e(sth.operator_vk),
-        "signature": _b64e(sth.signature),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Notary store (file-backed, reconstructable)
 # ---------------------------------------------------------------------------
+
+def _read_lines(path: Path) -> list[str]:
+    """Read a jsonl file once, returning its non-empty lines (empty if absent)."""
+    if not path.exists():
+        return []
+    return [line for line in path.read_text().splitlines() if line.strip()]
 
 class NotaryStore:
     """A persisted provenance notary: operator key + append-only manifest log."""
@@ -159,24 +145,14 @@ class NotaryStore:
         return store
 
     def _load_manifests(self) -> list[CaptureManifest]:
-        if not self.records.exists() or not self.records.read_text().strip():
-            return []
-        out = []
-        for line in self.records.read_text().splitlines():
-            if line.strip():
-                out.append(CaptureManifest.from_dict(json.loads(line)))
-        return out
+        return [CaptureManifest.from_dict(json.loads(l)) for l in _read_lines(self.records)]
 
-    def _sth_count(self) -> int:
-        if not self.sths.exists() or not self.sths.read_text().strip():
-            return 0
-        return len([l for l in self.sths.read_text().splitlines() if l.strip()])
+    def sth_count(self) -> int:
+        return len(_read_lines(self.sths))
 
-    def latest_sth_dict(self) -> dict | None:
-        if not self.sths.exists():
-            return None
-        lines = [l for l in self.sths.read_text().splitlines() if l.strip()]
-        return json.loads(lines[-1]) if lines else None
+    def latest_sth(self) -> SignedTreeHead | None:
+        lines = _read_lines(self.sths)
+        return SignedTreeHead.from_dict(json.loads(lines[-1])) if lines else None
 
     def load_log(self) -> ProvenanceLog:
         """Rebuild the in-memory provenance log by replaying stored manifests."""
@@ -186,7 +162,7 @@ class NotaryStore:
         plog = ProvenanceLog(operator)
         for manifest in self._load_manifests():
             plog.append_manifest(manifest)
-        plog.restore_sequence(self._sth_count())
+        plog.restore_sequence(self.sth_count())
         return plog
 
     def append_record(self, manifest: CaptureManifest) -> None:
@@ -195,7 +171,7 @@ class NotaryStore:
 
     def append_sth(self, sth: SignedTreeHead) -> None:
         with self.sths.open("a") as f:
-            f.write(json.dumps(_sth_to_dict(sth)) + "\n")
+            f.write(json.dumps(sth.to_dict()) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -297,9 +273,9 @@ def cmd_verify(args) -> int:
         print(f"    capture id   : {m.capture_id}")
         print(f"    originator   : {m.originator_id}")
         print(f"    captured_at  : {m.captured_at}")
-        print(f"    operator vk  : {_b64e(receipt.operator_vk)[:24]}…")
-        print(f"    attested root: {receipt.sth_root.hex()[:24]}…  (STH seq {receipt.sth_sequence})")
-        print(f"    proof path   : {len(receipt.audit_path)} hashes (O(log N))")
+        print(f"    operator vk  : {b64e(receipt.sth.operator_vk)[:24]}…")
+        print(f"    attested root: {receipt.sth.root_hash.hex()[:24]}…  (STH seq {receipt.sth.sequence})")
+        print(f"    proof path   : {receipt.proof.path_length} hashes (O(log N))")
         return 0
     print("FAIL — provenance could NOT be verified (tampered, mismatched, or forged)")
     return 1
@@ -328,13 +304,13 @@ def cmd_open(args) -> int:
 def cmd_log(args) -> int:
     store = NotaryStore(Path(args.dir))
     plog = store.load_log()
-    latest = store.latest_sth_dict()
+    latest = store.latest_sth()
     print(f"notary: {args.dir}")
     print(f"    captures : {plog.size}")
-    print(f"    STHs     : {store._sth_count()}")
+    print(f"    STHs     : {store.sth_count()}")
     if latest is not None:
-        print(f"    latest STH: seq={latest['sequence']} tree_size={latest['tree_size']} "
-              f"root={_b64d(latest['root']).hex()[:24]}…")
+        print(f"    latest STH: seq={latest.sequence} tree_size={latest.tree_size} "
+              f"root={latest.root_hash.hex()[:24]}…")
     return 0
 
 

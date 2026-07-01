@@ -268,6 +268,11 @@ class SealedBox:
     Total overhead: 1088 + NONCE_SIZE + TAG_SIZE bytes over plaintext
     """
 
+    # Constant byte overhead of a sealed blob over its plaintext (ML-KEM
+    # ciphertext + AEAD nonce + tag), independent of payload size. The single
+    # named source for size accounting (e.g. provenance's SEAL_OVERHEAD).
+    OVERHEAD = MLKEM.CT_SIZE + AEAD.NONCE_SIZE + AEAD.TAG_SIZE
+
     @classmethod
     def seal(cls, plaintext: bytes, receiver_ek: bytes) -> bytes:
         """

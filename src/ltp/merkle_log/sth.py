@@ -90,6 +90,30 @@ class SignedTreeHead:
         """Return True iff the ML-DSA-65 signature is valid for this STH."""
         return MLDSA.verify(self.operator_vk, self.signable_payload(), self.signature)
 
+    def to_dict(self) -> dict:
+        """JSON-serializable form (base64 for byte fields)."""
+        from ..encoding import b64e
+        return {
+            "sequence": self.sequence,
+            "tree_size": self.tree_size,
+            "timestamp": self.timestamp,
+            "root": b64e(self.root_hash),
+            "operator_vk": b64e(self.operator_vk),
+            "signature": b64e(self.signature),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SignedTreeHead":
+        from ..encoding import b64d
+        return cls(
+            sequence=d["sequence"],
+            tree_size=d["tree_size"],
+            timestamp=d["timestamp"],
+            root_hash=b64d(d["root"]),
+            operator_vk=b64d(d["operator_vk"]),
+            signature=b64d(d["signature"]),
+        )
+
     @classmethod
     def sign_envelope(
         cls,

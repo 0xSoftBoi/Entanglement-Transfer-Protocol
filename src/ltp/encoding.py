@@ -20,10 +20,21 @@ Reference: GSX_PRE_BLOCKCHAIN_ROADMAP.md §2.1
 
 from __future__ import annotations
 
+import base64
 import math
 import struct
 
-__all__ = ["CanonicalEncoder"]
+__all__ = ["CanonicalEncoder", "b64e", "b64d"]
+
+
+def b64e(b: bytes) -> str:
+    """Base64-encode bytes to an ASCII string (for JSON serialization lanes)."""
+    return base64.b64encode(b).decode("ascii")
+
+
+def b64d(s: str) -> bytes:
+    """Decode a base64 ASCII string back to bytes."""
+    return base64.b64decode(s.encode("ascii"))
 
 
 class CanonicalEncoder:

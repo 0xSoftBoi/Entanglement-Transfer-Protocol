@@ -81,3 +81,23 @@ class InclusionProof:
     def path_length(self) -> int:
         """Number of hashes in the audit path (≤ ⌈log₂(tree_size)⌉)."""
         return len(self.audit_path)
+
+    def to_dict(self) -> dict:
+        """JSON-serializable form (base64 for byte fields)."""
+        from ..encoding import b64e
+        return {
+            "leaf_index": self.leaf_index,
+            "tree_size": self.tree_size,
+            "audit_path": [b64e(h) for h in self.audit_path],
+            "root": b64e(self.root_hash),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "InclusionProof":
+        from ..encoding import b64d
+        return cls(
+            leaf_index=d["leaf_index"],
+            tree_size=d["tree_size"],
+            audit_path=[b64d(h) for h in d["audit_path"]],
+            root_hash=b64d(d["root"]),
+        )

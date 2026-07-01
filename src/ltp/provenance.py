@@ -7,7 +7,7 @@ defensible, unfunded whitespace —
 
   1. Confidentiality  — SealedBox (ML-KEM-768 + XChaCha20-Poly1305) seals an
                         artifact to a recipient with CONSTANT overhead
-                        (1136 bytes) regardless of payload size. This is the
+                        (SEAL_OVERHEAD bytes) regardless of payload size. This is the
                         harvest-now-decrypt-later defense for data that must
                         stay secret for years/decades.
   2. Provenance       — a CT-style RFC-6962 Merkle log (merkle_log/) notarizes
@@ -48,14 +48,15 @@ Typical flow:
 
 from __future__ import annotations
 
-import base64
+import hmac
 import json
-import struct
 import time
 from dataclasses import dataclass, field
 
 from .keypair import KeyPair, SealedBox
-from .primitives import H_bytes, AEAD, MLKEM
+from .primitives import H_bytes
+from .encoding import CanonicalEncoder, b64e, b64d
+from .domain import DOMAIN_PROVENANCE_CAPTURE
 from .merkle_log import MerkleLog, SignedTreeHead, InclusionProof
 
 __all__ = [
@@ -66,29 +67,12 @@ __all__ = [
     "SEAL_OVERHEAD",
 ]
 
-
-def _b64e(b: bytes) -> str:
-    return base64.b64encode(b).decode("ascii")
-
-
-def _b64d(s: str) -> bytes:
-    return base64.b64decode(s.encode("ascii"))
-
 # Constant byte overhead of a SealedBox seal, independent of plaintext size:
-#   ML-KEM ciphertext (1088) + AEAD nonce (16) + AEAD tag (32) = 1136 bytes.
-# This is the headline property — post-quantum confidentiality whose cost does
-# not grow with payload, which is what makes it viable on scarce/uplink-limited
-# and store-and-forward links.
-SEAL_OVERHEAD = MLKEM.CT_SIZE + AEAD.NONCE_SIZE + AEAD.TAG_SIZE
-
-# Domain-separation tag for the canonical manifest encoding, so manifest bytes
-# can never be confused with any other signed/logged structure in the system.
-_MANIFEST_DOMAIN = b"GSX-LTP/provenance-capture/v1\x00"
-
-
-def _lp(b: bytes) -> bytes:
-    """Length-prefix a byte string (4-byte big-endian length)."""
-    return struct.pack(">I", len(b)) + b
+# ML-KEM ciphertext + AEAD nonce + tag. This is the headline property —
+# post-quantum confidentiality whose cost does not grow with payload, which is
+# what makes it viable on scarce/uplink-limited and store-and-forward links.
+# Single source of truth lives on SealedBox.
+SEAL_OVERHEAD = SealedBox.OVERHEAD
 
 
 @dataclass(frozen=True)
@@ -115,18 +99,19 @@ class CaptureManifest:
         """
         Deterministic byte encoding — the exact bytes appended to the log.
 
-        Same fields always produce the same bytes (metadata keys are sorted),
-        so the leaf hash and every downstream proof are reproducible.
+        Uses the project's domain-tagged CanonicalEncoder (same lane as STHs and
+        commitment records), so metadata is sorted, floats reject NaN/Inf, and
+        the wire format is CBOR-translatable. Reproducible → so are all proofs.
         """
-        meta_json = json.dumps(self.meta, sort_keys=True, separators=(",", ":")).encode()
         return (
-            _MANIFEST_DOMAIN
-            + _lp(self.capture_id.encode())
-            + _lp(self.originator_id.encode())
-            + struct.pack(">d", self.captured_at)
-            + self.content_hash
-            + self.sealed_hash
-            + _lp(meta_json)
+            CanonicalEncoder(DOMAIN_PROVENANCE_CAPTURE)
+            .string(self.capture_id)
+            .string(self.originator_id)
+            .float64(self.captured_at)
+            .raw_bytes(self.content_hash)
+            .raw_bytes(self.sealed_hash)
+            .sorted_map(self.meta)
+            .finalize()
         )
 
     def to_dict(self) -> dict:
@@ -134,8 +119,8 @@ class CaptureManifest:
             "capture_id": self.capture_id,
             "originator_id": self.originator_id,
             "captured_at": self.captured_at,
-            "content_hash": _b64e(self.content_hash),
-            "sealed_hash": _b64e(self.sealed_hash),
+            "content_hash": b64e(self.content_hash),
+            "sealed_hash": b64e(self.sealed_hash),
             "meta": self.meta,
         }
 
@@ -145,8 +130,8 @@ class CaptureManifest:
             capture_id=d["capture_id"],
             originator_id=d["originator_id"],
             captured_at=d["captured_at"],
-            content_hash=_b64d(d["content_hash"]),
-            sealed_hash=_b64d(d["sealed_hash"]),
+            content_hash=b64d(d["content_hash"]),
+            sealed_hash=b64d(d["sealed_hash"]),
             meta=d.get("meta", {}),
         )
 
@@ -221,12 +206,13 @@ class ProvenanceLog:
         batching several captures per STH) to attest the new log state.
         """
         sealed = SealedBox.seal(artifact, recipient_ek)
+        sealed_hash = H_bytes(sealed)
         manifest = CaptureManifest(
-            capture_id=capture_id if capture_id is not None else H_bytes(sealed).hex()[:32],
+            capture_id=capture_id if capture_id is not None else sealed_hash.hex()[:32],
             originator_id=originator_id,
             captured_at=captured_at if captured_at is not None else time.time(),
             content_hash=H_bytes(artifact),
-            sealed_hash=H_bytes(sealed),
+            sealed_hash=sealed_hash,
             meta=meta or {},
         )
         idx = self._log.append(manifest.canonical_bytes())
@@ -281,7 +267,7 @@ class ProvenanceLog:
         """
         if not sth.verify():
             return False
-        if not _consteq(manifest.sealed_hash, H_bytes(sealed)):
+        if not hmac.compare_digest(manifest.sealed_hash, H_bytes(sealed)):
             return False
         return proof.verify(manifest.canonical_bytes(), sth.root_hash)
 
@@ -302,7 +288,7 @@ class ProvenanceLog:
         sealed blob was corrupted (AEAD authentication failure).
         """
         plaintext = SealedBox.unseal(sealed, recipient)
-        if manifest is not None and not _consteq(H_bytes(plaintext), manifest.content_hash):
+        if manifest is not None and not hmac.compare_digest(H_bytes(plaintext), manifest.content_hash):
             raise ValueError(
                 "Recovered plaintext does not match manifest content_hash — "
                 "artifact and provenance record disagree"
@@ -329,18 +315,8 @@ class ProvenanceReceipt:
     """
 
     manifest: CaptureManifest
-    # inclusion proof
-    leaf_index: int
-    tree_size: int
-    audit_path: list  # list[bytes]
-    proof_root: bytes
-    # signed tree head
-    sth_sequence: int
-    sth_tree_size: int
-    sth_timestamp: float
-    sth_root: bytes
-    operator_vk: bytes
-    sth_signature: bytes
+    proof: InclusionProof
+    sth: SignedTreeHead
 
     @classmethod
     def build(
@@ -349,37 +325,7 @@ class ProvenanceReceipt:
         proof: InclusionProof,
         sth: SignedTreeHead,
     ) -> "ProvenanceReceipt":
-        return cls(
-            manifest=manifest,
-            leaf_index=proof.leaf_index,
-            tree_size=proof.tree_size,
-            audit_path=list(proof.audit_path),
-            proof_root=proof.root_hash,
-            sth_sequence=sth.sequence,
-            sth_tree_size=sth.tree_size,
-            sth_timestamp=sth.timestamp,
-            sth_root=sth.root_hash,
-            operator_vk=sth.operator_vk,
-            sth_signature=sth.signature,
-        )
-
-    def inclusion_proof(self) -> InclusionProof:
-        return InclusionProof(
-            leaf_index=self.leaf_index,
-            tree_size=self.tree_size,
-            audit_path=list(self.audit_path),
-            root_hash=self.proof_root,
-        )
-
-    def signed_tree_head(self) -> SignedTreeHead:
-        return SignedTreeHead(
-            sequence=self.sth_sequence,
-            tree_size=self.sth_tree_size,
-            timestamp=self.sth_timestamp,
-            root_hash=self.sth_root,
-            operator_vk=self.operator_vk,
-            signature=self.sth_signature,
-        )
+        return cls(manifest=manifest, proof=proof, sth=sth)
 
     def verify(self, sealed: bytes) -> bool:
         """
@@ -388,30 +334,16 @@ class ProvenanceReceipt:
         True iff the operator's STH signature is valid, the sealed blob matches
         the manifest, and the manifest is included under the attested root.
         """
-        return ProvenanceLog.verify_capture(
-            self.manifest, sealed, self.inclusion_proof(), self.signed_tree_head()
-        )
+        return ProvenanceLog.verify_capture(self.manifest, sealed, self.proof, self.sth)
 
-    # -- serialization ------------------------------------------------
+    # -- serialization (each component owns its own to_dict/from_dict) --
 
     def to_dict(self) -> dict:
         return {
             "format": "etp-provenance-receipt/1",
             "manifest": self.manifest.to_dict(),
-            "inclusion_proof": {
-                "leaf_index": self.leaf_index,
-                "tree_size": self.tree_size,
-                "audit_path": [_b64e(h) for h in self.audit_path],
-                "root": _b64e(self.proof_root),
-            },
-            "signed_tree_head": {
-                "sequence": self.sth_sequence,
-                "tree_size": self.sth_tree_size,
-                "timestamp": self.sth_timestamp,
-                "root": _b64e(self.sth_root),
-                "operator_vk": _b64e(self.operator_vk),
-                "signature": _b64e(self.sth_signature),
-            },
+            "inclusion_proof": self.proof.to_dict(),
+            "signed_tree_head": self.sth.to_dict(),
         }
 
     def to_json(self) -> str:
@@ -419,28 +351,12 @@ class ProvenanceReceipt:
 
     @classmethod
     def from_dict(cls, d: dict) -> "ProvenanceReceipt":
-        ip = d["inclusion_proof"]
-        sth = d["signed_tree_head"]
         return cls(
             manifest=CaptureManifest.from_dict(d["manifest"]),
-            leaf_index=ip["leaf_index"],
-            tree_size=ip["tree_size"],
-            audit_path=[_b64d(h) for h in ip["audit_path"]],
-            proof_root=_b64d(ip["root"]),
-            sth_sequence=sth["sequence"],
-            sth_tree_size=sth["tree_size"],
-            sth_timestamp=sth["timestamp"],
-            sth_root=_b64d(sth["root"]),
-            operator_vk=_b64d(sth["operator_vk"]),
-            sth_signature=_b64d(sth["signature"]),
+            proof=InclusionProof.from_dict(d["inclusion_proof"]),
+            sth=SignedTreeHead.from_dict(d["signed_tree_head"]),
         )
 
     @classmethod
     def from_json(cls, s: str) -> "ProvenanceReceipt":
         return cls.from_dict(json.loads(s))
-
-
-def _consteq(a: bytes, b: bytes) -> bool:
-    """Constant-time comparison for hash/tag checks."""
-    import hmac as _hmac
-    return _hmac.compare_digest(a, b)
