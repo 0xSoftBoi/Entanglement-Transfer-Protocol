@@ -1,21 +1,30 @@
 """
 CloudStore — durable, multi-tenant persistence for the custody service.
 
-SQLite reference implementation (stdlib-only, WAL mode). The schema is written
-so it maps 1:1 onto Postgres for production — see the DDL in
-docs/cloud/CUSTODY_CLOUD_DESIGN.md §4.
+Two backends behind one interface:
+
+  CloudStore(path)      — SQLite (stdlib, WAL). The reference deployment and
+                          the dev/test default.
+  PostgresStore(dsn)    — Postgres via psycopg (optional `[cloud]` extra). The
+                          production deployment; identical schema and behavior,
+                          exercised in CI against a real Postgres service.
+
+  open_store(url)       — picks the backend from a URL/path (postgres:// DSNs
+                          route to PostgresStore).
 
 What it stores (and, deliberately, what it doesn't):
   - tenants + hashed API keys (raw keys are shown once and never persisted)
   - per-tenant capture manifests and signed tree heads (public data only —
     the service is zero-knowledge of content by construction)
   - anchor rows tracking the on-chain transaction lifecycle
+  - webhook outbox rows and per-chain indexer cursors
   - the service operator keypair (reference deployments only; production
     holds this in a KMS/HSM — see design doc §11)
 
-Thread safety: a single connection guarded by a lock; all writes are
-transactional. Fine for the reference service; production uses Postgres with
-ordinary connection pooling.
+Concurrency: every operation (reads included) is serialized behind one lock on
+one connection — correct and sufficient at reference scale for both backends.
+A pooled-connection variant is a production optimization, not a correctness
+requirement (all writes are single-statement transactions).
 """
 
 from __future__ import annotations
@@ -33,120 +42,160 @@ from ..encoding import b64e, b64d
 from ..provenance import CaptureManifest
 from ..merkle_log import SignedTreeHead
 
-__all__ = ["CloudStore"]
+__all__ = ["CloudStore", "PostgresStore", "open_store"]
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tenants (
-    id             TEXT PRIMARY KEY,
-    name           TEXT NOT NULL,
-    webhook_url    TEXT,
-    webhook_secret TEXT,                   -- HMAC key for X-ETP-Signature
-    created_at     REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS api_keys (
-    key_hash    TEXT PRIMARY KEY,          -- SHA3-256(raw key); raw never stored
-    tenant_id   TEXT NOT NULL REFERENCES tenants(id),
-    label       TEXT NOT NULL DEFAULT '',
-    revoked     INTEGER NOT NULL DEFAULT 0,
-    created_at  REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS captures (
-    tenant_id   TEXT NOT NULL,
-    leaf_index  INTEGER NOT NULL,
-    capture_id  TEXT NOT NULL,             -- idempotency key (from the manifest)
-    manifest    TEXT NOT NULL,             -- CaptureManifest.to_dict() JSON
-    created_at  REAL NOT NULL,
-    PRIMARY KEY (tenant_id, leaf_index)
-);
-CREATE INDEX IF NOT EXISTS idx_captures_capture_id
-    ON captures (tenant_id, capture_id);
-CREATE TABLE IF NOT EXISTS sths (
-    tenant_id   TEXT NOT NULL,
-    sequence    INTEGER NOT NULL,
-    sth         TEXT NOT NULL,             -- SignedTreeHead.to_dict() JSON
-    created_at  REAL NOT NULL,
-    PRIMARY KEY (tenant_id, sequence)
-);
-CREATE TABLE IF NOT EXISTS anchors (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id    TEXT NOT NULL,
-    sth_sequence INTEGER NOT NULL,
-    root         TEXT NOT NULL,            -- b64 Merkle root
-    digest       TEXT NOT NULL,            -- b64 unique anchor digest
-    status       TEXT NOT NULL,            -- pending | submitted | confirmed | failed
-    tx_ref       TEXT,
-    attempts     INTEGER NOT NULL DEFAULT 0,
-    error        TEXT,
-    block_number INTEGER,                  -- set on confirmation via event indexing
-    created_at   REAL NOT NULL,
-    updated_at   REAL NOT NULL,
-    UNIQUE (tenant_id, sth_sequence)
-);
-CREATE TABLE IF NOT EXISTS webhook_outbox (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id       TEXT NOT NULL,
-    event           TEXT NOT NULL,         -- event payload JSON
-    attempts        INTEGER NOT NULL DEFAULT 0,
-    delivered_at    REAL,
-    next_attempt_at REAL NOT NULL,
-    created_at      REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS indexer_cursor (
-    chain_id   INTEGER PRIMARY KEY,
-    last_block INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS service_config (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-"""
-
-# Columns added after the first release; applied to pre-existing databases.
-_MIGRATIONS = [
-    "ALTER TABLE tenants  ADD COLUMN webhook_secret TEXT",
-    "ALTER TABLE captures ADD COLUMN capture_id TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE anchors  ADD COLUMN block_number INTEGER",
+# Schema template; {AUTOID} and {REAL} are filled per dialect.
+_SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS tenants (
+        id             TEXT PRIMARY KEY,
+        name           TEXT NOT NULL,
+        webhook_url    TEXT,
+        webhook_secret TEXT,
+        created_at     {REAL} NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS api_keys (
+        key_hash    TEXT PRIMARY KEY,
+        tenant_id   TEXT NOT NULL REFERENCES tenants(id),
+        label       TEXT NOT NULL DEFAULT '',
+        revoked     INTEGER NOT NULL DEFAULT 0,
+        created_at  {REAL} NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS captures (
+        tenant_id   TEXT NOT NULL,
+        leaf_index  INTEGER NOT NULL,
+        capture_id  TEXT NOT NULL,
+        manifest    TEXT NOT NULL,
+        created_at  {REAL} NOT NULL,
+        PRIMARY KEY (tenant_id, leaf_index)
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_captures_capture_id
+        ON captures (tenant_id, capture_id)""",
+    """CREATE TABLE IF NOT EXISTS sths (
+        tenant_id   TEXT NOT NULL,
+        sequence    INTEGER NOT NULL,
+        sth         TEXT NOT NULL,
+        created_at  {REAL} NOT NULL,
+        PRIMARY KEY (tenant_id, sequence)
+    )""",
+    """CREATE TABLE IF NOT EXISTS anchors (
+        id           {AUTOID},
+        tenant_id    TEXT NOT NULL,
+        sth_sequence INTEGER NOT NULL,
+        root         TEXT NOT NULL,
+        digest       TEXT NOT NULL,
+        status       TEXT NOT NULL,
+        tx_ref       TEXT,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        error        TEXT,
+        block_number INTEGER,
+        created_at   {REAL} NOT NULL,
+        updated_at   {REAL} NOT NULL,
+        UNIQUE (tenant_id, sth_sequence)
+    )""",
+    """CREATE TABLE IF NOT EXISTS webhook_outbox (
+        id              {AUTOID},
+        tenant_id       TEXT NOT NULL,
+        event           TEXT NOT NULL,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        delivered_at    {REAL},
+        next_attempt_at {REAL} NOT NULL,
+        created_at      {REAL} NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS indexer_cursor (
+        chain_id   INTEGER PRIMARY KEY,
+        last_block INTEGER NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS service_config (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""",
 ]
 
 
 class CloudStore:
+    """SQLite-backed reference store (see module docstring)."""
+
+    _AUTOID = "INTEGER PRIMARY KEY AUTOINCREMENT"
+    _REALTYPE = "REAL"
+
     def __init__(self, path: str | Path) -> None:
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.executescript(_SCHEMA)
-        for migration in _MIGRATIONS:
+        self._create_schema()
+        self._migrate()
+
+    # -- dialect hooks (overridden by PostgresStore) --------------------
+
+    @staticmethod
+    def _tr(sql: str) -> str:
+        """Translate parameter placeholders for this dialect."""
+        return sql  # sqlite uses '?' natively
+
+    def _create_schema(self) -> None:
+        for stmt in _SCHEMA:
+            self._conn.execute(stmt.format(AUTOID=self._AUTOID, REAL=self._REALTYPE))
+        self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Columns added after the first release (pre-existing SQLite DBs)."""
+        for stmt in [
+            "ALTER TABLE tenants  ADD COLUMN webhook_secret TEXT",
+            "ALTER TABLE captures ADD COLUMN capture_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE anchors  ADD COLUMN block_number INTEGER",
+        ]:
             try:
-                self._conn.execute(migration)
+                self._conn.execute(stmt)
             except sqlite3.OperationalError:
-                pass  # column already exists (fresh DB or already migrated)
+                pass  # already present
         # Backfill capture_id for rows written before the column existed.
-        for tid, idx, manifest in self._conn.execute(
-                "SELECT tenant_id, leaf_index, manifest FROM captures WHERE capture_id=''"):
+        rows = self._conn.execute(
+            "SELECT tenant_id, leaf_index, manifest FROM captures WHERE capture_id=''"
+        ).fetchall()
+        for tid, idx, manifest in rows:
             self._conn.execute(
                 "UPDATE captures SET capture_id=? WHERE tenant_id=? AND leaf_index=?",
                 (json.loads(manifest)["capture_id"], tid, idx))
         self._conn.commit()
-        self._lock = threading.Lock()
+
+    def _insert_returning_id(self, sql: str, params: tuple, *,
+                             ignore_conflict: bool = False) -> int | None:
+        """INSERT and return the new row id (None on ignored conflict)."""
+        if ignore_conflict:
+            sql = sql.replace("INSERT", "INSERT OR IGNORE", 1)
+        cur = self._conn.execute(self._tr(sql), params)
+        self._conn.commit()
+        return cur.lastrowid if cur.rowcount else None
+
+    # -- locked execution core ------------------------------------------
+
+    def _query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        with self._lock:
+            return self._conn.execute(self._tr(sql), params).fetchall()
+
+    def _exec(self, sql: str, params: tuple = ()) -> int:
+        """Execute a write; returns affected rowcount."""
+        with self._lock:
+            cur = self._conn.execute(self._tr(sql), params)
+            self._conn.commit()
+            return cur.rowcount
 
     # ------------------------------------------------------------------
     # Operator identity (reference deployments; production = KMS/HSM)
     # ------------------------------------------------------------------
 
     def get_or_create_operator(self, label: str = "cloud-notary") -> KeyPair:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value FROM service_config WHERE key='operator'").fetchone()
-            if row:
-                d = json.loads(row[0])
-                return KeyPair(ek=b64d(d["ek"]), dk=b64d(d["dk"]),
-                               vk=b64d(d["vk"]), sk=b64d(d["sk"]), label=d["label"])
-            kp = KeyPair.generate(label)
-            self._conn.execute(
-                "INSERT INTO service_config (key, value) VALUES ('operator', ?)",
-                (json.dumps({"ek": b64e(kp.ek), "dk": b64e(kp.dk),
-                             "vk": b64e(kp.vk), "sk": b64e(kp.sk), "label": label}),))
-            self._conn.commit()
-            return kp
+        rows = self._query("SELECT value FROM service_config WHERE key='operator'")
+        if rows:
+            d = json.loads(rows[0][0])
+            return KeyPair(ek=b64d(d["ek"]), dk=b64d(d["dk"]),
+                           vk=b64d(d["vk"]), sk=b64d(d["sk"]), label=d["label"])
+        kp = KeyPair.generate(label)
+        self._exec(
+            "INSERT INTO service_config (key, value) VALUES ('operator', ?)",
+            (json.dumps({"ek": b64e(kp.ek), "dk": b64e(kp.dk),
+                         "vk": b64e(kp.vk), "sk": b64e(kp.sk), "label": label}),))
+        return kp
 
     # ------------------------------------------------------------------
     # Tenants + API keys
@@ -158,105 +207,98 @@ class CloudStore:
 
     def create_tenant(self, name: str, webhook_url: str | None = None) -> str:
         tenant_id = "t_" + secrets.token_hex(8)
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO tenants (id, name, webhook_url, webhook_secret, created_at) "
-                "VALUES (?,?,?,?,?)",
-                (tenant_id, name, webhook_url,
-                 secrets.token_urlsafe(32), time.time()))
-            self._conn.commit()
+        self._exec(
+            "INSERT INTO tenants (id, name, webhook_url, webhook_secret, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (tenant_id, name, webhook_url, secrets.token_urlsafe(32), time.time()))
         return tenant_id
 
     def issue_key(self, tenant_id: str, label: str = "") -> str:
         """Create an API key; the raw key is returned ONCE and never stored."""
         raw = "etpk_" + secrets.token_urlsafe(32)
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO api_keys (key_hash, tenant_id, label, created_at) VALUES (?,?,?,?)",
-                (self._hash_key(raw), tenant_id, label, time.time()))
-            self._conn.commit()
+        self._exec(
+            "INSERT INTO api_keys (key_hash, tenant_id, label, created_at) VALUES (?,?,?,?)",
+            (self._hash_key(raw), tenant_id, label, time.time()))
         return raw
 
     def revoke_key(self, raw: str) -> bool:
-        with self._lock:
-            cur = self._conn.execute(
-                "UPDATE api_keys SET revoked=1 WHERE key_hash=?", (self._hash_key(raw),))
-            self._conn.commit()
-            return cur.rowcount > 0
+        return self._exec(
+            "UPDATE api_keys SET revoked=1 WHERE key_hash=?", (self._hash_key(raw),)) > 0
 
     def tenant_for_key(self, raw: str | None) -> str | None:
         if not raw:
             return None
-        row = self._conn.execute(
+        rows = self._query(
             "SELECT tenant_id FROM api_keys WHERE key_hash=? AND revoked=0",
-            (self._hash_key(raw),)).fetchone()
-        return row[0] if row else None
+            (self._hash_key(raw),))
+        return rows[0][0] if rows else None
 
     def tenant(self, tenant_id: str) -> dict | None:
-        row = self._conn.execute(
+        rows = self._query(
             "SELECT id, name, webhook_url, webhook_secret FROM tenants WHERE id=?",
-            (tenant_id,)).fetchone()
-        if not row:
+            (tenant_id,))
+        if not rows:
             return None
-        return {"id": row[0], "name": row[1], "webhook_url": row[2], "webhook_secret": row[3]}
+        r = rows[0]
+        return {"id": r[0], "name": r[1], "webhook_url": r[2], "webhook_secret": r[3]}
 
     def tenant_ids(self) -> list[str]:
-        return [r[0] for r in self._conn.execute("SELECT id FROM tenants ORDER BY created_at")]
+        return [r[0] for r in self._query("SELECT id FROM tenants ORDER BY created_at")]
 
     # ------------------------------------------------------------------
     # Log persistence (per-tenant manifests + STHs)
     # ------------------------------------------------------------------
 
     def append_capture(self, tenant_id: str, leaf_index: int, manifest: CaptureManifest) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO captures (tenant_id, leaf_index, capture_id, manifest, created_at) "
-                "VALUES (?,?,?,?,?)",
-                (tenant_id, leaf_index, manifest.capture_id,
-                 json.dumps(manifest.to_dict()), time.time()))
-            self._conn.commit()
+        self._exec(
+            "INSERT INTO captures (tenant_id, leaf_index, capture_id, manifest, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (tenant_id, leaf_index, manifest.capture_id,
+             json.dumps(manifest.to_dict()), time.time()))
 
     def leaf_for_capture_id(self, tenant_id: str, capture_id: str) -> int | None:
         """Idempotency lookup: the leaf index already holding this capture_id."""
-        row = self._conn.execute(
+        rows = self._query(
             "SELECT leaf_index FROM captures WHERE tenant_id=? AND capture_id=? "
-            "ORDER BY leaf_index LIMIT 1", (tenant_id, capture_id)).fetchone()
-        return row[0] if row else None
+            "ORDER BY leaf_index LIMIT 1", (tenant_id, capture_id))
+        return rows[0][0] if rows else None
 
     def append_sth(self, tenant_id: str, sth: SignedTreeHead) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO sths (tenant_id, sequence, sth, created_at) VALUES (?,?,?,?)",
-                (tenant_id, sth.sequence, json.dumps(sth.to_dict()), time.time()))
-            self._conn.commit()
+        self._exec(
+            "INSERT INTO sths (tenant_id, sequence, sth, created_at) VALUES (?,?,?,?)",
+            (tenant_id, sth.sequence, json.dumps(sth.to_dict()), time.time()))
 
     def manifests(self, tenant_id: str) -> list[CaptureManifest]:
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT manifest FROM captures WHERE tenant_id=? ORDER BY leaf_index",
-            (tenant_id,)).fetchall()
+            (tenant_id,))
         return [CaptureManifest.from_dict(json.loads(r[0])) for r in rows]
 
     def sth_count(self, tenant_id: str) -> int:
-        return self._conn.execute(
-            "SELECT COUNT(*) FROM sths WHERE tenant_id=?", (tenant_id,)).fetchone()[0]
+        return self._query(
+            "SELECT COUNT(*) FROM sths WHERE tenant_id=?", (tenant_id,))[0][0]
 
     def latest_sth(self, tenant_id: str) -> SignedTreeHead | None:
-        row = self._conn.execute(
+        rows = self._query(
             "SELECT sth FROM sths WHERE tenant_id=? ORDER BY sequence DESC LIMIT 1",
-            (tenant_id,)).fetchone()
-        return SignedTreeHead.from_dict(json.loads(row[0])) if row else None
+            (tenant_id,))
+        return SignedTreeHead.from_dict(json.loads(rows[0][0])) if rows else None
 
     def usage(self, tenant_id: str) -> int:
         """The billable unit: notarized captures for this tenant."""
-        return self._conn.execute(
-            "SELECT COUNT(*) FROM captures WHERE tenant_id=?", (tenant_id,)).fetchone()[0]
+        return self._query(
+            "SELECT COUNT(*) FROM captures WHERE tenant_id=?", (tenant_id,))[0][0]
 
     def total_captures(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
+        return self._query("SELECT COUNT(*) FROM captures")[0][0]
 
     # ------------------------------------------------------------------
     # Anchor lifecycle
     # ------------------------------------------------------------------
+
+    _ANCHOR_COLS = ["id", "tenant_id", "sth_sequence", "root", "digest",
+                    "status", "tx_ref", "attempts", "error", "block_number",
+                    "updated_at"]
 
     def create_anchor(self, tenant_id: str, sth_sequence: int,
                       root_b64: str, digest_b64: str) -> int | None:
@@ -264,17 +306,12 @@ class CloudStore:
         for this (tenant, sequence) — enqueueing is idempotent."""
         now = time.time()
         with self._lock:
-            cur = self._conn.execute(
-                "INSERT OR IGNORE INTO anchors "
+            return self._insert_returning_id(
+                "INSERT INTO anchors "
                 "(tenant_id, sth_sequence, root, digest, status, created_at, updated_at) "
                 "VALUES (?,?,?,?,'pending',?,?)",
-                (tenant_id, sth_sequence, root_b64, digest_b64, now, now))
-            self._conn.commit()
-            return cur.lastrowid if cur.rowcount else None
-
-    _ANCHOR_COLS = ["id", "tenant_id", "sth_sequence", "root", "digest",
-                    "status", "tx_ref", "attempts", "error", "block_number",
-                    "updated_at"]
+                (tenant_id, sth_sequence, root_b64, digest_b64, now, now),
+                ignore_conflict=True)
 
     def anchors(self, tenant_id: str | None = None, status: str | None = None) -> list[dict]:
         q = f"SELECT {', '.join(self._ANCHOR_COLS)} FROM anchors"
@@ -286,26 +323,24 @@ class CloudStore:
         if conds:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY id"
-        return [dict(zip(self._ANCHOR_COLS, r)) for r in self._conn.execute(q, params)]
+        return [dict(zip(self._ANCHOR_COLS, r)) for r in self._query(q, tuple(params))]
+
+    def anchor_by_digest(self, digest_b64: str) -> dict | None:
+        rows = self._query(
+            f"SELECT {', '.join(self._ANCHOR_COLS)} FROM anchors WHERE digest=?",
+            (digest_b64,))
+        return dict(zip(self._ANCHOR_COLS, rows[0])) if rows else None
 
     def mark_anchor(self, anchor_id: int, status: str, *,
                     tx_ref: str | None = None, error: str | None = None,
                     block_number: int | None = None,
                     bump_attempts: bool = False) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE anchors SET status=?, tx_ref=COALESCE(?, tx_ref), error=?, "
-                "block_number=COALESCE(?, block_number), attempts=attempts + ?, "
-                "updated_at=? WHERE id=?",
-                (status, tx_ref, error, block_number,
-                 1 if bump_attempts else 0, time.time(), anchor_id))
-            self._conn.commit()
-
-    def anchor_by_digest(self, digest_b64: str) -> dict | None:
-        row = self._conn.execute(
-            f"SELECT {', '.join(self._ANCHOR_COLS)} FROM anchors WHERE digest=?",
-            (digest_b64,)).fetchone()
-        return dict(zip(self._ANCHOR_COLS, row)) if row else None
+        self._exec(
+            "UPDATE anchors SET status=?, tx_ref=COALESCE(?, tx_ref), error=?, "
+            "block_number=COALESCE(?, block_number), attempts=attempts + ?, "
+            "updated_at=? WHERE id=?",
+            (status, tx_ref, error, block_number,
+             1 if bump_attempts else 0, time.time(), anchor_id))
 
     # ------------------------------------------------------------------
     # Webhook outbox
@@ -314,51 +349,99 @@ class CloudStore:
     def enqueue_event(self, tenant_id: str, event: dict) -> int:
         now = time.time()
         with self._lock:
-            cur = self._conn.execute(
+            return self._insert_returning_id(
                 "INSERT INTO webhook_outbox (tenant_id, event, next_attempt_at, created_at) "
                 "VALUES (?,?,?,?)", (tenant_id, json.dumps(event), now, now))
-            self._conn.commit()
-            return cur.lastrowid
 
     def due_events(self, *, max_attempts: int, now: float | None = None) -> list[dict]:
         now = time.time() if now is None else now
-        rows = self._conn.execute(
+        rows = self._query(
             "SELECT id, tenant_id, event, attempts FROM webhook_outbox "
             "WHERE delivered_at IS NULL AND attempts < ? AND next_attempt_at <= ? "
-            "ORDER BY id", (max_attempts, now)).fetchall()
+            "ORDER BY id", (max_attempts, now))
         return [{"id": r[0], "tenant_id": r[1], "event": json.loads(r[2]), "attempts": r[3]}
                 for r in rows]
 
     def mark_event_delivered(self, event_id: int) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE webhook_outbox SET delivered_at=? WHERE id=?",
-                (time.time(), event_id))
-            self._conn.commit()
+        self._exec("UPDATE webhook_outbox SET delivered_at=? WHERE id=?",
+                   (time.time(), event_id))
 
     def mark_event_failed(self, event_id: int, retry_in: float) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE webhook_outbox SET attempts=attempts+1, next_attempt_at=? WHERE id=?",
-                (time.time() + retry_in, event_id))
-            self._conn.commit()
+        self._exec(
+            "UPDATE webhook_outbox SET attempts=attempts+1, next_attempt_at=? WHERE id=?",
+            (time.time() + retry_in, event_id))
 
     # ------------------------------------------------------------------
     # Indexer cursor
     # ------------------------------------------------------------------
 
     def get_cursor(self, chain_id: int) -> int:
-        row = self._conn.execute(
-            "SELECT last_block FROM indexer_cursor WHERE chain_id=?", (chain_id,)).fetchone()
-        return row[0] if row else 0
+        rows = self._query(
+            "SELECT last_block FROM indexer_cursor WHERE chain_id=?", (chain_id,))
+        return rows[0][0] if rows else 0
 
     def set_cursor(self, chain_id: int, last_block: int) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO indexer_cursor (chain_id, last_block) VALUES (?,?) "
-                "ON CONFLICT(chain_id) DO UPDATE SET last_block=excluded.last_block",
-                (chain_id, last_block))
-            self._conn.commit()
+        self._exec(
+            "INSERT INTO indexer_cursor (chain_id, last_block) VALUES (?,?) "
+            "ON CONFLICT (chain_id) DO UPDATE SET last_block=excluded.last_block",
+            (chain_id, last_block))
 
     def close(self) -> None:
         self._conn.close()
+
+
+class PostgresStore(CloudStore):
+    """Postgres-backed store (production). Requires the `[cloud]` extra."""
+
+    _AUTOID = "BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY"
+    _REALTYPE = "DOUBLE PRECISION"
+
+    def __init__(self, dsn: str) -> None:
+        import psycopg  # optional dependency, imported on use
+        self._lock = threading.Lock()
+        self._conn = psycopg.connect(dsn)
+        self._create_schema()
+        # Fresh backend: the full schema above already includes every column,
+        # so there are no legacy migrations to apply.
+
+    @staticmethod
+    def _tr(sql: str) -> str:
+        return sql.replace("?", "%s")   # psycopg paramstyle (no literal '?' in our SQL)
+
+    def _create_schema(self) -> None:
+        with self._conn.cursor() as cur:
+            for stmt in _SCHEMA:
+                cur.execute(stmt.format(AUTOID=self._AUTOID, REAL=self._REALTYPE))
+        self._conn.commit()
+
+    def _query(self, sql: str, params: tuple = ()) -> list[tuple]:
+        with self._lock:
+            with self._conn.cursor() as cur:
+                cur.execute(self._tr(sql), params)
+                return cur.fetchall()
+
+    def _exec(self, sql: str, params: tuple = ()) -> int:
+        with self._lock:
+            with self._conn.cursor() as cur:
+                cur.execute(self._tr(sql), params)
+                self._conn.commit()
+                return cur.rowcount
+
+    def _insert_returning_id(self, sql: str, params: tuple, *,
+                             ignore_conflict: bool = False) -> int | None:
+        if ignore_conflict:
+            sql += " ON CONFLICT DO NOTHING"
+        sql += " RETURNING id"
+        with self._conn.cursor() as cur:
+            cur.execute(self._tr(sql), params)
+            row = cur.fetchone()
+            self._conn.commit()
+            return row[0] if row else None
+
+
+def open_store(url: str | Path) -> CloudStore:
+    """Route a config value to the right backend: postgres DSN or SQLite path."""
+    s = str(url)
+    if s.startswith(("postgres://", "postgresql://")):
+        return PostgresStore(s)
+    return CloudStore(s)

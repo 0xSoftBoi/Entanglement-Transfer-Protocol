@@ -12,6 +12,20 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.12"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: custody
+          POSTGRES_PASSWORD: custody
+          POSTGRES_DB: custody
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U custody"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      # Enables the PostgresStore tests (they skip when unset).
+      POSTGRES_DSN: postgresql://custody:custody@localhost:5432/custody
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

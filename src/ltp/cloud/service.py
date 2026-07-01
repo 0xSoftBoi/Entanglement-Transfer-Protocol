@@ -324,13 +324,14 @@ def make_cloud_server(service: CloudNotaryService,
 
 
 def main() -> int:
+    from .store import open_store
     db = os.environ.get("ETP_CLOUD_DB", "custody-cloud.db")
     admin_token = os.environ.get("ETP_CLOUD_ADMIN_TOKEN")
     if not admin_token:
         raise SystemExit("error: set ETP_CLOUD_ADMIN_TOKEN")
     host = os.environ.get("ETP_CLOUD_HOST", "127.0.0.1")
     port = int(os.environ.get("ETP_CLOUD_PORT", "8080"))
-    service = CloudNotaryService(CloudStore(db), admin_token=admin_token)
+    service = CloudNotaryService(open_store(db), admin_token=admin_token)
     httpd = make_cloud_server(service, host, port)
     print(f"etp-custody-cloud listening on http://{host}:{port}  "
           f"(operator {b64e(service.operator_vk)[:16]}…, db {db})")
