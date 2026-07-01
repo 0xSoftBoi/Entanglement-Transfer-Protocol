@@ -244,6 +244,62 @@ class TestSendReceive:
         assert out.read_bytes() == content
 
 
+class TestBatch:
+    def _make_src(self, tmp_path, n=3):
+        src = tmp_path / "src"; src.mkdir()
+        contents = {}
+        for i in range(n):
+            c = f"record {i} confidential".encode() * (i + 1)
+            (src / f"f{i}.txt").write_bytes(c)
+            contents[f"f{i}.txt"] = c
+        return src, contents
+
+    def test_batch_send_receive_roundtrip(self, notary, tmp_path):
+        src, contents = self._make_src(tmp_path)
+        out = tmp_path / "parcels"
+        assert main(["batch-send", str(notary["dir"]), "--in-dir", str(src),
+                     "--to", str(notary["bob_pub"]), "--originator", "sensor-7",
+                     "--n", "6", "--k", "4", "--out-dir", str(out)]) == 0
+        # one append-only log covers the whole batch
+        assert (out / "batch.json").exists()
+
+        # simulate loss: delete 2 of 6 shards for one file — still reconstructs
+        for p in sorted(out.glob("f1.txt.shard*"))[:2]:
+            p.unlink()
+
+        dst = tmp_path / "recovered"
+        assert main(["batch-receive", "--key", str(tmp_path / "bob.key"),
+                     "--in-dir", str(out), "--out-dir", str(dst)]) == 0
+        for name, c in contents.items():
+            assert (dst / name).read_bytes() == c
+
+    def test_batch_receipts_are_one_append_only_log(self, notary, tmp_path):
+        src, _ = self._make_src(tmp_path, n=2)
+        out = tmp_path / "parcels"
+        assert main(["batch-send", str(notary["dir"]), "--in-dir", str(src),
+                     "--to", str(notary["bob_pub"]), "--originator", "s",
+                     "--n", "5", "--k", "3", "--out-dir", str(out)]) == 0
+        # every file's receipt shares the same batch STH → any pair audits consistent
+        ra, rb = out / "f0.txt.receipt", out / "f1.txt.receipt"
+        assert main(["audit", str(notary["dir"]), str(ra), str(rb)]) == 0
+
+    def test_batch_receive_reports_failure_on_unrecoverable_file(self, notary, tmp_path):
+        src, _ = self._make_src(tmp_path, n=2)
+        out = tmp_path / "parcels"
+        assert main(["batch-send", str(notary["dir"]), "--in-dir", str(src),
+                     "--to", str(notary["bob_pub"]), "--originator", "s",
+                     "--n", "6", "--k", "4", "--out-dir", str(out)]) == 0
+        # destroy too many shards of f0 → that file is unrecoverable, batch returns 1
+        for p in sorted(out.glob("f0.txt.shard*"))[:4]:
+            p.unlink()
+        dst = tmp_path / "recovered"
+        assert main(["batch-receive", "--key", str(tmp_path / "bob.key"),
+                     "--in-dir", str(out), "--out-dir", str(dst)]) == 1
+        # the other file still came through
+        assert (dst / "f1.txt").exists()
+        assert not (dst / "f0.txt").exists()
+
+
 class TestInspect:
     def test_inspect_valid_receipt(self, notary, tmp_path):
         _, _, receipt = _seal(notary, name="d")

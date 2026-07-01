@@ -79,12 +79,30 @@ etp-custody receive --key bob.key --bundle parcel.bundle --receipt parcel.receip
 
 The step-by-step commands below still exist for finer control.
 
+For a whole directory (a satellite pass of image products, a clinic's daily
+records), `batch-send` notarizes every file under **one append-only log** and
+`batch-receive` reassembles/verifies/opens the lot, failing closed per file:
+
+```bash
+etp-custody batch-send ./notary --in-dir ./day/ --to bob.pub \
+    --originator scanner-3 --originator-key scanner3.key --n 6 --k 4 --out-dir ./parcels/
+# ...transport ./parcels/ (any file tolerates losing 2 of 6 shards)...
+etp-custody batch-receive --key bob.key --in-dir ./parcels/ --out-dir ./recovered/ \
+    --operator op.pub --expect-originator scanner3.pub
+```
+
+Every file in a batch shares one signed tree head, so `audit` reports any two of
+them as the same checkpoint; audit a receipt from a *later* batch to prove
+append-only growth over time.
+
 ## Commands
 
 | Command | Purpose |
 |---|---|
 | `send DIR --in F --to PUB --originator ID [--originator-key K] --n N --k K [--prefix P]` | One shot: seal + notarize + bundle |
 | `receive --key KEY --bundle B --receipt R --out OUT [--operator PUB] [--expect-originator PUB] SHARD...` | One shot: reassemble + verify + open (fails closed) |
+| `batch-send DIR --in-dir SRC --to PUB --originator ID [--originator-key K] --n N --k K --out-dir OUT` | Seal + notarize + bundle every file in a directory (one append-only log) |
+| `batch-receive --key KEY --in-dir OUT --out-dir DST [--operator PUB] [--expect-originator PUB]` | Reassemble + verify + open every file in a batch |
 | `keygen -o KEY [--label L] [--pub PUB]` | Generate a PQ keypair; optionally write a shareable public key |
 | `pub -i KEY -o PUB` | Extract the public key from a secret key file |
 | `init DIR --operator KEY` | Initialize a notary store |

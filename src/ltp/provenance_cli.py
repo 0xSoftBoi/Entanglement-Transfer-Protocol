@@ -497,6 +497,105 @@ def cmd_receive(args) -> int:
     return 0
 
 
+def cmd_batch_send(args) -> int:
+    """Seal + notarize + bundle every file in a directory under one append-only log."""
+    store = NotaryStore(Path(args.dir))
+    recipient = _read_key(Path(args.to))
+    if not recipient.ek:
+        raise SystemExit("error: recipient key has no encapsulation key")
+    originator = None
+    if args.originator_key:
+        originator = _read_key(Path(args.originator_key))
+        if not originator.sk:
+            raise SystemExit("error: --originator-key must be a full (secret) key")
+
+    src = Path(args.in_dir)
+    files = sorted(p for p in src.iterdir() if p.is_file())
+    if not files:
+        raise SystemExit(f"error: no files in {src}")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Append all captures first, then publish ONE STH covering the whole batch,
+    # so every receipt shares the same attested (final) root.
+    plog = store.load_log()
+    pending = []
+    for f in files:
+        cap, idx = plog.record_capture(
+            f.read_bytes(), recipient_ek=recipient.ek, originator_id=args.originator,
+            originator=originator, meta={**_parse_meta(args.meta), "filename": f.name},
+        )
+        store.append_record(cap.manifest)
+        pending.append((f.name, cap, idx))
+    sth = plog.publish_sth()
+    store.append_sth(sth)
+
+    index = {"format": "etp-batch/1", "count": len(pending), "entries": []}
+    for name, cap, idx in pending:
+        receipt = ProvenanceReceipt.build(cap.manifest, plog.inclusion_proof(idx), sth)
+        try:
+            bundle, shards = bundle_sealed(cap.sealed, args.n, args.k)
+        except ValueError as e:
+            raise SystemExit(f"error: {e}")
+        prefix = out_dir / name
+        (out_dir / f"{name}.receipt").write_text(receipt.to_json())
+        bundle_path, shard_paths = _write_bundle(prefix, bundle, shards)
+        index["entries"].append({
+            "name": name,
+            "receipt": f"{name}.receipt",
+            "bundle": bundle_path.name,
+            "shards": [p.name for p in shard_paths],
+        })
+    (out_dir / "batch.json").write_text(json.dumps(index, indent=2))
+
+    print(f"✓ batch-sent {len(pending)} files → {out_dir}/  (one append-only log, "
+          f"shared STH seq {sth.sequence}, root {sth.root_hash.hex()[:16]}…)")
+    print(f"    each file bundled {args.n}/{args.k}; index: {out_dir / 'batch.json'}")
+    return 0
+
+
+def cmd_batch_receive(args) -> int:
+    """Reassemble + verify + open every entry in a batch, failing closed per file."""
+    recipient = _read_key(Path(args.key))
+    if not recipient.dk:
+        raise SystemExit("error: receiving requires a full (secret) recipient key")
+    in_dir = Path(args.in_dir)
+    index = json.loads((in_dir / "batch.json").read_text())
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    expected_vk = _read_key(Path(args.operator)).vk if args.operator else None
+    expected_origin_vk = _read_key(Path(args.expect_originator)).vk if args.expect_originator else None
+
+    ok_count = 0
+    for entry in index["entries"]:
+        name = entry["name"]
+        bundle = BundleManifest.from_json((in_dir / entry["bundle"]).read_text())
+        shards = _collect_shards([str(in_dir / s) for s in entry["shards"] if (in_dir / s).exists()])
+        try:
+            sealed = reassemble_sealed(bundle, shards)
+            receipt = ProvenanceReceipt.from_json((in_dir / entry["receipt"]).read_text())
+        except (ValueError, KeyError, TypeError) as e:
+            print(f"    [✗] {name}: {type(e).__name__}")
+            continue
+        if not receipt.verify(sealed, expected_operator_vk=expected_vk,
+                              expected_originator_vk=expected_origin_vk):
+            print(f"    [✗] {name}: provenance did NOT verify — skipped")
+            continue
+        try:
+            plaintext = ProvenanceLog.open_capture(sealed, recipient, receipt.manifest)
+        except ValueError as e:
+            print(f"    [✗] {name}: cannot open ({e})")
+            continue
+        (out_dir / name).write_bytes(plaintext)
+        ok_count += 1
+        print(f"    [✓] {name}  ({len(plaintext)} B)")
+
+    total = index["count"]
+    print(f"✓ batch-received {ok_count}/{total} files → {out_dir}/")
+    return 0 if ok_count == total else 1
+
+
 def cmd_inspect(args) -> int:
     """Read-only: describe a receipt/parcel and check its internal validity (no keys)."""
     try:
@@ -565,8 +664,18 @@ def cmd_audit(args) -> int:
         print(f"error — malformed receipt ({type(e).__name__})")
         return 1
     a, b = ra.sth, rb.sth
-    older, newer = (a, b) if a.sequence <= b.sequence else (b, a)
 
+    # Same sequence: either the identical checkpoint (e.g. two files from one
+    # batch share one STH) or an equivocation (same seq, different roots).
+    if a.sequence == b.sequence:
+        if a.verify() and b.verify() and hmac.compare_digest(a.root_hash, b.root_hash):
+            print(f"CONSISTENT — both receipts share one log checkpoint "
+                  f"(seq {a.sequence}, size {a.tree_size})")
+            return 0
+        print("NOT CONSISTENT — two signed roots at the same sequence = equivocation (fork)")
+        return 1
+
+    older, newer = (a, b) if a.sequence < b.sequence else (b, a)
     if plog.verify_append_only(older, newer):
         print(f"CONSISTENT — STH seq {newer.sequence} (size {newer.tree_size}) is an "
               f"append-only extension of seq {older.sequence} (size {older.tree_size})")
@@ -683,6 +792,26 @@ def build_parser() -> argparse.ArgumentParser:
     rc.add_argument("--expect-originator", help="pin the capturing device's public key file")
     rc.add_argument("shards", nargs="+", help="shard files (indices from .shardNN names)")
     rc.set_defaults(func=cmd_receive)
+
+    bs = sub.add_parser("batch-send", help="seal + notarize + bundle every file in a directory")
+    bs.add_argument("dir", help="notary directory")
+    bs.add_argument("--in-dir", required=True, help="directory of files to protect")
+    bs.add_argument("--to", required=True, help="recipient public-key file")
+    bs.add_argument("--originator", required=True, help="originator identifier")
+    bs.add_argument("--originator-key", help="capturing device's secret key (sign each capture)")
+    bs.add_argument("--n", type=int, required=True, help="total shards per file")
+    bs.add_argument("--k", type=int, required=True, help="shards needed to reconstruct (k < n)")
+    bs.add_argument("--out-dir", required=True, help="output parcel directory")
+    bs.add_argument("--meta", action="append", help="key=value metadata (repeatable)")
+    bs.set_defaults(func=cmd_batch_send)
+
+    br = sub.add_parser("batch-receive", help="reassemble + verify + open every file in a batch")
+    br.add_argument("--key", required=True, help="recipient secret key file")
+    br.add_argument("--in-dir", required=True, help="parcel directory (containing batch.json)")
+    br.add_argument("--out-dir", required=True, help="output directory for recovered files")
+    br.add_argument("--operator", help="pin the trusted notary's public key file")
+    br.add_argument("--expect-originator", help="pin the capturing device's public key file")
+    br.set_defaults(func=cmd_batch_receive)
 
     ins = sub.add_parser("inspect", help="describe a receipt/parcel and check internal validity (no keys)")
     ins.add_argument("--receipt", required=True, help="receipt file")
