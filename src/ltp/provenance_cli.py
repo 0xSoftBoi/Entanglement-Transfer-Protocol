@@ -35,15 +35,20 @@ backend, and refuses to run if only the PoC fallback is active.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
 from .keypair import KeyPair
-from .provenance import ProvenanceLog, ProvenanceReceipt, CaptureManifest, SEAL_OVERHEAD
+from .provenance import (
+    ProvenanceLog, ProvenanceReceipt, CaptureManifest, SEAL_OVERHEAD,
+    BundleManifest, bundle_sealed, reassemble_sealed,
+)
 from .encoding import b64e, b64d
-from .primitives import real_backend_active
+from .primitives import real_backend_active, H_bytes, MLDSA
 from .merkle_log import SignedTreeHead
 
 _KEY_FORMAT = "etp-custody-key/1"
@@ -98,16 +103,49 @@ def _keypair_from_dict(d: dict) -> KeyPair:
 
 
 def _write_key(path: Path, kp: KeyPair, *, public_only: bool) -> None:
-    path.write_text(json.dumps(_keypair_to_dict(kp, public_only=public_only), indent=2))
-    if not public_only:
-        try:
-            os.chmod(path, 0o600)  # secret material — owner-only
-        except OSError:
-            pass
+    data = json.dumps(_keypair_to_dict(kp, public_only=public_only), indent=2)
+    if public_only:
+        path.write_text(data)
+        return
+    # Secret material: create owner-only (0600) from the start so there is no
+    # window where the private key is world-readable under the default umask.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data.encode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 def _read_key(path: Path) -> KeyPair:
     return _keypair_from_dict(json.loads(path.read_text()))
+
+
+# ---------------------------------------------------------------------------
+# Zero-ceremony defaults: a home dir with an identity + a default notary, so the
+# common "just notarize this file" case needs no keygen/init/flags at all.
+# ---------------------------------------------------------------------------
+
+def _home() -> Path:
+    return Path(os.environ.get("ETP_CUSTODY_HOME", str(Path.home() / ".etp-custody")))
+
+
+def _ensure_identity() -> KeyPair:
+    """Return the user's default identity keypair, creating it on first use."""
+    p = _home() / "identity.key"
+    if p.exists():
+        return _read_key(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    kp = KeyPair.generate("identity")
+    _write_key(p, kp, public_only=False)
+    return kp
+
+
+def _ensure_default_notary(operator: KeyPair) -> "NotaryStore":
+    d = _home() / "notary"
+    store = NotaryStore(d)
+    if not store.operator_key.exists():
+        NotaryStore.init(d, operator)
+    return NotaryStore(d)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +157,19 @@ def _read_lines(path: Path) -> list[str]:
     if not path.exists():
         return []
     return [line for line in path.read_text().splitlines() if line.strip()]
+
+
+def _collect_shards(paths: list[str]) -> dict[int, bytes]:
+    """Load shard files into {index: bytes}, reading the index from .shardNN names."""
+    shards: dict[int, bytes] = {}
+    for sp in paths:
+        p = Path(sp)
+        m = re.search(r"\.shard(\d+)$", p.name)
+        if not m:
+            print(f"    skipping {p.name} (no .shardNN index in name)")
+            continue
+        shards[int(m.group(1))] = p.read_bytes()
+    return shards
 
 class NotaryStore:
     """A persisted provenance notary: operator key + append-only manifest log."""
@@ -214,6 +265,66 @@ def _parse_meta(pairs: list[str] | None) -> dict:
     return meta
 
 
+def cmd_id(args) -> int:
+    """Show (creating on first use) the default identity — no key files to manage."""
+    identity = _ensure_identity()
+    print(f"identity: {_home() / 'identity.key'}")
+    print(f"    public key: {b64e(identity.vk)}")
+    if args.pub:
+        _write_key(Path(args.pub), identity, public_only=True)
+        print(f"    exported shareable public key → {args.pub}")
+    return 0
+
+
+def cmd_notarize(args) -> int:
+    """
+    Zero-ceremony notarization: seal + notarize a file with your default
+    identity and default notary. No keygen, no init, no flags required.
+    Writes <file>.sealed + <file>.receipt (and <file>.intoto.json with --attest).
+    """
+    identity = _ensure_identity()
+    store = _ensure_default_notary(identity)
+    plog = store.load_log()
+    origin_id = args.originator or f"identity:{b64e(identity.vk)[:12]}"
+
+    for f in args.files:
+        artifact = Path(f).read_bytes()
+        # Seal to self and device-sign with the identity (we hold the key anyway).
+        cap, idx = plog.record_capture(
+            artifact, recipient_ek=identity.ek, originator_id=origin_id,
+            originator=identity, meta={**_parse_meta(args.meta), "filename": Path(f).name},
+        )
+        sth = plog.publish_sth()
+        receipt = ProvenanceReceipt.build(cap.manifest, plog.inclusion_proof(idx), sth)
+        store.append_record(cap.manifest)
+        store.append_sth(sth)
+
+        Path(f + ".sealed").write_bytes(cap.sealed)
+        Path(f + ".receipt").write_text(receipt.to_json())
+        outs = f"{Path(f).name}.sealed, {Path(f).name}.receipt"
+        if args.attest:
+            from .attestation import in_toto_statement
+            Path(f + ".intoto.json").write_text(
+                json.dumps(in_toto_statement(Path(f).name, receipt), indent=2))
+            outs += f", {Path(f).name}.intoto.json"
+        print(f"✓ notarized {f}  (device-signed)  →  {outs}")
+
+    print(f"    notary: {_home() / 'notary'}  ·  verify with `etp-custody verify {args.files[0]}`")
+    return 0
+
+
+def cmd_attest(args) -> int:
+    """Convert a receipt into a standard in-toto attestation statement."""
+    from .attestation import in_toto_statement
+    receipt = ProvenanceReceipt.from_json(Path(args.receipt).read_text())
+    subject = args.subject or "artifact"
+    stmt = in_toto_statement(subject, receipt)
+    out = Path(args.out) if args.out else Path(args.receipt).with_suffix(".intoto.json")
+    out.write_text(json.dumps(stmt, indent=2))
+    print(f"✓ wrote in-toto attestation → {out}  (subject: {subject})")
+    return 0
+
+
 def cmd_seal(args) -> int:
     store = NotaryStore(Path(args.dir))
     recipient = _read_key(Path(args.to))
@@ -221,11 +332,18 @@ def cmd_seal(args) -> int:
         raise SystemExit("error: recipient key has no encapsulation key")
     artifact = Path(args.inp).read_bytes()
 
+    originator = None
+    if args.originator_key:
+        originator = _read_key(Path(args.originator_key))
+        if not originator.sk:
+            raise SystemExit("error: --originator-key must be a full (secret) key")
+
     plog = store.load_log()
     capture, idx = plog.record_capture(
         artifact,
         recipient_ek=recipient.ek,
         originator_id=args.originator,
+        originator=originator,
         meta=_parse_meta(args.meta),
     )
     sth = plog.publish_sth()
@@ -248,6 +366,8 @@ def cmd_seal(args) -> int:
     print(f"    log index  : {idx}   tree size: {sth.tree_size}   STH seq: {sth.sequence}")
     print(f"    payload    : {len(artifact)} B  →  sealed {capture.size} B "
           f"(+{SEAL_OVERHEAD} B constant PQC overhead)")
+    print(f"    originator : {args.originator}"
+          + ("  (device-signed ✓)" if originator is not None else "  (operator-vouched only)"))
     print(f"    sealed blob: {sealed_path}")
     print(f"    receipt    : {receipt_path}")
     return 0
@@ -264,20 +384,62 @@ def cmd_publish(args) -> int:
 
 
 def cmd_verify(args) -> int:
-    receipt = ProvenanceReceipt.from_json(Path(args.receipt).read_text())
-    sealed = Path(args.sealed).read_bytes()
-    ok = receipt.verify(sealed)
+    # Resolve inputs. A positional FILE derives FILE.sealed / FILE.receipt, so
+    # `verify report.pdf` just works after `notarize report.pdf`.
+    sealed_path = args.sealed
+    receipt_path = args.receipt
+    if args.file:
+        sealed_path = sealed_path or (args.file + ".sealed")
+        receipt_path = receipt_path or (args.file + ".receipt")
+
+    # Receipts (and attestations) are untrusted input; parse defensively.
+    try:
+        if args.attestation:
+            from .attestation import receipt_from_statement
+            receipt = receipt_from_statement(json.loads(Path(args.attestation).read_text()))
+        elif receipt_path:
+            receipt = ProvenanceReceipt.from_json(Path(receipt_path).read_text())
+        else:
+            raise SystemExit("error: provide a FILE, --receipt, or --attestation")
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"FAIL — malformed receipt ({type(e).__name__})")
+        return 1
+    if not sealed_path:
+        raise SystemExit("error: provide the sealed blob (a FILE or --sealed)")
+    sealed = Path(sealed_path).read_bytes()
+
+    expected_vk = _read_key(Path(args.operator)).vk if args.operator else None
+    expected_origin_vk = _read_key(Path(args.expect_originator)).vk if args.expect_originator else None
+
+    ok = receipt.verify(sealed, expected_operator_vk=expected_vk,
+                        expected_originator_vk=expected_origin_vk)
     m = receipt.manifest
     if ok:
         print("PASS — provenance verified")
         print(f"    capture id   : {m.capture_id}")
-        print(f"    originator   : {m.originator_id}")
+        print(f"    originator   : {m.originator_id}", end="")
+        if expected_origin_vk is not None:
+            print(f"  (device-signed, PINNED to {args.expect_originator} ✓)")
+        elif m.originator_vk:
+            print("  (device-signed ✓ — pass --expect-originator to pin the device)")
+        else:
+            print("  (operator-vouched only — no device signature)")
         print(f"    captured_at  : {m.captured_at}")
-        print(f"    operator vk  : {b64e(receipt.sth.operator_vk)[:24]}…")
+        if expected_vk is not None:
+            print(f"    operator     : PINNED to {args.operator} ✓")
+        else:
+            print(f"    operator vk  : {b64e(receipt.sth.operator_vk)[:24]}…  "
+                  f"(UNPINNED — pass --operator to prove a trusted notary)")
         print(f"    attested root: {receipt.sth.root_hash.hex()[:24]}…  (STH seq {receipt.sth.sequence})")
         print(f"    proof path   : {receipt.proof.path_length} hashes (O(log N))")
         return 0
-    print("FAIL — provenance could NOT be verified (tampered, mismatched, or forged)")
+    if expected_vk is not None and not hmac.compare_digest(receipt.sth.operator_vk, expected_vk):
+        print("FAIL — receipt was signed by a DIFFERENT operator than --operator")
+    elif expected_origin_vk is not None and not hmac.compare_digest(m.originator_vk, expected_origin_vk):
+        print("FAIL — capture was signed by a DIFFERENT originator than --expect-originator "
+              "(or is unsigned)")
+    else:
+        print("FAIL — provenance could NOT be verified (tampered, mismatched, or forged)")
     return 1
 
 
@@ -298,6 +460,346 @@ def cmd_open(args) -> int:
     print(f"✓ recovered {len(plaintext)} B → {args.out}")
     if manifest is not None:
         print("    (verified plaintext matches the notarized content hash)")
+    return 0
+
+
+def _write_bundle(prefix: Path, manifest: BundleManifest, shards: list) -> tuple:
+    """Write the bundle manifest + shard files under `prefix`; return their paths."""
+    bundle_path = prefix.with_suffix(prefix.suffix + ".bundle")
+    bundle_path.write_text(manifest.to_json())
+    shard_paths = []
+    for idx, shard in enumerate(shards):
+        p = prefix.with_suffix(prefix.suffix + f".shard{idx:03d}")
+        p.write_bytes(shard)
+        shard_paths.append(p)
+    return bundle_path, shard_paths
+
+
+def cmd_bundle(args) -> int:
+    sealed = Path(args.inp).read_bytes()
+    try:
+        manifest, shards = bundle_sealed(sealed, args.n, args.k)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+    prefix = Path(args.prefix) if args.prefix else Path(args.inp)
+    bundle_path, shard_paths = _write_bundle(prefix, manifest, shards)
+    lost_ok = args.n - args.k
+    print(f"✓ bundled '{args.inp}' into {args.n} shards (any {args.k} reconstruct)")
+    print(f"    tolerates losing any {lost_ok} of {args.n} shards "
+          f"(~{100 * lost_ok // args.n}% loss)")
+    print(f"    each shard : ~{len(shards[0])} B")
+    print(f"    manifest   : {bundle_path}")
+    print(f"    shards     : {shard_paths[0].name} … {shard_paths[-1].name}")
+    return 0
+
+
+def cmd_reassemble(args) -> int:
+    manifest = BundleManifest.from_json(Path(args.bundle).read_text())
+    shards = _collect_shards(args.shards)
+    try:
+        sealed = reassemble_sealed(manifest, shards)
+    except ValueError as e:
+        print(f"FAIL — {e}")
+        return 1
+    Path(args.out).write_bytes(sealed)
+    print(f"✓ reassembled {len(sealed)} B → {args.out}  (from {len(shards)} shards, "
+          f"needed {manifest.k}/{manifest.n})")
+    print("    the reconstructed sealed blob verifies against its receipt as usual")
+    return 0
+
+
+def cmd_send(args) -> int:
+    """One shot: seal + notarize + erasure-bundle, ready to spray over a lossy link."""
+    store = NotaryStore(Path(args.dir))
+    recipient = _read_key(Path(args.to))
+    if not recipient.ek:
+        raise SystemExit("error: recipient key has no encapsulation key")
+    artifact = Path(args.inp).read_bytes()
+
+    originator = None
+    if args.originator_key:
+        originator = _read_key(Path(args.originator_key))
+        if not originator.sk:
+            raise SystemExit("error: --originator-key must be a full (secret) key")
+
+    plog = store.load_log()
+    capture, idx = plog.record_capture(
+        artifact, recipient_ek=recipient.ek, originator_id=args.originator,
+        originator=originator, meta=_parse_meta(args.meta),
+    )
+    sth = plog.publish_sth()
+    receipt = ProvenanceReceipt.build(capture.manifest, plog.inclusion_proof(idx), sth)
+    store.append_record(capture.manifest)
+    store.append_sth(sth)
+
+    try:
+        bundle, shards = bundle_sealed(capture.sealed, args.n, args.k)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
+
+    prefix = Path(args.prefix) if args.prefix else Path(args.inp)
+    receipt_path = prefix.with_suffix(prefix.suffix + ".receipt")
+    receipt_path.write_text(receipt.to_json())
+    bundle_path, shard_paths = _write_bundle(prefix, bundle, shards)
+
+    lost_ok = args.n - args.k
+    print(f"✓ sent '{args.inp}' — sealed, notarized, and erasure-bundled")
+    print(f"    capture id : {capture.manifest.capture_id}")
+    print(f"    originator : {args.originator}"
+          + ("  (device-signed ✓)" if originator is not None else "  (operator-vouched only)"))
+    print(f"    shards     : {args.n} (any {args.k} reconstruct; tolerates losing {lost_ok})")
+    print(f"    parcel     : {receipt_path.name}, {bundle_path.name}, "
+          f"{shard_paths[0].name}…{shard_paths[-1].name}")
+    print(f"    → transport the parcel; receiver runs `etp-custody receive`")
+    return 0
+
+
+def cmd_receive(args) -> int:
+    """One shot: reassemble from surviving shards, verify provenance, then open."""
+    recipient = _read_key(Path(args.key))
+    if not recipient.dk:
+        raise SystemExit("error: receiving requires a full (secret) recipient key")
+
+    bundle = BundleManifest.from_json(Path(args.bundle).read_text())
+    shards = _collect_shards(args.shards)
+    try:
+        sealed = reassemble_sealed(bundle, shards)
+    except ValueError as e:
+        print(f"FAIL — reassembly: {e}")
+        return 1
+
+    try:
+        receipt = ProvenanceReceipt.from_json(Path(args.receipt).read_text())
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"FAIL — malformed receipt ({type(e).__name__})")
+        return 1
+
+    expected_vk = _read_key(Path(args.operator)).vk if args.operator else None
+    expected_origin_vk = _read_key(Path(args.expect_originator)).vk if args.expect_originator else None
+
+    # Fail closed: never open a payload whose provenance does not verify.
+    if not receipt.verify(sealed, expected_operator_vk=expected_vk,
+                          expected_originator_vk=expected_origin_vk):
+        print("FAIL — provenance did NOT verify; refusing to open the payload")
+        return 1
+
+    try:
+        plaintext = ProvenanceLog.open_capture(sealed, recipient, receipt.manifest)
+    except ValueError as e:
+        print(f"FAIL — cannot open: {e}")
+        return 1
+
+    Path(args.out).write_bytes(plaintext)
+    m = receipt.manifest
+    print(f"✓ received → {args.out}  ({len(plaintext)} B)")
+    print(f"    reassembled  : from {len(shards)} shards (needed {bundle.k}/{bundle.n})")
+    print(f"    provenance   : VERIFIED"
+          + (f" · operator PINNED" if expected_vk is not None else "")
+          + (f" · device PINNED" if expected_origin_vk is not None else ""))
+    print(f"    originator   : {m.originator_id}"
+          + ("  (device-signed)" if m.originator_vk else "  (operator-vouched)"))
+    return 0
+
+
+def cmd_batch_send(args) -> int:
+    """Seal + notarize + bundle every file in a directory under one append-only log."""
+    store = NotaryStore(Path(args.dir))
+    recipient = _read_key(Path(args.to))
+    if not recipient.ek:
+        raise SystemExit("error: recipient key has no encapsulation key")
+    originator = None
+    if args.originator_key:
+        originator = _read_key(Path(args.originator_key))
+        if not originator.sk:
+            raise SystemExit("error: --originator-key must be a full (secret) key")
+
+    src = Path(args.in_dir)
+    files = sorted(p for p in src.iterdir() if p.is_file())
+    if not files:
+        raise SystemExit(f"error: no files in {src}")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Append all captures first, then publish ONE STH covering the whole batch,
+    # so every receipt shares the same attested (final) root.
+    plog = store.load_log()
+    pending = []
+    for f in files:
+        cap, idx = plog.record_capture(
+            f.read_bytes(), recipient_ek=recipient.ek, originator_id=args.originator,
+            originator=originator, meta={**_parse_meta(args.meta), "filename": f.name},
+        )
+        store.append_record(cap.manifest)
+        pending.append((f.name, cap, idx))
+    sth = plog.publish_sth()
+    store.append_sth(sth)
+
+    index = {"format": "etp-batch/1", "count": len(pending), "entries": []}
+    for name, cap, idx in pending:
+        receipt = ProvenanceReceipt.build(cap.manifest, plog.inclusion_proof(idx), sth)
+        try:
+            bundle, shards = bundle_sealed(cap.sealed, args.n, args.k)
+        except ValueError as e:
+            raise SystemExit(f"error: {e}")
+        prefix = out_dir / name
+        (out_dir / f"{name}.receipt").write_text(receipt.to_json())
+        bundle_path, shard_paths = _write_bundle(prefix, bundle, shards)
+        index["entries"].append({
+            "name": name,
+            "receipt": f"{name}.receipt",
+            "bundle": bundle_path.name,
+            "shards": [p.name for p in shard_paths],
+        })
+    (out_dir / "batch.json").write_text(json.dumps(index, indent=2))
+
+    print(f"✓ batch-sent {len(pending)} files → {out_dir}/  (one append-only log, "
+          f"shared STH seq {sth.sequence}, root {sth.root_hash.hex()[:16]}…)")
+    print(f"    each file bundled {args.n}/{args.k}; index: {out_dir / 'batch.json'}")
+    return 0
+
+
+def cmd_batch_receive(args) -> int:
+    """Reassemble + verify + open every entry in a batch, failing closed per file."""
+    recipient = _read_key(Path(args.key))
+    if not recipient.dk:
+        raise SystemExit("error: receiving requires a full (secret) recipient key")
+    in_dir = Path(args.in_dir)
+    index = json.loads((in_dir / "batch.json").read_text())
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    expected_vk = _read_key(Path(args.operator)).vk if args.operator else None
+    expected_origin_vk = _read_key(Path(args.expect_originator)).vk if args.expect_originator else None
+
+    ok_count = 0
+    for entry in index["entries"]:
+        name = entry["name"]
+        bundle = BundleManifest.from_json((in_dir / entry["bundle"]).read_text())
+        shards = _collect_shards([str(in_dir / s) for s in entry["shards"] if (in_dir / s).exists()])
+        try:
+            sealed = reassemble_sealed(bundle, shards)
+            receipt = ProvenanceReceipt.from_json((in_dir / entry["receipt"]).read_text())
+        except (ValueError, KeyError, TypeError) as e:
+            print(f"    [✗] {name}: {type(e).__name__}")
+            continue
+        if not receipt.verify(sealed, expected_operator_vk=expected_vk,
+                              expected_originator_vk=expected_origin_vk):
+            print(f"    [✗] {name}: provenance did NOT verify — skipped")
+            continue
+        try:
+            plaintext = ProvenanceLog.open_capture(sealed, recipient, receipt.manifest)
+        except ValueError as e:
+            print(f"    [✗] {name}: cannot open ({e})")
+            continue
+        (out_dir / name).write_bytes(plaintext)
+        ok_count += 1
+        print(f"    [✓] {name}  ({len(plaintext)} B)")
+
+    total = index["count"]
+    print(f"✓ batch-received {ok_count}/{total} files → {out_dir}/")
+    return 0 if ok_count == total else 1
+
+
+def cmd_inspect(args) -> int:
+    """Read-only: describe a receipt/parcel and check its internal validity (no keys)."""
+    try:
+        receipt = ProvenanceReceipt.from_json(Path(args.receipt).read_text())
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"error — malformed receipt ({type(e).__name__})")
+        return 1
+    m = receipt.manifest
+
+    print(f"receipt: {args.receipt}")
+    print(f"    capture id : {m.capture_id}")
+    print(f"    originator : {m.originator_id}"
+          + ("  (device-signed)" if m.originator_vk else "  (operator-vouched only)"))
+    print(f"    captured_at: {m.captured_at}")
+    print(f"    operator vk: {b64e(receipt.sth.operator_vk)[:24]}…")
+    print(f"    log state  : tree_size={receipt.sth.tree_size}  STH seq={receipt.sth.sequence}  "
+          f"leaf={receipt.proof.leaf_index}")
+    if m.meta:
+        print(f"    meta       : {m.meta}")
+
+    checks = [
+        ("operator STH signature valid", receipt.sth.verify()),
+        ("inclusion proof reconstructs the attested root",
+         receipt.proof.verify(m.canonical_bytes(), receipt.sth.root_hash)),
+    ]
+    if m.originator_vk:
+        checks.append((
+            "originator (device) signature valid",
+            MLDSA.verify(m.originator_vk, m.originator_signed_payload(), m.originator_sig),
+        ))
+    if args.bundle:
+        bundle = BundleManifest.from_json(Path(args.bundle).read_text())
+        shards = _collect_shards(args.shards)
+        valid = sum(
+            1 for i, s in shards.items()
+            if 0 <= i < len(bundle.shard_hashes)
+            and hmac.compare_digest(H_bytes(s), bundle.shard_hashes[i])
+        )
+        checks.append((f"shards present: {valid}/{bundle.n} valid, need {bundle.k}",
+                       valid >= bundle.k))
+        if valid >= bundle.k:
+            try:
+                recon = reassemble_sealed(bundle, shards)
+                checks.append(("reassembled blob matches manifest sealed_hash",
+                               hmac.compare_digest(H_bytes(recon), m.sealed_hash)))
+            except ValueError:
+                checks.append(("reassembly", False))
+
+    print("    checks:")
+    for name, ok in checks:
+        print(f"      [{'✓' if ok else '✗'}] {name}")
+    all_ok = all(ok for _, ok in checks)
+    print("    → structurally valid" if all_ok else "    → STRUCTURAL CHECK FAILED")
+    print("    (authenticity requires pinning: use `verify --operator/--expect-originator`)")
+    return 0 if all_ok else 1
+
+
+def cmd_audit(args) -> int:
+    """Verify two receipts came from one append-only log (RFC 6962 consistency)."""
+    store = NotaryStore(Path(args.dir))
+    plog = store.load_log()
+    try:
+        ra = ProvenanceReceipt.from_json(Path(args.receipt_a).read_text())
+        rb = ProvenanceReceipt.from_json(Path(args.receipt_b).read_text())
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"error — malformed receipt ({type(e).__name__})")
+        return 1
+    a, b = ra.sth, rb.sth
+
+    # Same sequence: either the identical checkpoint (e.g. two files from one
+    # batch share one STH) or an equivocation (same seq, different roots).
+    if a.sequence == b.sequence:
+        if a.verify() and b.verify() and hmac.compare_digest(a.root_hash, b.root_hash):
+            print(f"CONSISTENT — both receipts share one log checkpoint "
+                  f"(seq {a.sequence}, size {a.tree_size})")
+            return 0
+        print("NOT CONSISTENT — two signed roots at the same sequence = equivocation (fork)")
+        return 1
+
+    older, newer = (a, b) if a.sequence < b.sequence else (b, a)
+    if plog.verify_append_only(older, newer):
+        print(f"CONSISTENT — STH seq {newer.sequence} (size {newer.tree_size}) is an "
+              f"append-only extension of seq {older.sequence} (size {older.tree_size})")
+        print("    the notary did not rewrite or fork history between these two receipts")
+        return 0
+    print("NOT CONSISTENT — the two receipts are not linked by an append-only extension")
+    print("    (possible history rewrite / fork, or receipts from a different notary)")
+    return 1
+
+
+def cmd_serve(args) -> int:
+    from .notary_server import NotaryService, serve
+    operator = _read_key(Path(args.operator))
+    if not operator.sk:
+        raise SystemExit("error: --operator must be a full (secret) key")
+    if not args.api_key:
+        raise SystemExit("error: provide at least one --api-key")
+    api_keys = {k: f"tenant-{i}" for i, k in enumerate(args.api_key)}
+    service = NotaryService(operator, api_keys)
+    serve(service, host=args.host, port=args.port)
     return 0
 
 
@@ -325,6 +827,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    idp = sub.add_parser("id", help="show/create your default identity (zero-ceremony)")
+    idp.add_argument("--pub", help="export a shareable public-key file")
+    idp.set_defaults(func=cmd_id)
+
+    nz = sub.add_parser("notarize", help="one command: seal + notarize a file with your identity")
+    nz.add_argument("files", nargs="+", help="file(s) to notarize")
+    nz.add_argument("--originator", help="originator id (default: your identity)")
+    nz.add_argument("--attest", action="store_true", help="also emit an in-toto attestation")
+    nz.add_argument("--meta", action="append", help="key=value metadata (repeatable)")
+    nz.set_defaults(func=cmd_notarize)
+
+    at = sub.add_parser("attest", help="convert a receipt into an in-toto attestation")
+    at.add_argument("--receipt", required=True, help="receipt file")
+    at.add_argument("--subject", help="subject name (e.g. the filename)")
+    at.add_argument("--out", help="output path (default: <receipt>.intoto.json)")
+    at.set_defaults(func=cmd_attest)
+
     g = sub.add_parser("keygen", help="generate a post-quantum keypair")
     g.add_argument("-o", "--out", required=True, help="output secret key file")
     g.add_argument("--label", help="human-readable label")
@@ -346,6 +865,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--in", dest="inp", required=True, help="input file to protect")
     s.add_argument("--to", required=True, help="recipient public-key file")
     s.add_argument("--originator", required=True, help="originator identifier (e.g. sensor-7)")
+    s.add_argument("--originator-key", help="capturing device's secret key — cryptographically "
+                                            "sign the capture (default: operator-vouched only)")
     s.add_argument("--out", help="output sealed blob (default: <in>.sealed)")
     s.add_argument("--receipt", help="output receipt file (default: <out>.receipt)")
     s.add_argument("--meta", action="append", help="key=value metadata (repeatable)")
@@ -356,8 +877,14 @@ def build_parser() -> argparse.ArgumentParser:
     pubh.set_defaults(func=cmd_publish)
 
     v = sub.add_parser("verify", help="verify a receipt against a sealed blob (offline)")
-    v.add_argument("--sealed", required=True, help="sealed blob")
-    v.add_argument("--receipt", required=True, help="receipt file")
+    v.add_argument("file", nargs="?", help="a FILE → derives FILE.sealed and FILE.receipt")
+    v.add_argument("--sealed", help="sealed blob (overrides FILE.sealed)")
+    v.add_argument("--receipt", help="receipt file (overrides FILE.receipt)")
+    v.add_argument("--attestation", help="verify from an in-toto attestation instead of a receipt")
+    v.add_argument("--operator", help="pin the trusted notary's public key file "
+                                      "(without it, any operator's receipt passes)")
+    v.add_argument("--expect-originator", help="pin the capturing device's public key file "
+                                               "(require this device's signature on the capture)")
     v.set_defaults(func=cmd_verify)
 
     o = sub.add_parser("open", help="recover the plaintext (authorized recipient only)")
@@ -366,6 +893,80 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--receipt", help="receipt file (re-checks content hash if given)")
     o.add_argument("-o", "--out", required=True, help="output plaintext file")
     o.set_defaults(func=cmd_open)
+
+    b = sub.add_parser("bundle", help="erasure-code a sealed blob into n shards (any k reconstruct)")
+    b.add_argument("--in", dest="inp", required=True, help="sealed blob to bundle")
+    b.add_argument("--n", type=int, required=True, help="total shards to produce")
+    b.add_argument("--k", type=int, required=True, help="shards needed to reconstruct (k < n)")
+    b.add_argument("--prefix", help="output path prefix (default: <in>)")
+    b.set_defaults(func=cmd_bundle)
+
+    r = sub.add_parser("reassemble", help="reconstruct a sealed blob from any k shards")
+    r.add_argument("--bundle", required=True, help="bundle manifest (.bundle)")
+    r.add_argument("--out", required=True, help="output sealed blob")
+    r.add_argument("shards", nargs="+", help="shard files (indices read from .shardNN names)")
+    r.set_defaults(func=cmd_reassemble)
+
+    sd = sub.add_parser("send", help="one shot: seal + notarize + erasure-bundle a file")
+    sd.add_argument("dir", help="notary directory")
+    sd.add_argument("--in", dest="inp", required=True, help="input file to protect")
+    sd.add_argument("--to", required=True, help="recipient public-key file")
+    sd.add_argument("--originator", required=True, help="originator identifier (e.g. sensor-7)")
+    sd.add_argument("--originator-key", help="capturing device's secret key (sign the capture)")
+    sd.add_argument("--n", type=int, required=True, help="total shards to produce")
+    sd.add_argument("--k", type=int, required=True, help="shards needed to reconstruct (k < n)")
+    sd.add_argument("--prefix", help="output parcel prefix (default: <in>)")
+    sd.add_argument("--meta", action="append", help="key=value metadata (repeatable)")
+    sd.set_defaults(func=cmd_send)
+
+    rc = sub.add_parser("receive", help="one shot: reassemble + verify + open a parcel")
+    rc.add_argument("--key", required=True, help="recipient secret key file")
+    rc.add_argument("--bundle", required=True, help="bundle manifest (.bundle)")
+    rc.add_argument("--receipt", required=True, help="receipt file")
+    rc.add_argument("--out", required=True, help="output plaintext file")
+    rc.add_argument("--operator", help="pin the trusted notary's public key file")
+    rc.add_argument("--expect-originator", help="pin the capturing device's public key file")
+    rc.add_argument("shards", nargs="+", help="shard files (indices from .shardNN names)")
+    rc.set_defaults(func=cmd_receive)
+
+    bs = sub.add_parser("batch-send", help="seal + notarize + bundle every file in a directory")
+    bs.add_argument("dir", help="notary directory")
+    bs.add_argument("--in-dir", required=True, help="directory of files to protect")
+    bs.add_argument("--to", required=True, help="recipient public-key file")
+    bs.add_argument("--originator", required=True, help="originator identifier")
+    bs.add_argument("--originator-key", help="capturing device's secret key (sign each capture)")
+    bs.add_argument("--n", type=int, required=True, help="total shards per file")
+    bs.add_argument("--k", type=int, required=True, help="shards needed to reconstruct (k < n)")
+    bs.add_argument("--out-dir", required=True, help="output parcel directory")
+    bs.add_argument("--meta", action="append", help="key=value metadata (repeatable)")
+    bs.set_defaults(func=cmd_batch_send)
+
+    br = sub.add_parser("batch-receive", help="reassemble + verify + open every file in a batch")
+    br.add_argument("--key", required=True, help="recipient secret key file")
+    br.add_argument("--in-dir", required=True, help="parcel directory (containing batch.json)")
+    br.add_argument("--out-dir", required=True, help="output directory for recovered files")
+    br.add_argument("--operator", help="pin the trusted notary's public key file")
+    br.add_argument("--expect-originator", help="pin the capturing device's public key file")
+    br.set_defaults(func=cmd_batch_receive)
+
+    ins = sub.add_parser("inspect", help="describe a receipt/parcel and check internal validity (no keys)")
+    ins.add_argument("--receipt", required=True, help="receipt file")
+    ins.add_argument("--bundle", help="bundle manifest (.bundle) — also checks shard sufficiency")
+    ins.add_argument("shards", nargs="*", help="shard files to check (with --bundle)")
+    ins.set_defaults(func=cmd_inspect)
+
+    au = sub.add_parser("audit", help="verify two receipts are from one append-only log")
+    au.add_argument("dir", help="notary directory")
+    au.add_argument("receipt_a", help="first receipt")
+    au.add_argument("receipt_b", help="second receipt")
+    au.set_defaults(func=cmd_audit)
+
+    sv = sub.add_parser("serve", help="run the hosted notary HTTP service (SaaS backend)")
+    sv.add_argument("--operator", required=True, help="operator secret key file")
+    sv.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
+    sv.add_argument("--port", type=int, default=8080, help="bind port (default 8080)")
+    sv.add_argument("--api-key", action="append", help="authorized API key (repeatable)")
+    sv.set_defaults(func=cmd_serve)
 
     lg = sub.add_parser("log", help="show notary state")
     lg.add_argument("dir", help="notary directory")

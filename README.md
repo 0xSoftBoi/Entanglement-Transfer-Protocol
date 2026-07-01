@@ -16,6 +16,52 @@
 
 ---
 
+## 🛡️ `etp-custody` — verifiable chain of custody for your data
+
+**Prove where a file came from and that it hasn't changed** — a tamper-evident,
+append-only provenance record (RFC-6962, the Certificate-Transparency design)
+with a portable receipt anyone can verify offline. **No blockchain.** It's
+**post-quantum** (ML-KEM-768 / ML-DSA-65) so what you attest today stays provable
+and confidential for decades — the harvest-now-decrypt-later defense — and it's
+**delay-tolerant**, surviving links that drop packets.
+
+Think of it as **signing + a transparency log, without the key ceremony.**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/0xSoftBoi/Entanglement-Transfer-Protocol/main/install.sh | sh
+
+etp-custody notarize report.pdf --attest    # one command: no keygen, no init, no keys
+etp-custody verify   report.pdf             # anyone verifies offline → PASS
+```
+
+`notarize` emits a `report.pdf.receipt` and a standard **in-toto attestation**
+(`report.pdf.intoto.json`) so existing supply-chain verifiers can consume it.
+Drop it into CI with the [GitHub Action](.github/actions/attest/action.yml).
+
+For multi-party / lossy-link transport, the full flow adds sealing, device
+signatures, erasure-coded bundling, and a hosted notary:
+
+```bash
+etp-custody send ./notary --in report.pdf --to bob.pub \
+    --originator sensor-7 --originator-key sensor7.key --n 6 --k 4 --prefix parcel
+etp-custody receive --key bob.key --bundle parcel.bundle --receipt parcel.receipt \
+    --out report.pdf --operator op.pub --expect-originator sensor7.pub  parcel.shard*
+```
+
+**Provenance** (RFC-6962 inclusion + consistency) · **Authenticity** (operator +
+device signatures) · **Confidentiality** (constant-overhead PQC seal) ·
+**Delay-tolerance** (erasure-coded shards, any *k* of *n* reconstruct).
+
+→ [`bash examples/custody_demo.sh`](examples/custody_demo.sh) runs the whole story ·
+Full guide: [`docs/PROVENANCE_CLI.md`](docs/PROVENANCE_CLI.md) ·
+Landing page: [`website/index.html`](website/index.html)
+
+<div align="center"><a href="website/index.html">
+<img src="website/preview.png" alt="ETP Custody landing page" width="760">
+</a></div>
+
+---
+
 ## The Problem
 
 Every existing protocol -- TCP/IP, HTTP, FTP, QUIC -- operates on the same

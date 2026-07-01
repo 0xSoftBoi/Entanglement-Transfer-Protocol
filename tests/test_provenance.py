@@ -18,7 +18,10 @@ import pytest
 from src.ltp import KeyPair
 from src.ltp.merkle_log import MerkleLog
 from src.ltp.primitives import H_bytes
-from src.ltp.provenance import ProvenanceLog, CaptureManifest, SEAL_OVERHEAD
+from src.ltp.provenance import (
+    ProvenanceLog, ProvenanceReceipt, CaptureManifest, SEAL_OVERHEAD,
+    BundleManifest, bundle_sealed, reassemble_sealed,
+)
 
 
 @pytest.fixture
@@ -148,6 +151,143 @@ class TestTamperEvidence:
 # ---------------------------------------------------------------------------
 # Fork detection + append-only
 # ---------------------------------------------------------------------------
+
+class TestOperatorPinning:
+    """A receipt only proves authenticity when the operator key is pinned."""
+
+    def test_attacker_receipt_passes_without_pin_but_fails_with_pin(self, recipient):
+        honest = KeyPair.generate("honest-notary")
+        attacker = KeyPair.generate("attacker")
+        artifact = b"authentic evidence"
+
+        # Attacker runs their OWN notary, seals the same artifact, lies in metadata.
+        alog = ProvenanceLog(attacker)
+        cap, idx = alog.record_capture(artifact, recipient.ek, originator_id="sensor-7")
+        sth = alog.publish_sth()
+        proof = alog.inclusion_proof(idx)
+
+        # Unpinned: self-consistent, so it verifies (this is the documented gap).
+        assert ProvenanceLog.verify_capture(cap.manifest, cap.sealed, proof, sth)
+        # Pinned to the honest notary: the forgery is rejected.
+        assert not ProvenanceLog.verify_capture(
+            cap.manifest, cap.sealed, proof, sth, expected_operator_vk=honest.vk
+        )
+        # Pinned to the actual signer: passes.
+        assert ProvenanceLog.verify_capture(
+            cap.manifest, cap.sealed, proof, sth, expected_operator_vk=attacker.vk
+        )
+
+    def test_receipt_verify_honors_pin(self, plog, recipient):
+        cap, idx = plog.record_capture(b"x", recipient.ek, originator_id="s")
+        sth = plog.publish_sth()
+        receipt = ProvenanceReceipt.build(cap.manifest, plog.inclusion_proof(idx), sth)
+        assert receipt.verify(cap.sealed, expected_operator_vk=sth.operator_vk)
+        assert not receipt.verify(cap.sealed, expected_operator_vk=b"\x00" * len(sth.operator_vk))
+
+
+class TestOriginatorSignature:
+    """The capturing device can cryptographically attest, not just be named."""
+
+    def test_signed_capture_verifies_and_pins(self, plog, recipient):
+        device = KeyPair.generate("sensor-7")
+        cap, idx = plog.record_capture(
+            b"sensor reading", recipient.ek, originator_id="sensor-7", originator=device
+        )
+        sth = plog.publish_sth()
+        proof = plog.inclusion_proof(idx)
+        # signature present and valid
+        assert cap.manifest.originator_vk == device.vk
+        assert ProvenanceLog.verify_capture(cap.manifest, cap.sealed, proof, sth)
+        # pin to the right device passes, wrong device fails
+        assert ProvenanceLog.verify_capture(
+            cap.manifest, cap.sealed, proof, sth, expected_originator_vk=device.vk
+        )
+        assert not ProvenanceLog.verify_capture(
+            cap.manifest, cap.sealed, proof, sth,
+            expected_originator_vk=KeyPair.generate("other").vk,
+        )
+
+    def test_unsigned_capture_fails_when_originator_pin_required(self, plog, recipient):
+        cap, idx = plog.record_capture(b"x", recipient.ek, originator_id="sensor-7")
+        sth = plog.publish_sth()
+        proof = plog.inclusion_proof(idx)
+        assert cap.manifest.originator_vk == b""
+        # unsigned still verifies unpinned (operator-vouched)...
+        assert ProvenanceLog.verify_capture(cap.manifest, cap.sealed, proof, sth)
+        # ...but not when a specific device is required
+        assert not ProvenanceLog.verify_capture(
+            cap.manifest, cap.sealed, proof, sth,
+            expected_originator_vk=KeyPair.generate("sensor-7").vk,
+        )
+
+    def test_forged_originator_signature_rejected(self, plog, recipient):
+        device = KeyPair.generate("sensor-7")
+        cap, idx = plog.record_capture(
+            b"reading", recipient.ek, originator_id="sensor-7", originator=device
+        )
+        # Tamper the device signature; capture must fail even before notarization checks.
+        from dataclasses import replace
+        forged = replace(cap.manifest, originator_sig=b"\x00" * len(cap.manifest.originator_sig))
+        sth = plog.publish_sth()
+        proof = plog.inclusion_proof(idx)
+        assert not ProvenanceLog.verify_capture(forged, cap.sealed, proof, sth)
+
+    def test_originator_signature_survives_receipt_roundtrip(self, plog, recipient):
+        device = KeyPair.generate("sensor-7")
+        cap, idx = plog.record_capture(
+            b"reading", recipient.ek, originator_id="sensor-7", originator=device
+        )
+        sth = plog.publish_sth()
+        receipt = ProvenanceReceipt.build(cap.manifest, plog.inclusion_proof(idx), sth)
+        r2 = ProvenanceReceipt.from_json(receipt.to_json())
+        assert r2.verify(cap.sealed, expected_originator_vk=device.vk)
+
+
+class TestShardBundle:
+    """Delay-tolerant transport: erasure-code a sealed blob, reconstruct from any k."""
+
+    def test_roundtrip_all_shards(self, plog, recipient):
+        cap, _ = plog.record_capture(b"payload" * 100, recipient.ek, originator_id="s")
+        manifest, shards = bundle_sealed(cap.sealed, n=6, k=4)
+        got = reassemble_sealed(manifest, {i: s for i, s in enumerate(shards)})
+        assert got == cap.sealed
+
+    def test_reconstructs_after_losing_n_minus_k(self, plog, recipient):
+        cap, _ = plog.record_capture(b"lossy link payload" * 50, recipient.ek, originator_id="s")
+        manifest, shards = bundle_sealed(cap.sealed, n=6, k=4)
+        # Drop 2 of 6 (indices 1 and 4) — still have exactly k=4.
+        surviving = {i: s for i, s in enumerate(shards) if i not in (1, 4)}
+        assert len(surviving) == 4
+        assert reassemble_sealed(manifest, surviving) == cap.sealed
+
+    def test_reassembled_blob_still_verifies_against_receipt(self, plog, recipient):
+        cap, idx = plog.record_capture(b"evidence", recipient.ek, originator_id="s")
+        sth = plog.publish_sth()
+        receipt = ProvenanceReceipt.build(cap.manifest, plog.inclusion_proof(idx), sth)
+        manifest, shards = bundle_sealed(cap.sealed, n=5, k=3)
+        # Reassemble from 3 arbitrary shards, then the ORIGINAL receipt verifies it.
+        recon = reassemble_sealed(manifest, {0: shards[0], 2: shards[2], 4: shards[4]})
+        assert receipt.verify(recon)
+
+    def test_too_few_shards_raises(self, plog, recipient):
+        cap, _ = plog.record_capture(b"x" * 40, recipient.ek, originator_id="s")
+        manifest, shards = bundle_sealed(cap.sealed, n=6, k=4)
+        with pytest.raises(ValueError, match="need 4 valid shards"):
+            reassemble_sealed(manifest, {0: shards[0], 1: shards[1]})
+
+    def test_corrupt_shard_is_dropped(self, plog, recipient):
+        cap, _ = plog.record_capture(b"y" * 80, recipient.ek, originator_id="s")
+        manifest, shards = bundle_sealed(cap.sealed, n=6, k=4)
+        supplied = {i: s for i, s in enumerate(shards[:5])}  # 5 shards
+        supplied[2] = b"\x00" * len(supplied[2])             # corrupt one → dropped, 4 remain
+        assert reassemble_sealed(manifest, supplied) == cap.sealed
+
+    def test_manifest_json_roundtrip(self, plog, recipient):
+        cap, _ = plog.record_capture(b"z" * 40, recipient.ek, originator_id="s")
+        manifest, shards = bundle_sealed(cap.sealed, n=5, k=3)
+        m2 = BundleManifest.from_json(manifest.to_json())
+        assert reassemble_sealed(m2, {i: s for i, s in enumerate(shards)}) == cap.sealed
+
 
 class TestForkAndAppendOnly:
     def test_equivocation_detected(self, operator, recipient):
