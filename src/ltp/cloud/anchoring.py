@@ -56,6 +56,7 @@ class AnchorWorker:
         validity_secs: int = 365 * 24 * 3600,
         max_attempts: int = 5,
         on_confirmed=None,
+        anchor_plans: set[str] | None = None,
     ) -> None:
         """
         Args:
@@ -67,6 +68,10 @@ class AnchorWorker:
                           on-chain as signerVkHash).
             on_confirmed: optional callback(tenant_id, anchor_row) — used by the
                           service to fire anchor.confirmed webhooks.
+            anchor_plans: plan gating — when set, only tenants whose plan is in
+                          this set are anchored (production passes
+                          {'verified'}); None anchors every tenant (the
+                          reference default, used throughout the tests).
         """
         self._store = store
         self._client = client
@@ -75,6 +80,7 @@ class AnchorWorker:
         self._validity_secs = validity_secs
         self._max_attempts = max_attempts
         self._on_confirmed = on_confirmed
+        self._anchor_plans = anchor_plans
 
     # ------------------------------------------------------------------
     # Digest / submission construction
@@ -107,7 +113,10 @@ class AnchorWorker:
     def enqueue(self) -> int:
         """Stage 1: queue each tenant's latest un-anchored STH (idempotent)."""
         queued = 0
+        plans = self._store.tenant_plans() if self._anchor_plans is not None else None
         for tenant_id in self._store.tenant_ids():
+            if plans is not None and plans.get(tenant_id) not in self._anchor_plans:
+                continue  # plan gating: anchoring is the paid "Verified" tier
             sth = self._store.latest_sth(tenant_id)
             if sth is None:
                 continue
@@ -119,13 +128,36 @@ class AnchorWorker:
         return queued
 
     def submit_pending(self) -> int:
-        """Stage 2: submit pending anchors; count attempts, fail after max."""
+        """
+        Stage 2: submit pending anchors; count attempts, fail after max.
+
+        When more than one anchor is pending and the client supports it, all of
+        them go on-chain in ONE `batchAnchor` transaction (amortizing gas across
+        tenants); otherwise each is submitted individually.
+        """
+        rows = self._store.anchors(status="pending")
+        if not rows:
+            return 0
+        subs = [self._submission(r["tenant_id"], r["sth_sequence"],
+                                 b64d(r["root"]), b64d(r["digest"])) for r in rows]
+
+        if len(rows) > 1 and hasattr(self._client, "batch_anchor"):
+            try:
+                tx_ref = self._client.batch_anchor(subs)
+            except Exception as e:
+                for row in rows:
+                    attempts = row["attempts"] + 1
+                    status = "failed" if attempts >= self._max_attempts else "pending"
+                    self._store.mark_anchor(row["id"], status,
+                                            error=f"{type(e).__name__}: {e}",
+                                            bump_attempts=True)
+                return 0
+            for row in rows:
+                self._store.mark_anchor(row["id"], "submitted", tx_ref=tx_ref)
+            return len(rows)
+
         submitted = 0
-        for row in self._store.anchors(status="pending"):
-            sub = self._submission(
-                row["tenant_id"], row["sth_sequence"],
-                b64d(row["root"]), b64d(row["digest"]),
-            )
+        for row, sub in zip(rows, subs):
             try:
                 tx_ref = self._client.anchor(sub)
             except Exception as e:  # RPC/rate-limit/breaker errors — retry later

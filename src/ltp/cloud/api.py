@@ -62,6 +62,12 @@ def create_app(service: CloudNotaryService) -> FastAPI:
     def healthz() -> dict:
         return {"status": "ok", "captures": service._store.total_captures()}
 
+    @api.get("/metrics")
+    def metrics() -> Response:
+        from .metrics import render_metrics
+        return Response(render_metrics(service._store),
+                        media_type="text/plain; version=0.0.4")
+
     @api.get("/v1/operator")
     def operator() -> dict:
         return {"operator_vk": b64e(service.operator_vk)}
@@ -93,10 +99,14 @@ def create_app(service: CloudNotaryService) -> FastAPI:
 
     @api.get("/v1/sth")
     def sth(tenant: str = Depends(tenant_auth)) -> dict:
-        latest = service.latest_sth(tenant)
-        if latest is None:
+        payload = service.sth_response(tenant)
+        if payload is None:
             raise HTTPException(404, "no captures yet")
-        return latest.to_dict()
+        return payload
+
+    @api.get("/v1/captures")
+    def list_captures(tenant: str = Depends(tenant_auth)) -> list[dict[str, Any]]:
+        return service.captures(tenant)
 
     @api.get("/v1/proof/{index}")
     def proof(index: int, tenant: str = Depends(tenant_auth)) -> dict:
@@ -117,6 +127,17 @@ def create_app(service: CloudNotaryService) -> FastAPI:
         if not body.get("name"):
             raise HTTPException(400, "malformed request (name required)")
         return service.create_tenant(body["name"], body.get("webhook_url"))
+
+    @api.post("/v1/admin/tenants/{tenant_id}/plan",
+              dependencies=[Depends(admin_auth)])
+    def set_plan(tenant_id: str, body: dict) -> dict:
+        try:
+            ok = service.set_plan(tenant_id, body.get("plan", ""))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if not ok:
+            raise HTTPException(404, "unknown tenant")
+        return {"tenant_id": tenant_id, "plan_updated": True}
 
     # Match the reference server's error envelope: {"error": "..."}.
     @api.exception_handler(HTTPException)

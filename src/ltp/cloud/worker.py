@@ -42,7 +42,10 @@ def main() -> int:
     operator = store.get_or_create_operator()
     dispatcher = WebhookDispatcher(store)
     client = _try_anchor_client()
-    worker = AnchorWorker(store, client, operator.vk) if client else None
+    # Production gating: anchoring is the paid "Verified" tier.
+    plans = set(os.environ.get("ETP_CLOUD_ANCHOR_PLANS", "verified").split(","))
+    worker = (AnchorWorker(store, client, operator.vk, anchor_plans=plans)
+              if client else None)
 
     print(f"etp-custody-worker: interval={interval}s anchoring={'on' if worker else 'off'}")
     while True:

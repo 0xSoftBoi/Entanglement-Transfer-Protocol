@@ -19,14 +19,22 @@ Design doc: docs/cloud/CUSTODY_CLOUD_DESIGN.md
 API spec:   docs/cloud/openapi.yaml
 """
 
-from .store import CloudStore
+from .store import CloudStore, PostgresStore, open_store
 from .service import CloudNotaryService, make_cloud_server
 from .anchoring import AnchorWorker
 from .indexer import EventIndexer, AnchoredEvent
 from .webhooks import WebhookDispatcher, sign_payload
+from .witness import Witness, Cosignature
+from .metrics import render_metrics
+from .billing import usage_deltas, run_billing_export
+from .report import build_report, render_markdown
 
 __all__ = [
-    "CloudStore", "CloudNotaryService", "make_cloud_server",
+    "CloudStore", "PostgresStore", "open_store",
+    "CloudNotaryService", "make_cloud_server",
     "AnchorWorker", "EventIndexer", "AnchoredEvent",
     "WebhookDispatcher", "sign_payload",
+    "Witness", "Cosignature", "render_metrics",
+    "usage_deltas", "run_billing_export",
+    "build_report", "render_markdown",
 ]

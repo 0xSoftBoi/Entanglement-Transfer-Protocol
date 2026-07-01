@@ -51,6 +51,7 @@ _SCHEMA = [
         name           TEXT NOT NULL,
         webhook_url    TEXT,
         webhook_secret TEXT,
+        plan           TEXT NOT NULL DEFAULT 'free',
         created_at     {REAL} NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS api_keys (
@@ -105,6 +106,11 @@ _SCHEMA = [
         chain_id   INTEGER PRIMARY KEY,
         last_block INTEGER NOT NULL
     )""",
+    """CREATE TABLE IF NOT EXISTS billing_snapshots (
+        tenant_id  TEXT NOT NULL,
+        captures   INTEGER NOT NULL,
+        created_at {REAL} NOT NULL
+    )""",
     """CREATE TABLE IF NOT EXISTS service_config (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -141,6 +147,7 @@ class CloudStore:
         """Columns added after the first release (pre-existing SQLite DBs)."""
         for stmt in [
             "ALTER TABLE tenants  ADD COLUMN webhook_secret TEXT",
+            "ALTER TABLE tenants  ADD COLUMN plan TEXT NOT NULL DEFAULT 'free'",
             "ALTER TABLE captures ADD COLUMN capture_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE anchors  ADD COLUMN block_number INTEGER",
         ]:
@@ -235,15 +242,22 @@ class CloudStore:
 
     def tenant(self, tenant_id: str) -> dict | None:
         rows = self._query(
-            "SELECT id, name, webhook_url, webhook_secret FROM tenants WHERE id=?",
+            "SELECT id, name, webhook_url, webhook_secret, plan FROM tenants WHERE id=?",
             (tenant_id,))
         if not rows:
             return None
         r = rows[0]
-        return {"id": r[0], "name": r[1], "webhook_url": r[2], "webhook_secret": r[3]}
+        return {"id": r[0], "name": r[1], "webhook_url": r[2],
+                "webhook_secret": r[3], "plan": r[4]}
+
+    def set_plan(self, tenant_id: str, plan: str) -> bool:
+        return self._exec("UPDATE tenants SET plan=? WHERE id=?", (plan, tenant_id)) > 0
 
     def tenant_ids(self) -> list[str]:
         return [r[0] for r in self._query("SELECT id FROM tenants ORDER BY created_at")]
+
+    def tenant_plans(self) -> dict[str, str]:
+        return dict(self._query("SELECT id, plan FROM tenants"))
 
     # ------------------------------------------------------------------
     # Log persistence (per-tenant manifests + STHs)
@@ -284,13 +298,43 @@ class CloudStore:
             (tenant_id,))
         return SignedTreeHead.from_dict(json.loads(rows[0][0])) if rows else None
 
+    def sth_history(self, tenant_id: str) -> list[SignedTreeHead]:
+        rows = self._query(
+            "SELECT sth FROM sths WHERE tenant_id=? ORDER BY sequence", (tenant_id,))
+        return [SignedTreeHead.from_dict(json.loads(r[0])) for r in rows]
+
     def usage(self, tenant_id: str) -> int:
         """The billable unit: notarized captures for this tenant."""
         return self._query(
             "SELECT COUNT(*) FROM captures WHERE tenant_id=?", (tenant_id,))[0][0]
 
+    def usage_by_tenant(self) -> dict[str, int]:
+        return dict(self._query(
+            "SELECT tenant_id, COUNT(*) FROM captures GROUP BY tenant_id"))
+
     def total_captures(self) -> int:
         return self._query("SELECT COUNT(*) FROM captures")[0][0]
+
+    # -- metrics/billing helpers ----------------------------------------
+
+    def anchor_status_counts(self) -> dict[str, int]:
+        return dict(self._query(
+            "SELECT status, COUNT(*) FROM anchors GROUP BY status"))
+
+    def outbox_pending(self) -> int:
+        return self._query(
+            "SELECT COUNT(*) FROM webhook_outbox WHERE delivered_at IS NULL")[0][0]
+
+    def last_billing_snapshot(self, tenant_id: str) -> int:
+        rows = self._query(
+            "SELECT captures FROM billing_snapshots WHERE tenant_id=? "
+            "ORDER BY created_at DESC LIMIT 1", (tenant_id,))
+        return rows[0][0] if rows else 0
+
+    def record_billing_snapshot(self, tenant_id: str, captures: int) -> None:
+        self._exec(
+            "INSERT INTO billing_snapshots (tenant_id, captures, created_at) VALUES (?,?,?)",
+            (tenant_id, captures, time.time()))
 
     # ------------------------------------------------------------------
     # Anchor lifecycle

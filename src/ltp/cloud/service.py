@@ -56,12 +56,17 @@ class CloudNotaryService:
         operator: KeyPair | None = None,
         sync_webhooks: bool = False,
         rate_per_minute: float | None = 300.0,
+        witness: KeyPair | None = None,
     ) -> None:
         self._store = store
         self._operator = operator or store.get_or_create_operator()
         self._admin_token = admin_token
         self._sync_webhooks = sync_webhooks
         self._dispatcher = WebhookDispatcher(store)
+        self._witness = None
+        if witness is not None:
+            from .witness import Witness
+            self._witness = Witness(witness)
         self._rate_per_minute = rate_per_minute
         self._limiters: dict[str, TokenBucketRateLimiter] = {}
         self._logs: dict[str, ProvenanceLog] = {}
@@ -148,6 +153,33 @@ class CloudNotaryService:
 
     def latest_sth(self, tenant_id: str):
         return self._store.latest_sth(tenant_id)
+
+    def sth_response(self, tenant_id: str) -> dict | None:
+        """The /v1/sth payload: STH dict + witness cosignature when configured."""
+        sth = self._store.latest_sth(tenant_id)
+        if sth is None:
+            return None
+        out = sth.to_dict()
+        if self._witness is not None:
+            out["cosignature"] = self._witness.cosign(sth).to_dict()
+        return out
+
+    def captures(self, tenant_id: str, limit: int = 50) -> list[dict]:
+        """Recent captures (public manifest metadata) for the console."""
+        manifests = self._store.manifests(tenant_id)
+        out = [{
+            "leaf_index": i,
+            "capture_id": m.capture_id,
+            "originator_id": m.originator_id,
+            "captured_at": m.captured_at,
+            "device_signed": bool(m.originator_vk),
+        } for i, m in enumerate(manifests)]
+        return out[-limit:][::-1]   # newest first
+
+    def set_plan(self, tenant_id: str, plan: str) -> bool:
+        if plan not in ("free", "pro", "verified"):
+            raise ValueError(f"unknown plan: {plan!r}")
+        return self._store.set_plan(tenant_id, plan)
 
     def usage(self, tenant_id: str) -> int:
         return self._store.usage(tenant_id)
@@ -248,6 +280,15 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             return self._send(200, {"status": "ok",
                                     "captures": self.svc._store.total_captures()})
+        if path == "/metrics":
+            from .metrics import render_metrics
+            body = render_metrics(self.svc._store).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/v1/operator":
             return self._send(200, {"operator_vk": b64e(self.svc.operator_vk)})
 
@@ -257,10 +298,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/v1/usage":
             return self._send(200, {"captures": self.svc.usage(tenant)})
         if path == "/v1/sth":
-            sth = self.svc.latest_sth(tenant)
-            if sth is None:
+            payload = self.svc.sth_response(tenant)
+            if payload is None:
                 return self._send(404, {"error": "no captures yet"})
-            return self._send(200, sth.to_dict())
+            return self._send(200, payload)
+        if path == "/v1/captures":
+            return self._send(200, self.svc.captures(tenant))
         if path == "/v1/anchors":
             return self._send(200, self.svc.anchors(tenant))
         if path.startswith("/v1/proof/"):
@@ -290,6 +333,18 @@ class _Handler(BaseHTTPRequestHandler):
             except (ValueError, KeyError, TypeError) as e:
                 return self._send(400, {"error": f"malformed request ({type(e).__name__})"})
             return self._send(201, created)
+
+        if path.startswith("/v1/admin/tenants/") and path.endswith("/plan"):
+            if not self.svc.admin_authorized(self.headers.get("X-Admin-Token")):
+                return self._send(401, {"error": "invalid admin token"})
+            tenant_id = path.split("/")[4]
+            try:
+                ok = self.svc.set_plan(tenant_id, self._body().get("plan", ""))
+            except (ValueError, KeyError, TypeError) as e:
+                return self._send(400, {"error": str(e)})
+            if not ok:
+                return self._send(404, {"error": "unknown tenant"})
+            return self._send(200, {"tenant_id": tenant_id, "plan_updated": True})
 
         if path == "/v1/captures":
             key = self._api_key()
