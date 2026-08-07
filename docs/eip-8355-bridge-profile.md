@@ -22,6 +22,11 @@ Current EIP-8355 precompile addresses are draft values. This repository delibera
 one into `LTPAnchorRegistry`: the registry points at an admin-configured verifier adapter, and the
 EIP-8355 adapter points at a chain-specific precompile address.
 
+For the Suwappu devnet, the chain profile now assigns ML-DSA-65 to
+`0x0000000000000000000000000000000000008355` from Fjord onward. That value is Suwappu-local,
+not a claim about the eventual EIP assignment. The companion OP-Reth deployment branch builds the
+native verifier from a pinned maintained Optimism source revision.
+
 ## v6 authorization model
 
 v5 accepted a caller-supplied `signerVkHash` after checking only that the hash was allowlisted.
@@ -133,14 +138,18 @@ does not by itself prove source-chain finality or bridge liveness.
 ## Suwappu Chain activation checklist
 
 1. Run the v5 -> v6 proxy storage test and all contract tests.
-2. Run a custom execution-client build that actually implements the resolved EIP-8355 semantics.
-   Stock OP-Reth does not gain a precompile from these contracts.
-3. Deploy `EIP8355MLDSA65Verifier` with the chain's resolved ML-DSA-65 precompile address.
+2. Build the Suwappu custom OP-Reth profile and verify the native CI gate is green.
+3. Deploy `EIP8355MLDSA65Verifier` with
+   `0x0000000000000000000000000000000000008355` for the current Suwappu devnet profile.
 4. Set that adapter on the registry through governance.
 5. Register the raw FIPS 204 public key with `registerEIP8355Signer`.
-6. Pass positive, tampered-signature, malformed-input and absent-precompile tests against the
+6. Configure `LiveBridge` with the same operator key; it now fetches
+   `anchorAuthorizationMessage`, signs those exact bytes with the real ML-DSA-65 backend, and
+   submits `anchorSigned`.
+7. Pass positive, tampered-signature, malformed-input and absent-precompile tests against the
    running chain before enabling permissionless relaying.
-7. Keep PoC fallback crypto out of benchmarks and conformance claims; use the real FIPS backend.
+8. Keep PoC fallback crypto out of benchmarks and conformance claims; the signed Python client
+   refuses to use the PoC ML-DSA backend.
 
 ## Upstream coordination
 
