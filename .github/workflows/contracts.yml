@@ -9,19 +9,23 @@ on:
       - ".github/workflows/contracts.yml"
       - "contracts/**"
       - "src/ltp/anchor/**"
+      - "src/ltp/bridge/**"
       - "src/ltp/cloud/anchoring.py"
       - "src/ltp/cloud/indexer.py"
       - "src/ltp/primitives.py"
       - "tests/test_contract_integration.py"
+      - "tests/test_anchor_client_pq.py"
   pull_request:
     paths:
       - ".github/workflows/contracts.yml"
       - "contracts/**"
       - "src/ltp/anchor/**"
+      - "src/ltp/bridge/**"
       - "src/ltp/cloud/anchoring.py"
       - "src/ltp/cloud/indexer.py"
       - "src/ltp/primitives.py"
       - "tests/test_contract_integration.py"
+      - "tests/test_anchor_client_pq.py"
 
 jobs:
   forge-test:
