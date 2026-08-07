@@ -61,6 +61,18 @@ interface ILTPAnchorRegistry {
     event Paused(address indexed by);
     event Unpaused(address indexed by);
 
+    event MLDSA65VerifierUpdated(
+        address indexed oldVerifier,
+        address indexed newVerifier
+    );
+
+    /// @notice Emitted only after verifier-backed ML-DSA-65 authorization succeeds.
+    event PQAuthorizationVerified(
+        bytes32 indexed signerVkHash,
+        bytes32 indexed entityIdHash,
+        bytes32 messageHash
+    );
+
     // -----------------------------------------------------------------------
     // Errors
     // -----------------------------------------------------------------------
@@ -75,6 +87,9 @@ interface ILTPAnchorRegistry {
     error BatchTooLarge(uint256 provided, uint256 max);
     error ArrayLengthMismatch();
     error ContractPaused();
+    error VerifierNotConfigured();
+    error InvalidMLDSA65Signature();
+    error UnexpectedEntityState(uint8 expected, uint8 actual);
 
     // -----------------------------------------------------------------------
     // Write functions
@@ -113,15 +128,75 @@ interface ILTPAnchorRegistry {
         uint64  validUntil
     ) external;
 
+    /// @notice Configure the verifier adapter used by permissionless signed writes. Admin only.
+    /// @dev Setting address(0) intentionally disables signed writes.
+    function setMLDSA65Verifier(address newVerifier) external;
+
     /// @notice Register an authorized signer by VK hash. Admin only.
     function registerSigner(bytes32 vkHash) external;
 
     /// @notice Revoke an authorized signer. Admin only.
     function revokeSigner(bytes32 vkHash) external;
 
+    /// @notice Register a FIPS 204 public key for the signed EVM path. Admin only.
+    /// @dev Signed writes derive their EVM signer ID as keccak256(publicKey), which is
+    ///      deliberately distinct from LTP's SHA3-256 off-chain fingerprint.
+    function registerEIP8355Signer(bytes calldata signerVk) external returns (bytes32 signerId);
+
+    /// @notice Revoke a FIPS 204 public key from the signed EVM path. Admin only.
+    function revokeEIP8355Signer(bytes calldata signerVk) external returns (bytes32 signerId);
+
+    /// @notice Permissionless relay of an anchor carrying ML-DSA-65 authorization.
+    function anchorSigned(
+        bytes32 anchorDigest,
+        bytes32 entityIdHash,
+        bytes32 merkleRoot,
+        bytes32 policyHash,
+        bytes calldata signerVk,
+        uint64  sequence,
+        uint64  validUntil,
+        uint8   receiptType,
+        bytes calldata signature
+    ) external;
+
+    /// @notice Permissionless state transition carrying ML-DSA-65 authorization.
+    /// @dev expectedState is signed and checked to reject stale cross-signer authorizations.
+    function transitionStateSigned(
+        bytes32 entityIdHash,
+        uint8   expectedState,
+        uint8   newState,
+        bytes calldata signerVk,
+        uint64  sequence,
+        uint64  validUntil,
+        bytes calldata signature
+    ) external;
+
     // -----------------------------------------------------------------------
     // View functions
     // -----------------------------------------------------------------------
+
+    /// @notice Derive the EVM signer ID used by verifier-backed writes.
+    function eip8355SignerId(bytes calldata signerVk) external pure returns (bytes32);
+
+    /// @notice Exact raw ML-DSA message for anchorSigned.
+    function anchorAuthorizationMessage(
+        bytes32 anchorDigest,
+        bytes32 entityIdHash,
+        bytes32 merkleRoot,
+        bytes32 policyHash,
+        uint64 sequence,
+        uint64 validUntil,
+        uint8 receiptType
+    ) external view returns (bytes memory);
+
+    /// @notice Exact raw ML-DSA message for transitionStateSigned.
+    function stateTransitionAuthorizationMessage(
+        bytes32 entityIdHash,
+        uint8 expectedState,
+        uint8 newState,
+        uint64 sequence,
+        uint64 validUntil
+    ) external view returns (bytes memory);
 
     /// @notice Check if an anchor digest has been recorded.
     function isAnchored(bytes32 anchorDigest) external view returns (bool);
