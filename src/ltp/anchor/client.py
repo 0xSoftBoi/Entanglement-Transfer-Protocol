@@ -40,6 +40,11 @@ _DEFAULT_BURST = 20    # burst allowance (token bucket capacity)
 _DEFAULT_FAILURE_THRESHOLD = 5   # consecutive failures to trip breaker
 _DEFAULT_COOLDOWN_SECONDS = 30   # seconds to wait before retrying after trip
 
+# EIP-8355 / FIPS 204 ML-DSA-65 fixed sizes.
+_EIP8355_PUBLIC_KEY_BYTES = 1952
+_EIP8355_SIGNING_KEY_BYTES = 4032
+_EIP8355_SIGNATURE_BYTES = 3309
+
 
 class CircuitBreaker:
     """Simple circuit breaker: trips after N consecutive failures, resets after cooldown."""
@@ -169,6 +174,87 @@ _REGISTRY_ABI = [
             {"name": "validUntil", "type": "uint64"},
         ],
         "outputs": [],
+        "stateMutability": "nonpayable",
+    },
+    {
+        "type": "function",
+        "name": "anchorSigned",
+        "inputs": [
+            {"name": "anchorDigest", "type": "bytes32"},
+            {"name": "entityIdHash", "type": "bytes32"},
+            {"name": "merkleRoot", "type": "bytes32"},
+            {"name": "policyHash", "type": "bytes32"},
+            {"name": "signerVk", "type": "bytes"},
+            {"name": "sequence", "type": "uint64"},
+            {"name": "validUntil", "type": "uint64"},
+            {"name": "receiptType", "type": "uint8"},
+            {"name": "signature", "type": "bytes"},
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable",
+    },
+    {
+        "type": "function",
+        "name": "anchorAuthorizationMessage",
+        "inputs": [
+            {"name": "anchorDigest", "type": "bytes32"},
+            {"name": "entityIdHash", "type": "bytes32"},
+            {"name": "merkleRoot", "type": "bytes32"},
+            {"name": "policyHash", "type": "bytes32"},
+            {"name": "sequence", "type": "uint64"},
+            {"name": "validUntil", "type": "uint64"},
+            {"name": "receiptType", "type": "uint8"},
+        ],
+        "outputs": [{"name": "", "type": "bytes"}],
+        "stateMutability": "view",
+    },
+    {
+        "type": "function",
+        "name": "transitionStateSigned",
+        "inputs": [
+            {"name": "entityIdHash", "type": "bytes32"},
+            {"name": "expectedState", "type": "uint8"},
+            {"name": "newState", "type": "uint8"},
+            {"name": "signerVk", "type": "bytes"},
+            {"name": "sequence", "type": "uint64"},
+            {"name": "validUntil", "type": "uint64"},
+            {"name": "signature", "type": "bytes"},
+        ],
+        "outputs": [],
+        "stateMutability": "nonpayable",
+    },
+    {
+        "type": "function",
+        "name": "stateTransitionAuthorizationMessage",
+        "inputs": [
+            {"name": "entityIdHash", "type": "bytes32"},
+            {"name": "expectedState", "type": "uint8"},
+            {"name": "newState", "type": "uint8"},
+            {"name": "sequence", "type": "uint64"},
+            {"name": "validUntil", "type": "uint64"},
+        ],
+        "outputs": [{"name": "", "type": "bytes"}],
+        "stateMutability": "view",
+    },
+    {
+        "type": "function",
+        "name": "eip8355SignerId",
+        "inputs": [{"name": "signerVk", "type": "bytes"}],
+        "outputs": [{"name": "", "type": "bytes32"}],
+        "stateMutability": "pure",
+    },
+    {
+        "type": "function",
+        "name": "registerEIP8355Signer",
+        "inputs": [{"name": "signerVk", "type": "bytes"}],
+        "outputs": [{"name": "signerId", "type": "bytes32"}],
+        "stateMutability": "nonpayable",
+    },
+    {
+        "type": "function",
+        "name": "revokeEIP8355Signer",
+        "inputs": [{"name": "signerVk", "type": "bytes"}],
+        "outputs": [{"name": "signerId", "type": "bytes32"}],
         "stateMutability": "nonpayable",
     },
     {
@@ -395,6 +481,90 @@ class AnchorClient:
         receipt = self._send_tx(fn)
         return receipt["transactionHash"].hex()
 
+    @staticmethod
+    def _sign_eip8355_message(
+        public_key: bytes,
+        signing_key: bytes,
+        message: bytes,
+    ) -> bytes:
+        """Sign an on-chain authorization with the real FIPS 204 ML-DSA-65 backend."""
+        from ..primitives import MLDSA
+
+        if not MLDSA._use_real_backend():
+            raise RuntimeError(
+                "anchorSigned requires the real ML-DSA-65 backend; "
+                "install the 'crypto' extra / pqcrypto"
+            )
+        if len(public_key) != _EIP8355_PUBLIC_KEY_BYTES:
+            raise ValueError(
+                f"ML-DSA-65 public key must be {_EIP8355_PUBLIC_KEY_BYTES} bytes"
+            )
+        if len(signing_key) != _EIP8355_SIGNING_KEY_BYTES:
+            raise ValueError(
+                f"ML-DSA-65 signing key must be {_EIP8355_SIGNING_KEY_BYTES} bytes"
+            )
+
+        signature = MLDSA.sign(signing_key, message)
+        if len(signature) != _EIP8355_SIGNATURE_BYTES:
+            raise RuntimeError(
+                f"ML-DSA-65 signature must be {_EIP8355_SIGNATURE_BYTES} bytes"
+            )
+        if not MLDSA.verify(public_key, message, signature):
+            raise ValueError("ML-DSA-65 signing key does not match the supplied public key")
+        return signature
+
+    def anchor_signed(
+        self,
+        submission: "AnchorSubmission",
+        public_key: bytes,
+        signing_key: bytes,
+    ) -> str:
+        """Submit a permissionless v6 anchor with ML-DSA-65 authorization.
+
+        The exact message is fetched from the registry proxy before signing so Python
+        cannot drift from Solidity's ABI encoding, chain ID, or proxy-address binding.
+        """
+        if submission.target_chain_id != self._chain_id:
+            raise ValueError(
+                f"submission target_chain_id {submission.target_chain_id} "
+                f"does not match client chain_id {self._chain_id}"
+            )
+        try:
+            receipt_ordinal = _RECEIPT_TYPE_ORDINALS[submission.receipt_type]
+        except KeyError as exc:
+            raise ValueError(f"Unknown receipt type: {submission.receipt_type}") from exc
+
+        entity_id_hash = getattr(submission, "entity_id_hash", None)
+        if entity_id_hash is None:
+            entity_id_hash = submission.anchor_digest
+
+        message = bytes(
+            self._contract.functions.anchorAuthorizationMessage(
+                submission.anchor_digest,
+                entity_id_hash,
+                submission.merkle_root,
+                submission.policy_hash,
+                submission.sequence,
+                submission.valid_until,
+                receipt_ordinal,
+            ).call()
+        )
+        signature = self._sign_eip8355_message(public_key, signing_key, message)
+
+        fn = self._contract.functions.anchorSigned(
+            submission.anchor_digest,
+            entity_id_hash,
+            submission.merkle_root,
+            submission.policy_hash,
+            public_key,
+            submission.sequence,
+            submission.valid_until,
+            receipt_ordinal,
+            signature,
+        )
+        receipt = self._send_tx(fn)
+        return receipt["transactionHash"].hex()
+
     def batch_anchor(self, submissions: list["AnchorSubmission"]) -> str:
         """Anchor multiple submissions in a single transaction. Returns tx hash hex."""
         digests = [s.anchor_digest for s in submissions]
@@ -432,6 +602,39 @@ class AnchorClient:
         receipt = self._send_tx(fn)
         return receipt["transactionHash"].hex()
 
+    def transition_state_signed(
+        self,
+        entity_id_hash: bytes,
+        expected_state: int,
+        new_state: int,
+        public_key: bytes,
+        signing_key: bytes,
+        sequence: int,
+        valid_until: int,
+    ) -> str:
+        """Submit a permissionless v6 state transition with ML-DSA-65 authorization."""
+        message = bytes(
+            self._contract.functions.stateTransitionAuthorizationMessage(
+                entity_id_hash,
+                expected_state,
+                new_state,
+                sequence,
+                valid_until,
+            ).call()
+        )
+        signature = self._sign_eip8355_message(public_key, signing_key, message)
+        fn = self._contract.functions.transitionStateSigned(
+            entity_id_hash,
+            expected_state,
+            new_state,
+            public_key,
+            sequence,
+            valid_until,
+            signature,
+        )
+        receipt = self._send_tx(fn)
+        return receipt["transactionHash"].hex()
+
     def register_signer(self, vk_hash: bytes) -> str:
         """Register an authorized signer. Returns tx hash hex."""
         fn = self._contract.functions.registerSigner(vk_hash)
@@ -442,6 +645,32 @@ class AnchorClient:
         """Revoke an authorized signer. Returns tx hash hex."""
         fn = self._contract.functions.revokeSigner(vk_hash)
         receipt = self._send_tx(fn)
+        return receipt["transactionHash"].hex()
+
+    def eip8355_signer_id(self, public_key: bytes) -> bytes:
+        """Return the registry's keccak256 signer ID for an EIP-8355 public key."""
+        if len(public_key) != _EIP8355_PUBLIC_KEY_BYTES:
+            raise ValueError(
+                f"ML-DSA-65 public key must be {_EIP8355_PUBLIC_KEY_BYTES} bytes"
+            )
+        return bytes(self._contract.functions.eip8355SignerId(public_key).call())
+
+    def register_eip8355_signer(self, public_key: bytes) -> str:
+        """Register a raw FIPS 204 public key for v6 signed writes. Admin only."""
+        if len(public_key) != _EIP8355_PUBLIC_KEY_BYTES:
+            raise ValueError(
+                f"ML-DSA-65 public key must be {_EIP8355_PUBLIC_KEY_BYTES} bytes"
+            )
+        receipt = self._send_tx(self._contract.functions.registerEIP8355Signer(public_key))
+        return receipt["transactionHash"].hex()
+
+    def revoke_eip8355_signer(self, public_key: bytes) -> str:
+        """Revoke a raw FIPS 204 public key from v6 signed writes. Admin only."""
+        if len(public_key) != _EIP8355_PUBLIC_KEY_BYTES:
+            raise ValueError(
+                f"ML-DSA-65 public key must be {_EIP8355_PUBLIC_KEY_BYTES} bytes"
+            )
+        receipt = self._send_tx(self._contract.functions.revokeEIP8355Signer(public_key))
         return receipt["transactionHash"].hex()
 
     def is_anchored(self, anchor_digest: bytes) -> bool:
