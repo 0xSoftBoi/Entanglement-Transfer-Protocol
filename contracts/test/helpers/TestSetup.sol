@@ -19,6 +19,10 @@ abstract contract TestSetup is Test {
     bytes32 public signerVkHash2 = keccak256("test-signer-vk-2");
 
     function setUp() public virtual {
+        // Legacy v6 write methods are admin-only. Use the test contract as admin so
+        // existing direct-call tests still exercise their original validation paths.
+        admin = address(this);
+
         // 1. Deploy implementation
         implementation = new LTPAnchorRegistry();
 
