@@ -130,11 +130,13 @@ contract LTPAnchorRegistryPQTest is TestSetup {
     }
 
     function test_legacyTransition_nonAdminReverts() public {
+        uint8 committed = registry.STATE_COMMITTED();
+
         vm.prank(nonAdmin);
         vm.expectRevert(abi.encodeWithSelector(ILTPAnchorRegistry.NotAdmin.selector, nonAdmin));
         registry.transitionState(
             _entityId(1),
-            registry.STATE_COMMITTED(),
+            committed,
             pqSignerId,
             1,
             uint64(block.timestamp + 3600)
@@ -240,19 +242,22 @@ contract LTPAnchorRegistryPQTest is TestSetup {
         bytes32 entityId = _entityId(20);
         uint64 validUntil = uint64(block.timestamp + 3600);
         _signedAnchor(digest, entityId, 1, validUntil);
+        uint8 committed = registry.STATE_COMMITTED();
+        uint8 anchored = registry.STATE_ANCHORED();
+        uint8 materialized = registry.STATE_MATERIALIZED();
 
         vm.prank(nonAdmin);
         vm.expectRevert(
             abi.encodeWithSelector(
                 ILTPAnchorRegistry.UnexpectedEntityState.selector,
-                registry.STATE_COMMITTED(),
-                registry.STATE_ANCHORED()
+                committed,
+                anchored
             )
         );
         registry.transitionStateSigned(
             entityId,
-            registry.STATE_COMMITTED(),
-            registry.STATE_MATERIALIZED(),
+            committed,
+            materialized,
             publicKey,
             2,
             validUntil,
@@ -265,11 +270,13 @@ contract LTPAnchorRegistryPQTest is TestSetup {
         bytes32 entityId = _entityId(21);
         uint64 validUntil = uint64(block.timestamp + 3600);
         _signedAnchor(digest, entityId, 1, validUntil);
+        uint8 anchored = registry.STATE_ANCHORED();
+        uint8 materialized = registry.STATE_MATERIALIZED();
 
         bytes memory message = registry.stateTransitionAuthorizationMessage(
             entityId,
-            registry.STATE_ANCHORED(),
-            registry.STATE_MATERIALIZED(),
+            anchored,
+            materialized,
             2,
             validUntil
         );
@@ -278,15 +285,15 @@ contract LTPAnchorRegistryPQTest is TestSetup {
         vm.prank(nonAdmin);
         registry.transitionStateSigned(
             entityId,
-            registry.STATE_ANCHORED(),
-            registry.STATE_MATERIALIZED(),
+            anchored,
+            materialized,
             publicKey,
             2,
             validUntil,
             signature
         );
 
-        assertEq(registry.getEntityState(entityId), registry.STATE_MATERIALIZED());
+        assertEq(registry.getEntityState(entityId), materialized);
         assertEq(registry.getSignerSequence(pqSignerId), 2);
     }
 
