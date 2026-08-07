@@ -319,6 +319,7 @@ See [docs/README.md](docs/README.md) for the full documentation index.
 | [Production Plan](docs/PRODUCTION_PLAN.md) | PoC to production roadmap |
 | [Deployment Guide](docs/DEPLOYMENT_GUIDE.md) | Docker, Kubernetes, CI/CD |
 | [Bridge MVP](docs/bridge-mvp-scope.md) | Cross-chain bridge scope |
+| [EIP-8355 / ERC-7786 profile](docs/eip-8355-bridge-profile.md) | PQ on-chain authorization and gateway alignment |
 | [Security Review](docs/design-decisions/Security/SECURITY_REVIEW-2-24-2026.md) | Formal security analysis |
 
 ## Test Coverage
