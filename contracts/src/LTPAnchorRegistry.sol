@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {ILTPAnchorRegistry} from "./interfaces/ILTPAnchorRegistry.sol";
+import {ILTPMLDSA65Verifier} from "./interfaces/ILTPMLDSA65Verifier.sol";
 import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 
@@ -10,7 +11,7 @@ import {UUPSUpgradeable} from "@openzeppelin/contracts/proxy/utils/UUPSUpgradeab
 /// @notice On-chain registry for LTP anchor digests with state machine,
 ///         per-signer sequencing, signer authorization, and emergency pause.
 /// @dev Upgradeable via UUPS proxy pattern. Admin is expected to be a multi-sig.
-///      Thin on-chain, thick off-chain — no PQ signature verification on-chain.
+///      Legacy writes are admin-only; permissionless writes require ML-DSA-65 verification.
 contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable {
     // -----------------------------------------------------------------------
     // Constants — EntityState enum mirrors Python src/ltp/anchor/state.py
@@ -25,6 +26,14 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
 
     /// @notice Maximum items per batchAnchor call (gas DoS protection).
     uint256 public constant MAX_BATCH_SIZE = 100;
+
+    /// @notice Domain for ML-DSA authorization of anchorSigned operations.
+    bytes32 public constant ANCHOR_AUTHORIZATION_DOMAIN =
+        keccak256("GSX-LTP:anchor-authorization:v1");
+
+    /// @notice Domain for ML-DSA authorization of transitionStateSigned operations.
+    bytes32 public constant STATE_TRANSITION_AUTHORIZATION_DOMAIN =
+        keccak256("GSX-LTP:state-transition-authorization:v1");
 
     // -----------------------------------------------------------------------
     // Storage (must be append-only for upgrade safety)
@@ -44,6 +53,10 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
 
     /// @notice signerVkHash => authorized flag
     mapping(bytes32 => bool) public authorizedSigners;
+
+    /// @notice Verifier adapter for the permissionless FIPS 204 ML-DSA-65 path.
+    /// @dev Appended in v6 by consuming one slot from the v5 storage gap.
+    address public mlDsa65Verifier;
 
     // -----------------------------------------------------------------------
     // Constructor — disables initializers on the implementation contract
@@ -102,6 +115,13 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
         emit Unpaused(msg.sender);
     }
 
+    /// @inheritdoc ILTPAnchorRegistry
+    function setMLDSA65Verifier(address newVerifier) external onlyAdmin {
+        address oldVerifier = mlDsa65Verifier;
+        mlDsa65Verifier = newVerifier;
+        emit MLDSA65VerifierUpdated(oldVerifier, newVerifier);
+    }
+
     // -----------------------------------------------------------------------
     // UUPS upgrade authorization
     // -----------------------------------------------------------------------
@@ -123,7 +143,44 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
         uint64  sequence,
         uint64  validUntil,
         uint8   receiptType
+    ) external onlyAdmin whenNotPaused {
+        _anchor(
+            anchorDigest,
+            entityIdHash,
+            merkleRoot,
+            policyHash,
+            signerVkHash,
+            sequence,
+            validUntil,
+            receiptType
+        );
+    }
+
+    /// @inheritdoc ILTPAnchorRegistry
+    function anchorSigned(
+        bytes32 anchorDigest,
+        bytes32 entityIdHash,
+        bytes32 merkleRoot,
+        bytes32 policyHash,
+        bytes calldata signerVk,
+        uint64 sequence,
+        uint64 validUntil,
+        uint8 receiptType,
+        bytes calldata signature
     ) external whenNotPaused {
+        bytes32 signerVkHash = keccak256(signerVk);
+        bytes memory message = anchorAuthorizationMessage(
+            anchorDigest,
+            entityIdHash,
+            merkleRoot,
+            policyHash,
+            sequence,
+            validUntil,
+            receiptType
+        );
+        _requireAuthorizedSignature(signerVkHash, signerVk, signature, message);
+        emit PQAuthorizationVerified(signerVkHash, entityIdHash, keccak256(message));
+
         _anchor(
             anchorDigest,
             entityIdHash,
@@ -146,7 +203,7 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
         uint64[]  calldata sequences,
         uint64[]  calldata validUntils,
         uint8[]   calldata receiptTypes
-    ) external whenNotPaused {
+    ) external onlyAdmin whenNotPaused {
         uint256 len = anchorDigests.length;
         if (len == 0) revert EmptyBatch();
         if (len > MAX_BATCH_SIZE) revert BatchTooLarge(len, MAX_BATCH_SIZE);
@@ -182,37 +239,37 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
         bytes32 signerVkHash,
         uint64  sequence,
         uint64  validUntil
+    ) external onlyAdmin whenNotPaused {
+        _transitionState(entityIdHash, newState, signerVkHash, sequence, validUntil);
+    }
+
+    /// @inheritdoc ILTPAnchorRegistry
+    function transitionStateSigned(
+        bytes32 entityIdHash,
+        uint8 expectedState,
+        uint8 newState,
+        bytes calldata signerVk,
+        uint64 sequence,
+        uint64 validUntil,
+        bytes calldata signature
     ) external whenNotPaused {
-        // 1. Signer authorization
-        if (!authorizedSigners[signerVkHash]) {
-            revert UnauthorizedSigner(signerVkHash);
+        uint8 actualState = entityStates[entityIdHash];
+        if (actualState != expectedState) {
+            revert UnexpectedEntityState(expectedState, actualState);
         }
 
-        // 2. Sequence monotonicity
-        uint64 currentSeq = signerSequences[signerVkHash];
-        if (sequence <= currentSeq) {
-            revert SequenceTooLow(signerVkHash, sequence, currentSeq);
-        }
+        bytes32 signerVkHash = keccak256(signerVk);
+        bytes memory message = stateTransitionAuthorizationMessage(
+            entityIdHash,
+            expectedState,
+            newState,
+            sequence,
+            validUntil
+        );
+        _requireAuthorizedSignature(signerVkHash, signerVk, signature, message);
+        emit PQAuthorizationVerified(signerVkHash, entityIdHash, keccak256(message));
 
-        // 3. Temporal expiry
-        if (uint64(block.timestamp) >= validUntil) {
-            revert Expired(validUntil, uint64(block.timestamp));
-        }
-
-        // 4. State transition validation
-        uint8 currentState = entityStates[entityIdHash];
-        if (!_isValidTransition(currentState, newState)) {
-            revert InvalidStateTransition(currentState, newState);
-        }
-
-        // 5. Update state
-        entityStates[entityIdHash] = newState;
-
-        // 6. Update signer sequence HWM
-        signerSequences[signerVkHash] = sequence;
-
-        emit StateTransitioned(entityIdHash, signerVkHash, currentState, newState, sequence);
-        emit StateTransition(entityIdHash, currentState, newState);
+        _transitionState(entityIdHash, newState, signerVkHash, sequence, validUntil);
     }
 
     /// @inheritdoc ILTPAnchorRegistry
@@ -227,9 +284,76 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
         emit SignerRevoked(vkHash);
     }
 
+    /// @inheritdoc ILTPAnchorRegistry
+    function registerEIP8355Signer(
+        bytes calldata signerVk
+    ) external onlyAdmin returns (bytes32 signerId) {
+        signerId = keccak256(signerVk);
+        authorizedSigners[signerId] = true;
+        emit SignerRegistered(signerId);
+    }
+
+    /// @inheritdoc ILTPAnchorRegistry
+    function revokeEIP8355Signer(
+        bytes calldata signerVk
+    ) external onlyAdmin returns (bytes32 signerId) {
+        signerId = keccak256(signerVk);
+        authorizedSigners[signerId] = false;
+        emit SignerRevoked(signerId);
+    }
+
     // -----------------------------------------------------------------------
     // View functions
     // -----------------------------------------------------------------------
+
+    /// @inheritdoc ILTPAnchorRegistry
+    function eip8355SignerId(bytes calldata signerVk) external pure returns (bytes32) {
+        return keccak256(signerVk);
+    }
+
+    /// @inheritdoc ILTPAnchorRegistry
+    function anchorAuthorizationMessage(
+        bytes32 anchorDigest,
+        bytes32 entityIdHash,
+        bytes32 merkleRoot,
+        bytes32 policyHash,
+        uint64 sequence,
+        uint64 validUntil,
+        uint8 receiptType
+    ) public view returns (bytes memory) {
+        return abi.encode(
+            ANCHOR_AUTHORIZATION_DOMAIN,
+            block.chainid,
+            address(this),
+            anchorDigest,
+            entityIdHash,
+            merkleRoot,
+            policyHash,
+            sequence,
+            validUntil,
+            receiptType
+        );
+    }
+
+    /// @inheritdoc ILTPAnchorRegistry
+    function stateTransitionAuthorizationMessage(
+        bytes32 entityIdHash,
+        uint8 expectedState,
+        uint8 newState,
+        uint64 sequence,
+        uint64 validUntil
+    ) public view returns (bytes memory) {
+        return abi.encode(
+            STATE_TRANSITION_AUTHORIZATION_DOMAIN,
+            block.chainid,
+            address(this),
+            entityIdHash,
+            expectedState,
+            newState,
+            sequence,
+            validUntil
+        );
+    }
 
     /// @inheritdoc ILTPAnchorRegistry
     function isAnchored(bytes32 anchorDigest) external view returns (bool) {
@@ -284,12 +408,66 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
 
     /// @notice Returns the implementation version for upgrade tracking.
     function version() external pure returns (uint256) {
-        return 5;
+        return 6;
     }
 
     // -----------------------------------------------------------------------
     // Internal
     // -----------------------------------------------------------------------
+
+    /// @dev Verify authorization through the configured ML-DSA-65 adapter.
+    function _requireAuthorizedSignature(
+        bytes32 signerVkHash,
+        bytes calldata signerVk,
+        bytes calldata signature,
+        bytes memory message
+    ) internal view {
+        if (!authorizedSigners[signerVkHash]) {
+            revert UnauthorizedSigner(signerVkHash);
+        }
+
+        address verifier = mlDsa65Verifier;
+        if (verifier == address(0)) {
+            revert VerifierNotConfigured();
+        }
+
+        if (!ILTPMLDSA65Verifier(verifier).verify(signerVk, signature, message)) {
+            revert InvalidMLDSA65Signature();
+        }
+    }
+
+    /// @dev Core state-transition logic shared by admin and signed entry points.
+    function _transitionState(
+        bytes32 entityIdHash,
+        uint8 newState,
+        bytes32 signerVkHash,
+        uint64 sequence,
+        uint64 validUntil
+    ) internal {
+        if (!authorizedSigners[signerVkHash]) {
+            revert UnauthorizedSigner(signerVkHash);
+        }
+
+        uint64 currentSeq = signerSequences[signerVkHash];
+        if (sequence <= currentSeq) {
+            revert SequenceTooLow(signerVkHash, sequence, currentSeq);
+        }
+
+        if (uint64(block.timestamp) >= validUntil) {
+            revert Expired(validUntil, uint64(block.timestamp));
+        }
+
+        uint8 currentState = entityStates[entityIdHash];
+        if (!_isValidTransition(currentState, newState)) {
+            revert InvalidStateTransition(currentState, newState);
+        }
+
+        entityStates[entityIdHash] = newState;
+        signerSequences[signerVkHash] = sequence;
+
+        emit StateTransitioned(entityIdHash, signerVkHash, currentState, newState, sequence);
+        emit StateTransition(entityIdHash, currentState, newState);
+    }
 
     /// @dev Core anchoring logic shared by anchor() and batchAnchor().
     function _anchor(
@@ -375,5 +553,5 @@ contract LTPAnchorRegistry is ILTPAnchorRegistry, Initializable, UUPSUpgradeable
     // with derived contract storage. Standard OpenZeppelin pattern.
     // -----------------------------------------------------------------------
 
-    uint256[50] private __gap;
+    uint256[49] private __gap;
 }
