@@ -29,7 +29,6 @@ from typing import Optional
 
 from ..anchor.client import AnchorClient
 from ..anchor.submission import AnchorSubmission
-from ..domain import signer_fingerprint
 from ..keypair import KeyPair
 from ..protocol import LTPProtocol
 from .anchor import L1Anchor
@@ -103,9 +102,11 @@ class LiveBridge:
             chain_id=dest_chain, required_confirmations=1,
         )
 
-        # Track on-chain sequence (mirrors contract's per-signer HWM)
-        self._on_chain_sequence = 0
-        self._signer_vk_hash = signer_fingerprint(operator_keypair.vk)
+        # v6 signed writes key sequences by keccak256(FIPS public key), not the
+        # legacy SHA3-256 LTP fingerprint. Seed the local HWM from chain state so
+        # restarting a relayer does not reuse sequence 1.
+        self._signer_vk_hash = self._client.eip8355_signer_id(operator_keypair.vk)
+        self._on_chain_sequence = self._client.signer_sequence(self._signer_vk_hash)
 
     def _make_anchor_digest(self, entity_id: str, merkle_root: bytes) -> bytes:
         """Compute a 32-byte anchor digest from entity_id and merkle_root."""
@@ -148,8 +149,11 @@ class LiveBridge:
 
         anchor_digest = self._make_anchor_digest(commitment.entity_id, merkle_root)
 
-        # Advance on-chain sequence
-        self._on_chain_sequence += 1
+        # Refresh the contract HWM before allocating a sequence. This tolerates
+        # relayer restarts and other successfully submitted authorizations for
+        # the same key. The contract remains the final race/replay arbiter.
+        chain_sequence = self._client.signer_sequence(self._signer_vk_hash)
+        self._on_chain_sequence = max(self._on_chain_sequence, chain_sequence) + 1
         valid_until = int(time.time()) + 3600
 
         submission = AnchorSubmission(
@@ -168,7 +172,11 @@ class LiveBridge:
             receipt_type="COMMIT",
         )
 
-        anchor_tx_hash = self._client.anchor(submission)
+        anchor_tx_hash = self._client.anchor_signed(
+            submission,
+            public_key=self._operator_kp.vk,
+            signing_key=self._operator_kp.sk,
+        )
         logger.info(
             "[LiveBridge] Anchored: tx=%s, digest=%s",
             anchor_tx_hash[:16], anchor_digest.hex()[:16],
