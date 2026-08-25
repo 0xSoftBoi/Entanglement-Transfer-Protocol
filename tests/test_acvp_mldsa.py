@@ -15,15 +15,26 @@ import pytest
 
 VECTORS_DIR = Path(__file__).parent / "vectors"
 
+# pqcrypto>=1.0 renamed generate_keypair to keygen (sign/verify kept their
+# names, though verify()'s success return changed — see the call site
+# below). Try the new name first, fall back to the old one.
 try:
     from pqcrypto.sign.ml_dsa_65 import (
-        generate_keypair as mldsa65_keygen,
+        keygen as mldsa65_keygen,
         sign as mldsa65_sign,
         verify as mldsa65_verify,
     )
     HAS_REAL_MLDSA = True
 except ImportError:
-    HAS_REAL_MLDSA = False
+    try:
+        from pqcrypto.sign.ml_dsa_65 import (
+            generate_keypair as mldsa65_keygen,
+            sign as mldsa65_sign,
+            verify as mldsa65_verify,
+        )
+        HAS_REAL_MLDSA = True
+    except ImportError:
+        HAS_REAL_MLDSA = False
 
 skip_no_backend = pytest.mark.skipif(
     not HAS_REAL_MLDSA,
@@ -131,8 +142,10 @@ class TestMLDSA65SigVer:
                 expected_pass = tc["testPassed"]
 
                 try:
-                    result = mldsa65_verify(pk, message, signature)
-                    actual_pass = bool(result)
+                    # pqcrypto>=1.0's verify() returns None on success and
+                    # raises on failure — not reaching the except means valid.
+                    mldsa65_verify(pk, message, signature)
+                    actual_pass = True
                 except Exception:
                     actual_pass = False
 

@@ -58,11 +58,22 @@ _REAL_KEM_CT = 1088
 
 _pqcrypto_kem_available = False
 try:
-    from pqcrypto.kem.ml_kem_768 import (
-        generate_keypair as _kem_keygen,
-        encrypt as _kem_encrypt,       # returns (ct, ss) — note order!
-        decrypt as _kem_decrypt,
-    )
+    # pqcrypto>=1.0 renamed generate_keypair/encrypt/decrypt to
+    # keygen/encaps/decaps; keep both names importable so either pqcrypto
+    # major version works (0.x is still resolvable via `pip install
+    # pqcrypto<1`, and downstream envs may be pinned to it).
+    try:
+        from pqcrypto.kem.ml_kem_768 import (
+            keygen as _kem_keygen,
+            encaps as _kem_encrypt,     # returns (ct, ss) — note order!
+            decaps as _kem_decrypt,
+        )
+    except ImportError:
+        from pqcrypto.kem.ml_kem_768 import (
+            generate_keypair as _kem_keygen,
+            encrypt as _kem_encrypt,    # returns (ct, ss) — note order!
+            decrypt as _kem_decrypt,
+        )
     _pqcrypto_kem_available = True
 except ImportError:
     pass
@@ -74,11 +85,21 @@ _REAL_DSA_SIG = 3309
 
 _pqcrypto_sign_available = False
 try:
-    from pqcrypto.sign.ml_dsa_65 import (
-        generate_keypair as _dsa_keygen,
-        sign as _dsa_sign,
-        verify as _dsa_verify,          # raises on invalid, doesn't return bool
-    )
+    # Same pqcrypto>=1.0 rename as the KEM import above (generate_keypair ->
+    # keygen); sign/verify kept their names but verify()'s success return
+    # changed (see the call site in MLDSA.verify for how that's handled).
+    try:
+        from pqcrypto.sign.ml_dsa_65 import (
+            keygen as _dsa_keygen,
+            sign as _dsa_sign,
+            verify as _dsa_verify,
+        )
+    except ImportError:
+        from pqcrypto.sign.ml_dsa_65 import (
+            generate_keypair as _dsa_keygen,
+            sign as _dsa_sign,
+            verify as _dsa_verify,
+        )
     _pqcrypto_sign_available = True
 except ImportError:
     pass
@@ -632,8 +653,16 @@ class MLDSA:
             return False
 
         if cls._use_real_backend():
-            # pqcrypto.sign.ml_dsa_65.verify returns True/False.
-            return bool(_dsa_verify(vk, message, signature))
+            # pqcrypto>=1.0's verify() returns None on success and RAISES
+            # (pqcrypto.InvalidSignatureError) on a bad signature — it no
+            # longer returns a bool. Treat "didn't raise" as valid so this
+            # works across pqcrypto major versions without depending on the
+            # return value.
+            try:
+                _dsa_verify(vk, message, signature)
+                return True
+            except Exception:
+                return False
 
         # PoC fallback: lookup table verification
         # TIMING NOTE: dict.get() is NOT constant-time — it leaks whether the
