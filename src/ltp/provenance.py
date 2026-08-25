@@ -224,15 +224,22 @@ class ProvenanceLog:
     Operator-run notary: seals captures and commits their manifests to an
     RFC-6962 append-only Merkle log.
 
-    One ProvenanceLog is run by one operator keypair (the notary). The operator
+    One ProvenanceLog is run by one operator identity (the notary). The operator
     signs Tree Heads (STHs); auditors verify captures against those STHs. The
     operator never sees plaintext beyond what it is asked to seal, and never
     holds recipients' decapsulation keys.
+
+    `operator` is either a KeyPair (reference custody) or any Signer exposing
+    `.vk` + `.sign(payload)` — e.g. a KMS-held key (cloud/keys.py) — so the
+    signing key need not exist in this process at all.
     """
 
-    def __init__(self, operator: KeyPair) -> None:
+    def __init__(self, operator) -> None:
         self._operator = operator
-        self._log = MerkleLog(operator.vk, operator.sk)
+        if hasattr(operator, "sk"):  # KeyPair: in-process signing key
+            self._log = MerkleLog(operator.vk, operator.sk)
+        else:  # external Signer (KMS/HSM)
+            self._log = MerkleLog(operator.vk, signer=operator)
 
     # ------------------------------------------------------------------
     # Persistence support (rebuild a notary log from stored manifests)

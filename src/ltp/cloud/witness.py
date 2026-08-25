@@ -63,11 +63,18 @@ class Cosignature:
 
 class Witness:
     def __init__(self, keypair: KeyPair) -> None:
+        """Accepts a KeyPair or any Signer (`.vk` + `.sign`; see cloud/keys.py),
+        so a production witness can hold its key in KMS/HSM too."""
         self._kp = keypair
 
     @property
     def vk(self) -> bytes:
         return self._kp.vk
+
+    def _sign(self, payload: bytes) -> bytes:
+        if hasattr(self._kp, "sk"):
+            return MLDSA.sign(self._kp.sk, payload)
+        return self._kp.sign(payload)
 
     def cosign(self, sth: SignedTreeHead) -> Cosignature:
         """
@@ -80,5 +87,5 @@ class Witness:
             raise ValueError("refusing to cosign an STH with an invalid operator signature")
         return Cosignature(
             witness_vk=self._kp.vk,
-            signature=MLDSA.sign(self._kp.sk, _payload(sth)),
+            signature=self._sign(_payload(sth)),
         )

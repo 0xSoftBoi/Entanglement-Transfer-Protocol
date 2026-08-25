@@ -62,7 +62,7 @@ ANCHORED badge; a customer can self-serve keys and watch anchors confirm.
 
 | # | Item | Effort | Owner |
 |---|---|---|---|
-| E1 | KMS/HSM for operator + anchoring keys (kill the reference DB-stored key) | M | [auto] design + AWS-KMS impl; [you] cloud account |
+| E1 | ✅ *(operator half)* `cloud/keys.py`: Signer seam + AWS-KMS ML-DSA-65 impl (`ETP_CLOUD_KMS_KEY_ID`; key non-exportable, per-signature fail-fast verify; log/witness/service all signer-agnostic). Anchoring EOA via KMS lands with the funded-account smoke (A4) | M | done; [you] cloud account + KMS key to activate |
 | E2 | ✅ `batchAnchor` aggregation (worker batches >1 pending into one tx when the client supports it) | S | done |
 | E3 | ✅ Witness cosigning (`cloud/witness.py`: independent keypair countersigns STHs; cosignature in `/v1/sth`) | M | done |
 | E4 | ✅ *(vertical-agnostic v1)* `cloud/report.py`: audit evidence bundle (JSON+MD), claims verified at generation time. 21-CFR-11/NERC-CIP framing waits on the design partner | L | done; [you] pick vertical for the branded pack |

@@ -175,3 +175,33 @@ class SignedTreeHead:
             operator_vk=operator_vk,
             signature=signature,
         )
+
+    @classmethod
+    def sign_with(
+        cls,
+        signer,
+        sequence: int,
+        tree_size: int,
+        root_hash: bytes,
+    ) -> "SignedTreeHead":
+        """
+        Create an STH signed by an external Signer (`.vk` + `.sign(payload)`),
+        e.g. a KMS/HSM-held key (cloud/keys.py). Payload encoding is identical
+        to sign(), so verify() cannot tell the custody modes apart.
+        """
+        ts = time.time()
+        payload = (
+            struct.pack('>Q', sequence)
+            + struct.pack('>Q', tree_size)
+            + struct.pack('>d', ts)
+            + root_hash
+        )
+        return cls(
+            sequence=sequence,
+            tree_size=tree_size,
+            timestamp=ts,
+            root_hash=root_hash,
+            operator_vk=signer.vk,
+            signature=signer.sign(payload),
+        )
+

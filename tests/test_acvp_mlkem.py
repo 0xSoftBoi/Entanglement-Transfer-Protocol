@@ -16,16 +16,26 @@ import pytest
 
 VECTORS_DIR = Path(__file__).parent / "vectors"
 
-# Check if real ML-KEM backend is available
+# Check if real ML-KEM backend is available. pqcrypto>=1.0 renamed
+# generate_keypair/encrypt/decrypt to keygen/encaps/decaps; try the new
+# names first, fall back to the old ones for pre-1.0 installs.
 try:
     from pqcrypto.kem.ml_kem_768 import (
-        generate_keypair as mlkem768_keygen,
-        encrypt as mlkem768_encaps,
-        decrypt as mlkem768_decaps,
+        keygen as mlkem768_keygen,
+        encaps as mlkem768_encaps,
+        decaps as mlkem768_decaps,
     )
     HAS_REAL_MLKEM = True
 except ImportError:
-    HAS_REAL_MLKEM = False
+    try:
+        from pqcrypto.kem.ml_kem_768 import (
+            generate_keypair as mlkem768_keygen,
+            encrypt as mlkem768_encaps,
+            decrypt as mlkem768_decaps,
+        )
+        HAS_REAL_MLKEM = True
+    except ImportError:
+        HAS_REAL_MLKEM = False
 
 skip_no_backend = pytest.mark.skipif(
     not HAS_REAL_MLKEM,
