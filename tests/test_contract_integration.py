@@ -156,6 +156,30 @@ def anchor_client(contract_address):
     )
 
 
+@pytest.fixture(scope="module")
+def pq_test_verifier(w3, registry, account):
+    """Deploy a test-only verifier so Anvil can exercise the v6 signed transaction seam."""
+    contracts_dir = os.path.join(os.path.dirname(__file__), "..", "contracts")
+    artifact_path = os.path.join(
+        contracts_dir, "out", "TestMLDSA65Verifier.sol", "TestMLDSA65Verifier.json",
+    )
+    with open(artifact_path) as f:
+        artifact = json.load(f)
+
+    verifier = w3.eth.contract(
+        abi=artifact["abi"], bytecode=artifact["bytecode"]["object"],
+    )
+    receipt = _send_tx(w3, account, verifier.constructor(), gas=5_000_000)
+    assert receipt["status"] == 1
+    verifier_address = receipt["contractAddress"]
+
+    configured = _send_tx(
+        w3, account, registry.functions.setMLDSA65Verifier(verifier_address),
+    )
+    assert configured["status"] == 1
+    return verifier_address
+
+
 def _send_tx(w3, account, fn, gas=500_000):
     """Helper to send a transaction. Returns receipt."""
     tx = fn.build_transaction({
@@ -637,19 +661,21 @@ class TestLiveBridge:
     """Prove the bridge works with real on-chain state (via anvil)."""
 
     @pytest.fixture
-    def live_bridge(self, anchor_client, registry, w3, account):
-        """Set up LiveBridge with all components wired to anvil."""
+    def live_bridge(self, anchor_client, registry, w3, account, pq_test_verifier):
+        """Set up LiveBridge with the v6 signed-anchor path wired to anvil."""
         from src.ltp import CommitmentNetwork, KeyPair, LTPProtocol
         from src.ltp.bridge.live import LiveBridge
-        from src.ltp.domain import signer_fingerprint
 
-        # Create bridge keypairs
+        # Create bridge keypairs. The CI integration job installs the real pqcrypto backend.
         operator_kp = KeyPair.generate("live-bridge-operator")
         verifier_kp = KeyPair.generate("live-bridge-verifier")
 
-        # Register the operator's signer VK hash on-chain
-        vk_hash = signer_fingerprint(operator_kp.vk)
-        _send_tx(w3, account, registry.functions.registerSigner(vk_hash))
+        # v6 signed writes authorize keccak256(raw FIPS public key), not the
+        # legacy SHA3-256 LTP fingerprint.
+        registration = _send_tx(
+            w3, account, registry.functions.registerEIP8355Signer(operator_kp.vk),
+        )
+        assert registration["status"] == 1
 
         # Set up commitment network
         net = CommitmentNetwork()
